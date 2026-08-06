@@ -1,0 +1,645 @@
+package mutate
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/printer"
+	"go/token"
+	"path/filepath"
+	"runtime"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"golang.org/x/sync/errgroup"
+	"golang.org/x/tools/go/packages"
+
+	"github.com/jh125486/turango/internal/goproxy"
+	"github.com/jh125486/turango/internal/mutator"
+
+	// Importing the operator packages for their side effect is what populates
+	// the mutator registry; mutator.All() is empty without them.
+	_ "github.com/jh125486/turango/internal/mutator/control"
+	_ "github.com/jh125486/turango/internal/mutator/expression"
+	_ "github.com/jh125486/turango/internal/mutator/literal"
+	_ "github.com/jh125486/turango/internal/mutator/operator"
+	_ "github.com/jh125486/turango/internal/mutator/statement"
+)
+
+// Scope selects which tests are run to decide whether a mutant was caught.
+//
+// The three modes trade run time against confidence, and they can disagree: a
+// mutant only a neighbouring package's tests exercise is killed under
+// [ScopeFull] and survives under [ScopePackage]. Narrower scopes never produce
+// *more* kills than wider ones, so a narrow scope's score is a lower bound on
+// the full one.
+type Scope int
+
+const (
+	// ScopeFull runs the whole module's tests (`go test ./...`) against every
+	// mutant. It is the default because it is the only scope that cannot miss a
+	// kill: a package's behaviour is frequently only asserted on by its
+	// callers' tests, and those live in other packages.
+	ScopeFull Scope = iota
+
+	// ScopePackage runs only the tests of the package holding the mutated file.
+	// Much cheaper than [ScopeFull] on a large module, at the cost of reporting
+	// cross-package kills as survivors.
+	ScopePackage
+
+	// ScopeImpact runs only the tests that actually execute the mutated line,
+	// derived from a per-test coverage map built once per package before any
+	// mutant runs (see impact.go). A line no test covers is not tested at all,
+	// so its mutants are reported as survived without running anything.
+	ScopeImpact
+)
+
+// String reports the scope's -mutatescope spelling.
+func (s Scope) String() string {
+	switch s {
+	case ScopeFull:
+		return "full"
+	case ScopePackage:
+		return "package"
+	case ScopeImpact:
+		return "impact"
+	default:
+		return "unknown"
+	}
+}
+
+// ParseScope converts a -mutatescope flag value to a [Scope].
+//
+// It lives beside the type rather than in the command so that any caller
+// constructing [Options] from user input — the CLI today, a config file later —
+// agrees on the spellings.
+func ParseScope(s string) (Scope, error) {
+	switch s {
+	case "full":
+		return ScopeFull, nil
+	case "package":
+		return ScopePackage, nil
+	case "impact":
+		return ScopeImpact, nil
+	default:
+		return ScopeFull, fmt.Errorf("mutate: unknown scope %q (want full, package or impact)", s)
+	}
+}
+
+// Options configures a mutation run.
+//
+// Every field has a usable zero value: the zero Options mutates the package in
+// the working directory, with every registered operator, at [ScopeFull], one
+// file at a time, with a derived per-mutant timeout.
+type Options struct {
+	// Packages holds the package patterns to mutate, in `go test` syntax
+	// ("./...", "./internal/...", an import path). Empty means "." — the
+	// package in Dir.
+	Packages []string
+
+	// Dir is the directory patterns are resolved relative to. Empty means the
+	// process working directory.
+	Dir string
+
+	// Operators names the mutation operators to apply, using their registry
+	// names ("operator/binary", "control/if"). Empty means every registered
+	// operator. An unknown name fails the run rather than being skipped: a
+	// typo'd operator that silently reduced the mutant set would quietly
+	// inflate the score.
+	Operators []string
+
+	// Scope selects the tests each mutant is judged by. The zero value is
+	// [ScopeFull].
+	Scope Scope
+
+	// Parallel bounds how many *files* are mutated concurrently. Zero or less
+	// means one.
+	//
+	// The unit is a file, not a mutant, and that is a correctness constraint
+	// rather than a tuning choice: every mutant of a file shares that file's
+	// AST, which the runner mutates in place and reverts, so two mutants of one
+	// file can never run at the same time. Different files hold entirely
+	// separate trees.
+	Parallel int
+
+	// TestTimeout bounds each individual mutant's `go test` run. A bound is not
+	// optional: mutation is very good at producing infinite loops — turning an
+	// `i++` into an `i--` hangs the suite forever — and without one such a
+	// mutant stalls the whole run until `go test`'s own 10-minute default
+	// fires.
+	//
+	// Zero means "derive it": the engine times the unmutated suite before
+	// mutating anything and scales that (see [baselineTimeout]). Set it
+	// explicitly to skip the baseline entirely, which is what phase 5's
+	// -mutatetimeout flag does.
+	TestTimeout time.Duration
+}
+
+// baselineRuns is how many times the unmutated suite is timed before a run.
+//
+// Three is enough to damp the first run's cold build cache without turning the
+// measurement into a meaningful fraction of the mutation run itself.
+const baselineRuns = 3
+
+// MinBaselineTimeout is the floor applied to a derived timeout.
+//
+// The baseline measures a suite whose build cache is already warm, so it barely
+// pays for compilation — but every mutant recompiles its package from changed
+// source, and that cost is not in the measurement. On a fast, small suite the
+// derived product can land below the time a single mutant needs just to build,
+// which would report perfectly good mutants as killed-by-timeout. The floor
+// only ever raises a derived value; it never lowers one, and it never applies
+// to an explicit [Options.TestTimeout].
+const MinBaselineTimeout = 10 * time.Second
+
+// Run executes a full mutation run and reports every mutant it produced.
+//
+// Files are mutated concurrently, up to [Options.Parallel] at a time, so the
+// order in which results *arrive* is not deterministic. The report is: Run
+// sorts [Result.Mutants] and [Result.Suppressions] by file, line, operator and
+// description before returning, so two runs over unchanged sources still
+// produce identical reports regardless of scheduling. Within one file the walk
+// is strictly sequential — a file's mutants share one AST that is mutated in
+// place and reverted between mutants, so the whole run reuses one parse per
+// file.
+//
+// Run is cancellation-aware between mutants: when ctx is done, every in-flight
+// file stops at its next mutant rather than finishing its walk, and Run returns
+// the mutants completed so far together with ctx.Err(), so a caller
+// interrupting a long run still gets a partial report rather than nothing.
+func Run(ctx context.Context, opts Options) (*Result, error) {
+	goBin, err := goproxy.Resolve()
+	if err != nil {
+		return nil, err
+	}
+
+	mutators, err := opts.mutators()
+	if err != nil {
+		return nil, err
+	}
+
+	pkgs, err := load(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	timeout, err := resolveTimeout(ctx, opts, goTestSuite(goBin, opts.Dir, opts.patterns()))
+	if err != nil {
+		return nil, err
+	}
+
+	run := &runner{goBin: goBin, testTimeout: timeout}
+
+	jobs, err := plan(ctx, goBin, opts, pkgs, mutators)
+	if err != nil {
+		return &Result{}, err
+	}
+
+	sink := &collector{result: &Result{}}
+	runErr := execute(ctx, run, jobs, opts.parallel(), sink)
+
+	return sink.sorted(), runErr
+}
+
+// execute drives the file workers, bounded at parallel files in flight.
+//
+// The group's context is derived from ctx, so the first failing file cancels
+// the rest instead of leaving a doomed run to grind through every remaining
+// mutant — each of which costs a full `go test`.
+func execute(ctx context.Context, run *runner, jobs []fileJob, parallel int, sink *collector) error {
+	group, groupCtx := errgroup.WithContext(ctx)
+	group.SetLimit(parallel)
+
+	for _, job := range jobs {
+		group.Go(func() error {
+			return mutateFile(groupCtx, run, job, sink)
+		})
+	}
+
+	return group.Wait()
+}
+
+// collector serialises the file workers' appends into one Result.
+//
+// Results are accumulated unordered and sorted once at the end rather than
+// being slotted into a pre-sized per-file position: how many mutants a file
+// yields is only known once its walk is finished.
+type collector struct {
+	mu     sync.Mutex
+	result *Result
+}
+
+// mutant records one mutant's verdict.
+func (c *collector) mutant(res MutantResult) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.result.Mutants = append(c.result.Mutants, res)
+}
+
+// suppression records one //nomutant hit.
+func (c *collector) suppression(res SuppressionResult) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.result.Suppressions = append(c.result.Suppressions, res)
+}
+
+// sorted restores the deterministic report order and returns the Result.
+func (c *collector) sorted() *Result {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	sort.SliceStable(c.result.Mutants, func(i, j int) bool {
+		a, b := c.result.Mutants[i], c.result.Mutants[j]
+
+		switch {
+		case a.File != b.File:
+			return a.File < b.File
+		case a.Line != b.Line:
+			return a.Line < b.Line
+		case a.Operator != b.Operator:
+			return a.Operator < b.Operator
+		default:
+			return a.Description < b.Description
+		}
+	})
+
+	sort.SliceStable(c.result.Suppressions, func(i, j int) bool {
+		a, b := c.result.Suppressions[i], c.result.Suppressions[j]
+
+		if a.File != b.File {
+			return a.File < b.File
+		}
+
+		return a.Line < b.Line
+	})
+
+	return c.result
+}
+
+// suiteTimer runs the unmutated test suite once and reports how long it took.
+//
+// It exists as a function type so the baseline arithmetic can be tested without
+// shelling out to a toolchain three times.
+type suiteTimer func(ctx context.Context) (time.Duration, error)
+
+// resolveTimeout decides the per-mutant timeout for a run.
+//
+// An explicit [Options.TestTimeout] wins and short-circuits: measuring a
+// baseline nobody is going to use would add three full suite runs to the front
+// of the run for nothing.
+func resolveTimeout(ctx context.Context, opts Options, timeSuite suiteTimer) (time.Duration, error) {
+	if opts.TestTimeout > 0 {
+		return opts.TestTimeout, nil
+	}
+
+	return baselineTimeout(ctx, baselineRuns, runtime.NumCPU(), timeSuite)
+}
+
+// baselineTimeout times the unmutated suite runs times and derives a per-mutant
+// budget from the mean.
+//
+// The mean is multiplied by the CPU count. That looks generous for a sequential
+// run, and it is — the multiplier is there because mutants are meant to run
+// concurrently (phase 5's -mutateparallel), and a suite sharing a machine with
+// NumCPU other suites takes correspondingly longer in wall-clock terms. Deriving
+// the same number in both modes keeps a mutant from being killed by the timeout
+// purely because the run was parallel.
+//
+// A failing baseline is a hard error. Every verdict a mutation run produces is
+// relative to a suite that passes on unmutated code; if it does not, every
+// mutant is "killed" by a failure that was already there and the whole report is
+// meaningless.
+func baselineTimeout(ctx context.Context, runs, cpus int, timeSuite suiteTimer) (time.Duration, error) {
+	if runs <= 0 || cpus <= 0 {
+		return MinBaselineTimeout, nil
+	}
+
+	var total time.Duration
+
+	for i := 0; i < runs; i++ {
+		elapsed, err := timeSuite(ctx)
+		if err != nil {
+			return 0, fmt.Errorf("mutate: baseline run %d of %d: %w", i+1, runs, err)
+		}
+
+		total += elapsed
+	}
+
+	timeout := (total / time.Duration(runs)) * time.Duration(cpus)
+	if timeout < MinBaselineTimeout {
+		return MinBaselineTimeout, nil
+	}
+
+	return timeout, nil
+}
+
+// patterns resolves the package patterns to load.
+func (o Options) patterns() []string {
+	if len(o.Packages) == 0 {
+		return []string{"."}
+	}
+
+	return o.Packages
+}
+
+// mutators resolves the operator set for a run.
+//
+// An unnamed set is [mutator.All], which is already sorted by name; a named set
+// keeps the order the caller gave, since that is just as reproducible and
+// reordering a user's list in an error message would be confusing.
+func (o Options) mutators() ([]mutator.Mutator, error) {
+	if len(o.Operators) == 0 {
+		return mutator.All(), nil
+	}
+
+	out := make([]mutator.Mutator, 0, len(o.Operators))
+
+	for _, name := range o.Operators {
+		m, err := mutator.New(name)
+		if err != nil {
+			return nil, err
+		}
+
+		out = append(out, m)
+	}
+
+	return out, nil
+}
+
+// parallel clamps the worker count to a usable value.
+func (o Options) parallel() int {
+	if o.Parallel < 1 {
+		return 1
+	}
+
+	return o.Parallel
+}
+
+// load resolves the target patterns to packages.
+//
+// The load mode asks only for names, files and module metadata: the engine
+// parses the files itself (with comments, which phase 4's //nomutant scan
+// needs) rather than reusing packages' syntax trees, and no operator needs type
+// information. That keeps the load cheap and avoids type-checking a module that
+// may not even type-check cleanly.
+func load(ctx context.Context, opts Options) ([]*packages.Package, error) {
+	cfg := &packages.Config{
+		Context: ctx,
+		Mode:    packages.NeedName | packages.NeedFiles | packages.NeedModule,
+		Dir:     opts.Dir,
+		Tests:   false,
+	}
+
+	pkgs, err := packages.Load(cfg, opts.patterns()...)
+	if err != nil {
+		return nil, fmt.Errorf("mutate: loading packages: %w", err)
+	}
+
+	var errs []error
+
+	packages.Visit(pkgs, nil, func(pkg *packages.Package) {
+		for _, e := range pkg.Errors {
+			errs = append(errs, fmt.Errorf("mutate: %s: %w", pkg.PkgPath, e))
+		}
+	})
+
+	if len(errs) > 0 {
+		return nil, errors.Join(errs...)
+	}
+
+	if len(pkgs) == 0 {
+		return nil, fmt.Errorf("mutate: no packages matched %v", opts.patterns())
+	}
+
+	return pkgs, nil
+}
+
+// fileJob is one file's share of a run: everything a worker needs to mutate it
+// without consulting any state shared with the other workers.
+type fileJob struct {
+	// moduleDir is the absolute root of the module holding path.
+	moduleDir string
+
+	// path is the absolute path of the file to mutate.
+	path string
+
+	// scope selects the tests each of this file's mutants is judged by. It is
+	// per job rather than read from Options so that a package whose coverage
+	// map could not be built can be demoted from [ScopeImpact] to
+	// [ScopePackage] on its own, without downgrading the whole run.
+	scope Scope
+
+	// cover is the package's line-to-tests coverage map, non-nil only when
+	// scope is [ScopeImpact].
+	cover *impactMap
+
+	// mutators is the operator set, shared read-only across all jobs.
+	mutators []mutator.Mutator
+}
+
+// plan enumerates the files to mutate and, for [ScopeImpact], builds each
+// package's coverage map before any mutant runs.
+//
+// The coverage maps are built here, up front and sequentially, rather than
+// lazily inside the workers: a map costs one `go test` per test function in the
+// package, and it is only worth that once, amortised over every mutant in the
+// package. Building it inside a worker would need locking around a
+// half-finished map for the sibling files of the same package to wait on, for
+// no gain.
+//
+// Packages outside a module are skipped rather than failing the run: the
+// temp-workspace strategy copies a module, so there is nothing to copy for a
+// GOPATH-style or synthetic package.
+func plan(ctx context.Context, goBin string, opts Options, pkgs []*packages.Package, mutators []mutator.Mutator) ([]fileJob, error) {
+	var jobs []fileJob
+
+	for _, pkg := range pkgs {
+		if pkg.Module == nil || pkg.Module.Dir == "" {
+			continue
+		}
+
+		var files []string
+
+		for _, path := range pkg.GoFiles {
+			// GoFiles already excludes _test.go (Tests is false), but mutating
+			// a test file would be meaningless even if one slipped through: the
+			// mutant and its own detector would be the same code.
+			if strings.HasSuffix(path, "_test.go") {
+				continue
+			}
+
+			files = append(files, path)
+		}
+
+		if len(files) == 0 {
+			continue
+		}
+
+		scope, cover := opts.Scope, (*impactMap)(nil)
+
+		if scope == ScopeImpact {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+
+			var err error
+
+			cover, err = buildImpact(ctx, goBin, pkg.Module.Dir, filepath.Dir(files[0]), pkg.GoFiles)
+			if err != nil {
+				if ctx.Err() != nil {
+					return nil, ctx.Err()
+				}
+
+				// Fail soft, per package. Impact scope is an optimisation over
+				// package scope, and every way of building the map can fail on
+				// a package that is nonetheless perfectly mutable: an
+				// unparseable `go test -list` output, a coverage profile a
+				// future toolchain writes differently, a test that only passes
+				// when run alongside its siblings. Demoting this one package to
+				// package scope costs time and nothing else, whereas failing
+				// the run would throw away every other package's work.
+				scope, cover = ScopePackage, nil
+			}
+		}
+
+		for _, path := range files {
+			jobs = append(jobs, fileJob{
+				moduleDir: pkg.Module.Dir,
+				path:      path,
+				scope:     scope,
+				cover:     cover,
+				mutators:  mutators,
+			})
+		}
+	}
+
+	return jobs, nil
+}
+
+// mutateFile parses one file and runs every mutation every operator offers for
+// it.
+//
+// One call owns its file completely: it is the unit of concurrency, and the
+// only state it shares with its siblings is the collector, which serialises
+// itself, and the read-only mutator set.
+//
+// The FileSet is per file rather than per run: positions only ever have to be
+// consistent within the file currently being printed, and a fresh set keeps
+// memory flat over a large module.
+func mutateFile(ctx context.Context, run *runner, job fileJob, sink *collector) error {
+	// Checked before parsing, not just inside the walk: with a bounded worker
+	// pool most jobs start after cancellation rather than before it, and
+	// parsing a file whose mutants will never run is pure waste.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	path := job.path
+	fset := token.NewFileSet()
+
+	// ParseComments is what makes //nomutant suppression possible: file.Comments
+	// is only populated with it, and re-parsing every file a second time to get
+	// them would double the engine's parse cost.
+	file, err := parser.ParseFile(fset, path, nil, parser.ParseComments)
+	if err != nil {
+		return fmt.Errorf("mutate: parsing %s: %w", path, err)
+	}
+
+	// Scanned once per file rather than per node: the directives are a property
+	// of the source text, not of the walk.
+	suppressed := scanSuppressions(fset, file)
+
+	// The baseline for the no-op check is the *printed* pristine AST, not the
+	// bytes on disk: go/printer normalises formatting, so comparing against
+	// disk would flag every mutant in an unformatted file as changed and every
+	// printer-masked mutation as changed too. Printing both sides through the
+	// same pipeline makes the comparison mean exactly "did this mutation change
+	// the generated source".
+	var baseline bytes.Buffer
+	if err := printer.Fprint(&baseline, fset, file); err != nil {
+		return fmt.Errorf("mutate: printing %s: %w", path, err)
+	}
+
+	spec := mutant{
+		fset:      fset,
+		file:      file,
+		path:      path,
+		baseline:  baseline.Bytes(),
+		moduleDir: job.moduleDir,
+		pkgDir:    filepath.Dir(path),
+		scope:     job.scope,
+	}
+
+	var walkErr error
+
+	ast.Inspect(file, func(node ast.Node) bool {
+		if node == nil || walkErr != nil {
+			return false
+		}
+
+		if err := ctx.Err(); err != nil {
+			walkErr = err
+
+			return false
+		}
+
+		// Returning false is what makes suppression cascade: ast.Inspect skips
+		// the node's children but carries on with its siblings, so a directive
+		// on a compound statement covers everything nested inside it without
+		// the walk having to carry any "am I inside a suppressed subtree" state.
+		if reason, ok := suppressed.anchored(fset, node); ok {
+			sink.suppression(SuppressionResult{
+				File:   path,
+				Line:   fset.Position(node.Pos()).Line,
+				Reason: reason,
+			})
+
+			return false
+		}
+
+		for _, m := range job.mutators {
+			if !m.Applies(node) {
+				continue
+			}
+
+			spec.operator = m.Name()
+			spec.line = fset.Position(node.Pos()).Line
+			// Looked up per node rather than per mutant: every mutation of a
+			// node shares its line, and the map is only consulted at all under
+			// ScopeImpact (covering reports nil for a nil map).
+			spec.covering = job.cover.covering(path, spec.line)
+
+			for _, mutation := range m.Mutate(node) {
+				if err := ctx.Err(); err != nil {
+					walkErr = err
+
+					return false
+				}
+
+				spec.mutation = mutation
+
+				res, err := run.run(ctx, spec)
+				if err != nil {
+					walkErr = err
+
+					return false
+				}
+
+				if res != nil {
+					sink.mutant(*res)
+				}
+			}
+		}
+
+		return true
+	})
+
+	return walkErr
+}

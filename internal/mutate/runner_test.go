@@ -1,0 +1,515 @@
+package mutate
+
+import (
+	"bytes"
+	"context"
+	"go/ast"
+	"go/parser"
+	"go/printer"
+	"go/token"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
+	"testing"
+
+	"github.com/jh125486/turango/internal/mutator"
+)
+
+// The samples below are verbatim `go test -json` output captured from a real
+// toolchain against a throwaway module, trimmed only of lines the classifier
+// does not read. They are the contract this classifier is written against, so
+// they are pasted rather than generated.
+
+const passStream = `{"Time":"2026-08-05T16:03:00.089842-07:00","Action":"start","Package":"example.com/fixture/mathx"}
+{"Time":"2026-08-05T16:03:00.566645-07:00","Action":"run","Package":"example.com/fixture/mathx","Test":"TestClamp"}
+{"Time":"2026-08-05T16:03:00.569463-07:00","Action":"output","Package":"example.com/fixture/mathx","Test":"TestClamp","Output":"=== RUN   TestClamp\n"}
+{"Time":"2026-08-05T16:03:00.569498-07:00","Action":"output","Package":"example.com/fixture/mathx","Test":"TestClamp","Output":"--- PASS: TestClamp (0.00s)\n"}
+{"Time":"2026-08-05T16:03:00.569505-07:00","Action":"pass","Package":"example.com/fixture/mathx","Test":"TestClamp","Elapsed":0}
+{"Time":"2026-08-05T16:03:00.569554-07:00","Action":"output","Package":"example.com/fixture/mathx","Output":"PASS\n"}
+{"Time":"2026-08-05T16:03:00.569617-07:00","Action":"output","Package":"example.com/fixture/mathx","Output":"ok  \texample.com/fixture/mathx\t0.480s\n"}
+{"Time":"2026-08-05T16:03:00.569815-07:00","Action":"pass","Package":"example.com/fixture/mathx","Elapsed":0.48}
+`
+
+const failStream = `{"Time":"2026-08-05T16:03:12.500158-07:00","Action":"start","Package":"example.com/fixture/mathx"}
+{"Time":"2026-08-05T16:03:13.004879-07:00","Action":"run","Package":"example.com/fixture/mathx","Test":"TestClamp"}
+{"Time":"2026-08-05T16:03:13.005033-07:00","Action":"run","Package":"example.com/fixture/mathx","Test":"TestSum"}
+{"Time":"2026-08-05T16:03:13.005038-07:00","Action":"output","Package":"example.com/fixture/mathx","Test":"TestSum","Output":"    mathx_test.go:19: Sum = -6\n"}
+{"Time":"2026-08-05T16:03:13.005053-07:00","Action":"output","Package":"example.com/fixture/mathx","Test":"TestSum","Output":"--- FAIL: TestSum (0.00s)\n"}
+{"Time":"2026-08-05T16:03:13.005057-07:00","Action":"fail","Package":"example.com/fixture/mathx","Test":"TestSum","Elapsed":0}
+{"Time":"2026-08-05T16:03:13.005078-07:00","Action":"output","Package":"example.com/fixture/mathx","Output":"FAIL\n"}
+{"Time":"2026-08-05T16:03:13.005547-07:00","Action":"output","Package":"example.com/fixture/mathx","Output":"FAIL\texample.com/fixture/mathx\t0.505s\n"}
+{"Time":"2026-08-05T16:03:13.005568-07:00","Action":"fail","Package":"example.com/fixture/mathx","Elapsed":0.505}
+`
+
+// buildFailStream is what a modern toolchain (Go 1.24+) emits: the compiler's
+// diagnostics arrive as build-output/build-fail events on stdout, keyed by
+// ImportPath rather than Package, and stderr stays empty.
+const buildFailStream = `{"ImportPath":"example.com/fixture/mathx [example.com/fixture/mathx.test]","Action":"build-output","Output":"# example.com/fixture/mathx [example.com/fixture/mathx.test]\n"}
+{"ImportPath":"example.com/fixture/mathx [example.com/fixture/mathx.test]","Action":"build-output","Output":"mathx/mathx.go:18:12: undefined: undefinedVar\n"}
+{"ImportPath":"example.com/fixture/mathx [example.com/fixture/mathx.test]","Action":"build-fail"}
+{"Time":"2026-08-05T16:03:13.147299-07:00","Action":"start","Package":"example.com/fixture/mathx"}
+{"Time":"2026-08-05T16:03:13.147325-07:00","Action":"output","Package":"example.com/fixture/mathx","Output":"FAIL\texample.com/fixture/mathx [build failed]\n"}
+{"Time":"2026-08-05T16:03:13.147329-07:00","Action":"fail","Package":"example.com/fixture/mathx","Elapsed":0,"FailedBuild":"example.com/fixture/mathx [example.com/fixture/mathx.test]"}
+`
+
+// legacyBuildFailStdout / legacyBuildFailStderr are the pre-1.24 shape: the
+// compiler writes to stderr, outside the event stream entirely, and stdout only
+// carries a package-level failure with no test ever having run.
+const legacyBuildFailStdout = `{"Time":"2026-08-05T16:03:13.147299-07:00","Action":"start","Package":"example.com/fixture/mathx"}
+{"Time":"2026-08-05T16:03:13.147325-07:00","Action":"output","Package":"example.com/fixture/mathx","Output":"FAIL\texample.com/fixture/mathx [build failed]\n"}
+{"Time":"2026-08-05T16:03:13.147329-07:00","Action":"fail","Package":"example.com/fixture/mathx","Elapsed":0}
+`
+
+const legacyBuildFailStderr = `# example.com/fixture/mathx [example.com/fixture/mathx.test]
+mathx/mathx.go:18:12: undefined: undefinedVar
+`
+
+// noTestFilesStream is a package with no tests at all: the package is skipped,
+// nothing fails, and no test-level event ever appears.
+const noTestFilesStream = `{"Time":"2026-08-05T16:03:13.147299-07:00","Action":"start","Package":"example.com/fixture/app"}
+{"Time":"2026-08-05T16:03:13.147325-07:00","Action":"output","Package":"example.com/fixture/app","Output":"?   \texample.com/fixture/app\t[no test files]\n"}
+{"Time":"2026-08-05T16:03:13.147329-07:00","Action":"skip","Package":"example.com/fixture/app","Elapsed":0}
+`
+
+func TestClassify(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		stdout     string
+		stderr     string
+		want       Status
+		wantOutput string // substring the reconstructed output must contain
+	}{
+		"all tests pass": {
+			stdout:     passStream,
+			want:       Survived,
+			wantOutput: "ok  \texample.com/fixture/mathx",
+		},
+		"a test fails": {
+			stdout:     failStream,
+			want:       Killed,
+			wantOutput: "--- FAIL: TestSum",
+		},
+		"build failure, modern events": {
+			stdout:     buildFailStream,
+			want:       NotViable,
+			wantOutput: "undefined: undefinedVar",
+		},
+		"build failure, diagnostics on stderr": {
+			stdout:     legacyBuildFailStdout,
+			stderr:     legacyBuildFailStderr,
+			want:       NotViable,
+			wantOutput: "undefined: undefinedVar",
+		},
+		"package has no test files": {
+			stdout:     noTestFilesStream,
+			want:       Survived,
+			wantOutput: "[no test files]",
+		},
+		"nothing at all": {
+			want: Survived,
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			got, out := classify([]byte(tt.stdout), []byte(tt.stderr))
+			if got != tt.want {
+				t.Errorf("classify() = %v, want %v\noutput:\n%s", got, tt.want, out)
+			}
+
+			if tt.wantOutput != "" && !strings.Contains(out, tt.wantOutput) {
+				t.Errorf("classify() output = %q, want it to contain %q", out, tt.wantOutput)
+			}
+		})
+	}
+}
+
+// TestClassifyIgnoresTestOutputThatLooksLikeACompileError guards the one way
+// the compile-error heuristic could misfire: a test that prints something
+// shaped like a compiler diagnostic must still be classified by its events.
+func TestClassifyIgnoresTestOutputThatLooksLikeACompileError(t *testing.T) {
+	t.Parallel()
+
+	stream := `{"Action":"run","Package":"p","Test":"TestX"}
+{"Action":"output","Package":"p","Test":"TestX","Output":"    x_test.go:9:3: undefined: whatever\n"}
+{"Action":"output","Package":"p","Test":"TestX","Output":"--- FAIL: TestX (0.00s)\n"}
+{"Action":"fail","Package":"p","Test":"TestX","Elapsed":0}
+{"Action":"fail","Package":"p","Elapsed":0.1}
+`
+
+	if got, _ := classify([]byte(stream), nil); got != Killed {
+		t.Errorf("classify() = %v, want %v", got, Killed)
+	}
+}
+
+func TestTruncateKeepsTail(t *testing.T) {
+	t.Parallel()
+
+	long := strings.Repeat("x", maxOutputBytes) + "TAIL"
+
+	got := truncate(long)
+	if !strings.HasSuffix(got, "TAIL") {
+		t.Error("truncate() dropped the tail")
+	}
+
+	if !strings.HasPrefix(got, "...(truncated)...") {
+		t.Error("truncate() did not mark the output as truncated")
+	}
+
+	if short := truncate("short"); short != "short" {
+		t.Errorf("truncate(%q) = %q, want it unchanged", "short", short)
+	}
+}
+
+// TestRunSkipsNoOpMutation covers the skip path: a mutation whose printed
+// source is identical to the original is not a mutant, so run must report
+// neither a result nor an error — and must not touch the filesystem or shell
+// out, which is why this runner has a deliberately unusable go binary path.
+func TestRunSkipsNoOpMutation(t *testing.T) {
+	t.Parallel()
+
+	const src = `package p
+
+func f(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+`
+
+	fset := token.NewFileSet()
+
+	file, err := parser.ParseFile(fset, "p.go", src, parser.ParseComments)
+	if err != nil {
+		t.Fatalf("ParseFile() error = %v", err)
+	}
+
+	var baseline bytes.Buffer
+	if err := printer.Fprint(&baseline, fset, file); err != nil {
+		t.Fatalf("Fprint() error = %v", err)
+	}
+
+	var applied, reverted bool
+
+	r := &runner{goBin: "/nonexistent/go", testTimeout: MinBaselineTimeout}
+
+	got, err := r.run(context.Background(), mutant{
+		fset:      fset,
+		file:      file,
+		path:      "/nowhere/p.go",
+		baseline:  baseline.Bytes(),
+		moduleDir: "/nowhere",
+		pkgDir:    "/nowhere",
+		operator:  "test/noop",
+		line:      4,
+		mutation: mutator.Mutation{
+			Description: "no-op",
+			Apply:       func() { applied = true },
+			Revert:      func() { reverted = true },
+		},
+	})
+	if err != nil {
+		t.Fatalf("run() error = %v, want nil", err)
+	}
+
+	if got != nil {
+		t.Errorf("run() = %+v, want nil for a no-op mutation", got)
+	}
+
+	if !applied || !reverted {
+		t.Errorf("run() applied = %v, reverted = %v; want both true", applied, reverted)
+	}
+}
+
+// TestMutantTestArgs pins the flag surface each scope produces, which is what
+// decides how much of the module gets to catch a mutant.
+func TestMutantTestArgs(t *testing.T) {
+	t.Parallel()
+
+	base := mutant{
+		moduleDir: filepath.FromSlash("/m"),
+		pkgDir:    filepath.FromSlash("/m/internal/mathx"),
+	}
+
+	tests := map[string]struct {
+		scope    Scope
+		covering []string
+		want     []string
+	}{
+		"full runs the whole module": {
+			scope: ScopeFull,
+			want:  []string{"./..."},
+		},
+		"package runs only the mutated package": {
+			scope: ScopePackage,
+			want:  []string{"./internal/mathx"},
+		},
+		"impact runs only the covering tests": {
+			scope:    ScopeImpact,
+			covering: []string{"TestClamp", "TestDescribe"},
+			want: []string{
+				"-run=^(TestClamp|TestDescribe)$",
+				"-coverpkg=./internal/mathx",
+				"./internal/mathx",
+			},
+		},
+		"impact with a single covering test": {
+			scope:    ScopeImpact,
+			covering: []string{"TestClamp"},
+			want: []string{
+				"-run=^(TestClamp)$",
+				"-coverpkg=./internal/mathx",
+				"./internal/mathx",
+			},
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			m := base
+			m.scope = tt.scope
+			m.covering = tt.covering
+
+			got, err := m.testArgs()
+			if err != nil {
+				t.Fatalf("testArgs() error = %v", err)
+			}
+
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("testArgs() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestRunSkipsUncoveredMutant covers impact scope's payoff: a mutant on a line
+// no test executes is decided by the coverage map alone. The unusable go binary
+// is the assertion — reaching the toolchain at all would fail the test.
+func TestRunSkipsUncoveredMutant(t *testing.T) {
+	t.Parallel()
+
+	const src = `package p
+
+func f(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+`
+
+	fset := token.NewFileSet()
+
+	file, err := parser.ParseFile(fset, "p.go", src, parser.ParseComments)
+	if err != nil {
+		t.Fatalf("ParseFile() error = %v", err)
+	}
+
+	var baseline bytes.Buffer
+	if err := printer.Fprint(&baseline, fset, file); err != nil {
+		t.Fatalf("Fprint() error = %v", err)
+	}
+
+	// A mutation that genuinely changes the printed source, so the no-op
+	// short-circuit cannot be what makes this pass.
+	decl := file.Decls[0].(*ast.FuncDecl)
+	stmt := decl.Body.List[0].(*ast.IfStmt)
+	original := stmt.Cond
+
+	r := &runner{goBin: "/nonexistent/go", testTimeout: MinBaselineTimeout}
+
+	got, err := r.run(context.Background(), mutant{
+		fset:      fset,
+		file:      file,
+		path:      "/nowhere/p.go",
+		baseline:  baseline.Bytes(),
+		moduleDir: "/nowhere",
+		pkgDir:    "/nowhere",
+		operator:  "control/if",
+		line:      4,
+		scope:     ScopeImpact,
+		covering:  nil,
+		mutation: mutator.Mutation{
+			Description: "if -> false",
+			Apply:       func() { stmt.Cond = ast.NewIdent("false") },
+			Revert:      func() { stmt.Cond = original },
+		},
+	})
+	if err != nil {
+		t.Fatalf("run() error = %v", err)
+	}
+
+	if got == nil {
+		t.Fatal("run() = nil, want a survived verdict for an uncovered line")
+	}
+
+	if got.Status != Survived {
+		t.Errorf("run() status = %v, want %v", got.Status, Survived)
+	}
+
+	if !strings.Contains(got.Output, "no test") {
+		t.Errorf("run() output = %q, want it to explain that no test covers the line", got.Output)
+	}
+
+	if stmt.Cond != original {
+		t.Error("run() left the mutation applied to the shared AST")
+	}
+}
+
+func TestPackagePattern(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		moduleDir, pkgDir, want string
+	}{
+		"root package":   {moduleDir: "/m", pkgDir: "/m", want: "."},
+		"nested package": {moduleDir: "/m", pkgDir: "/m/internal/foo", want: "./internal/foo"},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := packagePattern(filepath.FromSlash(tt.moduleDir), filepath.FromSlash(tt.pkgDir))
+			if err != nil {
+				t.Fatalf("packagePattern() error = %v", err)
+			}
+
+			if got != tt.want {
+				t.Errorf("packagePattern() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCommonDir(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		paths []string
+		want  string
+	}{
+		"single path":     {paths: []string{"/a/b/c"}, want: "/a/b/c"},
+		"siblings":        {paths: []string{"/a/b/c", "/a/b/d"}, want: "/a/b"},
+		"nested":          {paths: []string{"/a/b", "/a/b/c/d"}, want: "/a/b"},
+		"only root":       {paths: []string{"/a", "/b"}, want: "/"},
+		"nothing at all":  {paths: nil, want: ""},
+		"three way split": {paths: []string{"/a/b/c", "/a/b/d/e", "/a/x"}, want: "/a"},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			paths := make([]string, 0, len(tt.paths))
+			for _, p := range tt.paths {
+				paths = append(paths, filepath.FromSlash(p))
+			}
+
+			if got := commonDir(paths); got != filepath.FromSlash(tt.want) {
+				t.Errorf("commonDir(%v) = %q, want %q", tt.paths, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestCopyModuleWithLocalReplace exercises the workspace copy against the shape
+// that actually breaks naive copiers: a module that replaces a dependency with
+// a sibling checkout, embeds a non-Go asset, and vendors nothing in particular.
+func TestCopyModuleWithLocalReplace(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	main := filepath.Join(root, "main")
+	lib := filepath.Join(root, "lib")
+
+	writeFiles(t, map[string]string{
+		filepath.Join(main, "go.mod"): `module example.com/main
+
+go 1.23
+
+require example.com/lib v0.0.0
+
+replace example.com/lib => ../lib
+`,
+		filepath.Join(main, "assets", "banner.txt"):  "hello\n",
+		filepath.Join(main, "vendor", "modules.txt"): "# example.com/lib v0.0.0\n",
+		filepath.Join(main, ".git", "config"):        "[core]\n",
+		filepath.Join(lib, "go.mod"):                 "module example.com/lib\n\ngo 1.23\n",
+		filepath.Join(lib, "lib.go"):                 "package lib\n",
+	})
+
+	dst := t.TempDir()
+
+	copied, err := copyModule(dst, main)
+	if err != nil {
+		t.Fatalf("copyModule() error = %v", err)
+	}
+
+	// Non-Go assets and vendor/ must survive at their original relative paths,
+	// or //go:embed and -mod=vendor builds break in the copy.
+	for _, rel := range []string{"go.mod", "assets/banner.txt", "vendor/modules.txt"} {
+		if _, err := os.Stat(filepath.Join(copied, filepath.FromSlash(rel))); err != nil {
+			t.Errorf("copied module is missing %s: %v", rel, err)
+		}
+	}
+
+	if _, err := os.Stat(filepath.Join(copied, ".git")); !os.IsNotExist(err) {
+		t.Errorf(".git was copied into the workspace; err = %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(copied, "go.mod"))
+	if err != nil {
+		t.Fatalf("reading copied go.mod: %v", err)
+	}
+
+	target := replaceTarget(t, string(data))
+	if !strings.HasPrefix(target, "./") && !strings.HasPrefix(target, "../") {
+		t.Fatalf("rewritten replace target %q is not a filesystem path", target)
+	}
+
+	resolved := filepath.Join(copied, filepath.FromSlash(target))
+	if _, err := os.Stat(filepath.Join(resolved, "go.mod")); err != nil {
+		t.Errorf("replace target %q does not resolve to a copied module: %v", target, err)
+	}
+}
+
+// replaceTarget pulls the right-hand side out of the single replace line in a
+// go.mod.
+func replaceTarget(t *testing.T, gomod string) string {
+	t.Helper()
+
+	for _, line := range strings.Split(gomod, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 4 && fields[0] == "replace" && fields[2] == "=>" {
+			return fields[3]
+		}
+	}
+
+	t.Fatalf("no replace directive found in:\n%s", gomod)
+
+	return ""
+}
+
+// writeFiles creates every named file, and the directories holding them, with
+// the given contents.
+func writeFiles(t *testing.T, files map[string]string) {
+	t.Helper()
+
+	for path, content := range files {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatalf("MkdirAll(%s) error = %v", filepath.Dir(path), err)
+		}
+
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatalf("WriteFile(%s) error = %v", path, err)
+		}
+	}
+}
