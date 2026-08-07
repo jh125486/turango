@@ -1,0 +1,13 @@
+{
+  "description": "Minimal integration fixture for operator/binary: Sum's `a + b` is never exercised by any test, so the +/- swap survives. Deliberately the smallest possible fixture (one mutant) to isolate this operator cleanly.",
+  "modulePath": "corpus/op-operator-binary/module",
+  "scope": "package",
+  "operators": null,
+  "timeout": "15s",
+  "expect": {
+    "mutants": 1,
+    "killed": 0,
+    "survived": 1,
+    "notViable": 0
+  }
+}

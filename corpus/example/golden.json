@@ -1,0 +1,15 @@
+{
+  "description": "turango's own example/ demo package, run in-place against turango's own module. Package-scoped only -- full scope has a known pathological self-reference issue documented in PROGRESS.md.",
+  "modulePath": "",
+  "target": "./example/...",
+  "scope": "package",
+  "operators": null,
+  "timeout": "30s",
+  "expect": {
+    "mutants": 219,
+    "killed": 151,
+    "survived": 60,
+    "notViable": 8,
+    "suppressed": 2
+  }
+}

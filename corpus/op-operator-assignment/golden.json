@@ -1,0 +1,13 @@
+{
+  "description": "Minimal integration fixture for operator/assignment: Double's `x *= 2` is never exercised by any test, so its compound-assignment swap survives alongside literal/number and statement/remover's independent mutations on the same statement.",
+  "modulePath": "corpus/op-operator-assignment/module",
+  "scope": "package",
+  "operators": null,
+  "timeout": "15s",
+  "expect": {
+    "mutants": 4,
+    "killed": 0,
+    "survived": 4,
+    "notViable": 0
+  }
+}

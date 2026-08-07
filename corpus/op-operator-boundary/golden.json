@@ -1,0 +1,13 @@
+{
+  "description": "Minimal integration fixture for operator/boundary: BelowLimit's `x < limit` is never exercised by any test, so the classic off-by-one boundary shift (< -> <=) survives alongside operator/binary's independent negation swap (< -> >=) on the same comparison.",
+  "modulePath": "corpus/op-operator-boundary/module",
+  "scope": "package",
+  "operators": null,
+  "timeout": "15s",
+  "expect": {
+    "mutants": 2,
+    "killed": 0,
+    "survived": 2,
+    "notViable": 0
+  }
+}

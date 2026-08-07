@@ -1,0 +1,13 @@
+{
+  "description": "crypto/x509/pkix (Go stdlib, frozen copy): ASN.1 structures for X.509 cert/CRL/OCSP parsing. Historically had zero tests (see PROPOSAL.md in this repo for the 2018-vs-2026 comparison).",
+  "modulePath": "corpus/stdlib-x509-pkix/module",
+  "scope": "package",
+  "operators": null,
+  "timeout": "30s",
+  "expect": {
+    "mutants": 291,
+    "killed": 0,
+    "survived": 256,
+    "notViable": 35
+  }
+}

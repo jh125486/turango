@@ -1,0 +1,13 @@
+{
+  "description": "Minimal integration fixture for expression/remove: InRange's && condition is never exercised by any test, so both operand-elimination mutations (left, right) survive, alongside operator/binary and operator/boundary's independent mutations on the same comparisons.",
+  "modulePath": "corpus/op-expression-remove/module",
+  "scope": "package",
+  "operators": null,
+  "timeout": "15s",
+  "expect": {
+    "mutants": 7,
+    "killed": 0,
+    "survived": 7,
+    "notViable": 0
+  }
+}

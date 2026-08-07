@@ -1,0 +1,13 @@
+{
+  "description": "Minimal integration fixture for control/else: Sign's else-body is never exercised by any test. Two of the six generated mutants are not-viable (emptying the else body leaves a code path with no return in a function that must return a string).",
+  "modulePath": "corpus/op-control-else/module",
+  "scope": "package",
+  "operators": null,
+  "timeout": "15s",
+  "expect": {
+    "mutants": 6,
+    "killed": 0,
+    "survived": 4,
+    "notViable": 2
+  }
+}

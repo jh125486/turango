@@ -1,0 +1,13 @@
+{
+  "description": "Minimal integration fixture for literal/number: TooManyRetries' `count > 3` is never exercised by any test, so both the +1/-1 literal shifts survive alongside operator/binary and operator/boundary's independent mutations on the same comparison.",
+  "modulePath": "corpus/op-literal-number/module",
+  "scope": "package",
+  "operators": null,
+  "timeout": "15s",
+  "expect": {
+    "mutants": 4,
+    "killed": 0,
+    "survived": 4,
+    "notViable": 0
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "description": "Minimal integration fixture for the //nomutant directive: Guarded's if-statement carries a //nomutant comment, which cascades to suppress every mutation nested inside its body too (per the cascading-scope design in the plan), leaving zero mutants generated at all.",
+  "modulePath": "corpus/op-suppress-nomutant/module",
+  "scope": "package",
+  "operators": null,
+  "timeout": "15s",
+  "expect": {
+    "mutants": 0,
+    "killed": 0,
+    "survived": 0,
+    "notViable": 0,
+    "suppressed": 1
+  }
+}

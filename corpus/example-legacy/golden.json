@@ -1,0 +1,14 @@
+{
+  "description": "turango's own example/legacy demo package (ported from the original go-turango prototype, single coarse assert.Equal-style assertion), run in-place against turango's own module. Package-scoped only.",
+  "modulePath": "",
+  "target": "./example/legacy/...",
+  "scope": "package",
+  "operators": null,
+  "timeout": "30s",
+  "expect": {
+    "mutants": 74,
+    "killed": 43,
+    "survived": 29,
+    "notViable": 2
+  }
+}

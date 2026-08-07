@@ -1,0 +1,13 @@
+{
+  "description": "Minimal integration fixture for operator/inc_dec: Next's `x++` is never exercised by any test, so the ++/-- swap survives alongside statement/remover's independent mutation on the same statement.",
+  "modulePath": "corpus/op-operator-incdec/module",
+  "scope": "package",
+  "operators": null,
+  "timeout": "15s",
+  "expect": {
+    "mutants": 2,
+    "killed": 0,
+    "survived": 2,
+    "notViable": 0
+  }
+}

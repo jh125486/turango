@@ -1,0 +1,13 @@
+{
+  "description": "Minimal integration fixture for statement/remover: Accumulate's loop body is never exercised by any test. One of the four generated mutants is not-viable (removing `total += v` orphans a range variable when the mutated build's vet-adjacent checks catch it, matching the same failure mode documented in ROADMAP.md's TCE section for statement removal).",
+  "modulePath": "corpus/op-statement-remover/module",
+  "scope": "package",
+  "operators": null,
+  "timeout": "15s",
+  "expect": {
+    "mutants": 4,
+    "killed": 0,
+    "survived": 3,
+    "notViable": 1
+  }
+}

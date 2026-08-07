@@ -1,0 +1,13 @@
+{
+  "description": "Minimal integration fixture for control/case: Grade's switch cases are never exercised by any test. Three of the eleven generated mutants are not-viable (emptying a case body can leave a code path with no return).",
+  "modulePath": "corpus/op-control-case/module",
+  "scope": "package",
+  "operators": null,
+  "timeout": "15s",
+  "expect": {
+    "mutants": 11,
+    "killed": 0,
+    "survived": 8,
+    "notViable": 3
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "description": "Minimal integration fixture for operator/unary: Check's `if !ok` puts the UnaryExpr directly in IfStmt.Cond, one of the three positions operator/unary recognizes. Never exercised by any test, so the strip-! mutation survives alongside control/if, literal/number and operator/binary's independent mutations nearby.",
+  "modulePath": "corpus/op-operator-unary/module",
+  "scope": "package",
+  "operators": null,
+  "timeout": "15s",
+  "expect": {
+    "mutants": 6,
+    "killed": 0,
+    "survived": 6,
+    "notViable": 0
+  }
+}

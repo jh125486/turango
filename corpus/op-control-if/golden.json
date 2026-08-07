@@ -1,0 +1,13 @@
+{
+  "description": "Minimal integration fixture for control/if: Clamp's if-body is never exercised by any test, so every mutation on it (body removal, plus every other operator that also matches the same node: literal/number, operator/binary, operator/boundary, statement/remover) survives.",
+  "modulePath": "corpus/op-control-if/module",
+  "scope": "package",
+  "operators": null,
+  "timeout": "15s",
+  "expect": {
+    "mutants": 8,
+    "killed": 0,
+    "survived": 8,
+    "notViable": 0
+  }
+}

@@ -38,3 +38,29 @@ jobs:
 
       - name: Test (race)
         run: go test -race ./...
+
+      - name: Corpus regression
+        # The corpus package's own TestCorpus skips under -short and this
+        # repo's "Test"/"Test (race)" steps above already run without
+        # -short, so this step technically re-runs work those steps already
+        # did. It stays as its own step anyway: a distinct, clearly-named
+        # step keeps the corpus run's pass/fail and wall-clock time
+        # independently visible in the CI UI, separate from the rest of the
+        # suite, and easy to re-run or tune (e.g. -run) without touching the
+        # general test steps.
+        #
+        # -timeout is explicit and generous for a reason verified the hard
+        # way while building this: `go test` applies its own default 10m
+        # process-wide timeout regardless of any context timeout inside the
+        # test, and that default panics the whole binary (no per-entry
+        # attribution, no clean failure) rather than failing one slow
+        # subtest. TestCorpus runs its entries sequentially, not in
+        # parallel, specifically so each entry's time is attributable; a
+        # single entry (crypto/aes, full-module scope) alone can run
+        # hundreds of mutants, each compiling and `go test`-ing its own
+        # module copy, so the corpus as a whole needs real headroom. The
+        # step's own timeout-minutes sits comfortably above -timeout so a
+        # hang shows up as a `go test` timeout with output, not a bare
+        # runner cancellation.
+        run: go test -run TestCorpus -v -timeout=45m ./internal/corpus/...
+        timeout-minutes: 60

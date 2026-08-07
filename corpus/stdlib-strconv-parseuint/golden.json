@@ -1,0 +1,13 @@
+{
+  "description": "strconv (Go stdlib, frozen pre-fix copy, golang/go#21278): ParseUint returned maxUint64 instead of the bitSize-correct maxVal on overflow. This is a wrong-constant-substitution bug that none of turango's current operators can reproduce (an honest negative case) -- see ROADMAP.md in this repo.",
+  "modulePath": "corpus/stdlib-strconv-parseuint/module",
+  "scope": "package",
+  "operators": null,
+  "timeout": "30s",
+  "expect": {
+    "mutants": 157,
+    "killed": 40,
+    "survived": 101,
+    "notViable": 16
+  }
+}

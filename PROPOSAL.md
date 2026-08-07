@@ -268,6 +268,13 @@ it to shadow `go` on `PATH` is supported as an explicit opt-in experimental
 mode, not a default, given the blast radius of a single unhandled `go`
 verb breaking every tool on a machine that shells out to `go`.
 
+turango itself is a from-scratch 2026 rebuild, not a port of the 2018
+`go-turango` codebase — written with Claude, applying the lessons the 2018
+paper's own "Future Work" section identified as unfinished (see Background,
+above): an in-memory diff engine, coverage-directed test selection,
+per-operator enable/disable, `//nomutant` suppression, and CI-gating via a
+score threshold are all now implemented, none of them present in 2018.
+
 ## Costs and risks
 
 - **Runtime cost.** Mutation testing is inherently slower than a normal
