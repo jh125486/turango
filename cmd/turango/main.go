@@ -1,8 +1,14 @@
 // Command turango is a drop-in replacement for the go command that adds
 // mutation testing as a `go test` flag.
 //
-//	turango test -mutate=./...   # run the mutation engine
-//	turango build ./...          # forwarded verbatim to the real go toolchain
+//	turango test -mutate=. ./...   # run the mutation engine
+//	turango build ./...            # forwarded verbatim to the real go toolchain
+//
+// -mutate behaves like -run/-bench/-fuzz: its value is a regular expression
+// matched against function/method names, not a package selector. Package
+// selection is the ordinary trailing package arguments, exactly as with
+// those three flags — "-mutate=." (mirroring "-bench=.") means "match every
+// function," with ./... supplying which packages to look in.
 //
 // Every invocation that is not `test` with a -mutate= flag is handed to the
 // real Go toolchain unchanged, so turango behaves exactly like go plus one new
@@ -18,6 +24,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -263,7 +270,7 @@ unhandled verb or flag breaks your whole toolchain, not just mutation testing.
 
 Use the supported form instead:
 
-    turango test -mutate=./...
+    turango test -mutate=. ./...
 
 or, if you understand the blast radius, set %s=1 to enable alias mode.`, base, aliasEnvVar)
 }
@@ -285,7 +292,8 @@ type mutateConfig struct {
 }
 
 // parseMutateFlags scans the arguments that follow `test` for turango's own
-// flags.
+// flags plus, exactly as with `-run`/`-bench`/`-fuzz`, ordinary trailing
+// package arguments.
 //
 // It returns (nil, nil) when the arguments are not a mutation request at all —
 // the ordinary `turango test ./...` case — which is what sends the invocation
@@ -337,20 +345,36 @@ func parseMutateFlags(args []string) (*mutateConfig, error) {
 		}
 	}
 
+	// Nothing is validated against leftover until we know -mutate was
+	// actually given: an ordinary `turango test -v -race ./...` (no -mutate
+	// at all) must forward untouched to the real go command exactly as
+	// before, including whatever real go test flags it carries — those are
+	// none of turango's business unless mutation mode was actually
+	// requested.
 	if !found {
 		return nil, nil
 	}
 
-	if len(leftover) > 0 {
-		// Guessing is the alternative, and the guesses are all bad: a bare
-		// pattern could be a second mutation target or a package the tests
-		// should run from, and a real `go test` flag could change the meaning
-		// of every mutant's test run in ways the engine does not model. Phase 5
-		// draws the line at turango's own flags and says so.
-		return nil, fmt.Errorf(
-			"turango: unsupported argument %q alongside -%s: mutation mode understands only the -mutateXXX= flags (%s)",
-			leftover[0], flagMutate, strings.Join(mutateFlags, ", "))
+	var packages []string
+
+	for _, arg := range leftover {
+		// A bare, dash-less argument is a legitimate positional package
+		// pattern — exactly what -run/-bench/-fuzz already leave to go
+		// test's own trailing arguments. Anything else starting with "-" is
+		// an unrecognised go test flag: guessing what it should do to a
+		// mutant's test run is the alternative, and the guesses are all
+		// bad, so it is rejected rather than silently ignored or
+		// misapplied.
+		if strings.HasPrefix(arg, "-") {
+			return nil, fmt.Errorf(
+				"turango: unsupported flag %q alongside -%s: mutation mode understands only the -mutateXXX= flags (%s) plus trailing package patterns",
+				arg, flagMutate, strings.Join(mutateFlags, ", "))
+		}
+
+		packages = append(packages, arg)
 	}
+
+	cfg.options.Packages = packages
 
 	return cfg, nil
 }
@@ -408,12 +432,17 @@ func isMutateFlag(name string) bool {
 func (c *mutateConfig) set(name, value string) error {
 	switch name {
 	case flagMutate:
-		patterns := splitList(value)
-		if len(patterns) == 0 {
-			return fmt.Errorf("turango: -%s= requires a package pattern, e.g. -%s=./...", flagMutate, flagMutate)
+		// Validated here, at parse time, rather than left for Run() to reject
+		// later — the same early-fail shape flagScope's ParseScope call below
+		// already has. -mutate's value is a regexp matched against function
+		// names (mirroring -run/-bench/-fuzz), not a package pattern: package
+		// selection is the ordinary trailing positional arguments, collected
+		// separately in parseMutateFlags.
+		if _, err := regexp.Compile(value); err != nil {
+			return fmt.Errorf("turango: -%s=%q: %w", flagMutate, value, err)
 		}
 
-		c.options.Packages = patterns
+		c.options.FuncPattern = value
 
 	case flagScope:
 		scope, err := mutate.ParseScope(value)

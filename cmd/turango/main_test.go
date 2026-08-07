@@ -27,12 +27,12 @@ func TestParseMutateFlagsRecognition(t *testing.T) {
 		want bool
 	}{
 		{"none", []string{"./..."}, false},
-		{"equals form", []string{"-mutate=./..."}, true},
-		{"double dash equals form", []string{"--mutate=./..."}, true},
+		{"equals form", []string{"-mutate=."}, true},
+		{"double dash equals form", []string{"--mutate=."}, true},
 		{"other mutate flag alone is not a request", []string{"-mutatescope=package"}, false},
-		{"after -args is the test binary's", []string{"-v", "-args", "-mutate=./..."}, false},
-		{"after --args is the test binary's", []string{"--args", "-mutate=./..."}, false},
-		{"before -args still counts", []string{"-mutate=./...", "-args", "-x"}, true},
+		{"after -args is the test binary's", []string{"-v", "-args", "-mutate=."}, false},
+		{"after --args is the test binary's", []string{"--args", "-mutate=."}, false},
+		{"before -args still counts", []string{"-mutate=.", "-args", "-x"}, true},
 		{"not a prefix match on another flag", []string{"-run=Test-mutate=x"}, false},
 		{"plain test flags pass through", []string{"-v", "-race", "-run=TestX", "./..."}, false},
 	}
@@ -61,14 +61,20 @@ func TestParseMutateFlagsValues(t *testing.T) {
 	t.Run("defaults", func(t *testing.T) {
 		t.Parallel()
 
-		cfg, err := parseMutateFlags([]string{"-mutate=./..."})
+		cfg, err := parseMutateFlags([]string{"-mutate=."})
 		if err != nil {
 			t.Fatalf("parseMutateFlags() error = %v", err)
 		}
 
 		switch {
-		case !reflect.DeepEqual(cfg.options.Packages, []string{"./..."}):
-			t.Errorf("Packages = %v, want [./...]", cfg.options.Packages)
+		case cfg.options.FuncPattern != ".":
+			t.Errorf("FuncPattern = %q, want \".\"", cfg.options.FuncPattern)
+		case len(cfg.options.Packages) != 0:
+			// No trailing positional args were given, mirroring -run/-bench/
+			// -fuzz's own default: an absent package pattern means "." (the
+			// package in Dir), resolved later by Options.patterns(), not
+			// injected here.
+			t.Errorf("Packages = %v, want none", cfg.options.Packages)
 		case cfg.options.Scope != mutate.ScopeFull:
 			t.Errorf("Scope = %v, want %v", cfg.options.Scope, mutate.ScopeFull)
 		case cfg.options.Parallel != runtime.GOMAXPROCS(0):
@@ -88,19 +94,22 @@ func TestParseMutateFlagsValues(t *testing.T) {
 		t.Parallel()
 
 		cfg, err := parseMutateFlags([]string{
-			"-mutate=./internal/...",
+			"-mutate=Foo.*",
 			"-mutatescope=impact",
 			"-mutateoperators=control/if,operator/binary",
 			"-mutateparallel=3",
 			"-mutatetimeout=90s",
 			"-mutateoutput=/tmp/reports",
 			"-mutatemin=0.75",
+			"./internal/...",
 		})
 		if err != nil {
 			t.Fatalf("parseMutateFlags() error = %v", err)
 		}
 
 		switch {
+		case cfg.options.FuncPattern != "Foo.*":
+			t.Errorf("FuncPattern = %q, want \"Foo.*\"", cfg.options.FuncPattern)
 		case !reflect.DeepEqual(cfg.options.Packages, []string{"./internal/..."}):
 			t.Errorf("Packages = %v", cfg.options.Packages)
 		case cfg.options.Scope != mutate.ScopeImpact:
@@ -118,10 +127,13 @@ func TestParseMutateFlagsValues(t *testing.T) {
 		}
 	})
 
-	t.Run("comma separated patterns", func(t *testing.T) {
+	t.Run("multiple positional package patterns", func(t *testing.T) {
 		t.Parallel()
 
-		cfg, err := parseMutateFlags([]string{"-mutate=./a/...,./b,"})
+		// Package selection is ordinary trailing positional arguments now,
+		// exactly as with -run/-bench/-fuzz — not a comma-separated -mutate
+		// value. Each space-separated pattern is its own argument.
+		cfg, err := parseMutateFlags([]string{"-mutate=.", "./a/...", "./b"})
 		if err != nil {
 			t.Fatalf("parseMutateFlags() error = %v", err)
 		}
@@ -134,7 +146,7 @@ func TestParseMutateFlagsValues(t *testing.T) {
 	t.Run("a zero threshold is still a threshold", func(t *testing.T) {
 		t.Parallel()
 
-		cfg, err := parseMutateFlags([]string{"-mutate=./...", "-mutatemin=0"})
+		cfg, err := parseMutateFlags([]string{"-mutate=.", "-mutatemin=0"})
 		if err != nil {
 			t.Fatalf("parseMutateFlags() error = %v", err)
 		}
@@ -147,13 +159,43 @@ func TestParseMutateFlagsValues(t *testing.T) {
 	t.Run("scope defaults survive an unrelated flag", func(t *testing.T) {
 		t.Parallel()
 
-		cfg, err := parseMutateFlags([]string{"-mutateparallel=2", "-mutate=./..."})
+		cfg, err := parseMutateFlags([]string{"-mutateparallel=2", "-mutate=."})
 		if err != nil {
 			t.Fatalf("parseMutateFlags() error = %v", err)
 		}
 
 		if cfg.options.Scope != mutate.ScopeFull || cfg.options.Parallel != 2 {
 			t.Errorf("cfg = %+v, want full scope and 2 workers", cfg.options)
+		}
+	})
+
+	t.Run("trailing package pattern after -mutate", func(t *testing.T) {
+		t.Parallel()
+
+		// A bare, dash-less argument after -mutate is a legitimate
+		// positional package pattern, exactly like -run/-bench/-fuzz's own
+		// trailing package args — this used to be rejected as "unsupported
+		// argument" before -mutate stopped taking packages as its own value.
+		cfg, err := parseMutateFlags([]string{"-mutate=.", "./cmd/..."})
+		if err != nil {
+			t.Fatalf("parseMutateFlags() error = %v", err)
+		}
+
+		if want := []string{"./cmd/..."}; !reflect.DeepEqual(cfg.options.Packages, want) {
+			t.Errorf("Packages = %v, want %v", cfg.options.Packages, want)
+		}
+	})
+
+	t.Run("trailing package pattern after other mutate flags", func(t *testing.T) {
+		t.Parallel()
+
+		cfg, err := parseMutateFlags([]string{"-mutate=.", "-mutatemin=0.5", "extra"})
+		if err != nil {
+			t.Fatalf("parseMutateFlags() error = %v", err)
+		}
+
+		if want := []string{"extra"}; !reflect.DeepEqual(cfg.options.Packages, want) {
+			t.Errorf("Packages = %v, want %v", cfg.options.Packages, want)
 		}
 	})
 }
@@ -166,22 +208,22 @@ func TestParseMutateFlagsErrors(t *testing.T) {
 		args []string
 		want string
 	}{
-		"bare -mutate":              {args: []string{"-mutate", "./..."}, want: "= form"},
-		"bare -mutatescope":         {args: []string{"-mutate=./...", "-mutatescope"}, want: "= form"},
-		"bare -mutateparallel":      {args: []string{"-mutateparallel"}, want: "= form"},
-		"empty -mutate":             {args: []string{"-mutate="}, want: "package pattern"},
-		"unknown mutate flag":       {args: []string{"-mutate=./...", "-mutatescopes=full"}, want: "unknown flag"},
-		"unknown scope":             {args: []string{"-mutate=./...", "-mutatescope=module"}, want: "unknown scope"},
-		"non-numeric parallel":      {args: []string{"-mutate=./...", "-mutateparallel=lots"}, want: "positive integer"},
-		"zero parallel":             {args: []string{"-mutate=./...", "-mutateparallel=0"}, want: "positive integer"},
-		"bad duration":              {args: []string{"-mutate=./...", "-mutatetimeout=30"}, want: "mutatetimeout"},
-		"negative duration":         {args: []string{"-mutate=./...", "-mutatetimeout=-5s"}, want: "positive duration"},
-		"empty output":              {args: []string{"-mutate=./...", "-mutateoutput="}, want: "requires a directory"},
-		"non-numeric min":           {args: []string{"-mutate=./...", "-mutatemin=high"}, want: "mutatemin"},
-		"leftover package pattern":  {args: []string{"-mutate=./...", "./cmd/..."}, want: "unsupported argument"},
-		"leftover go test flag":     {args: []string{"-mutate=./...", "-v"}, want: "unsupported argument"},
-		"leftover before the flag":  {args: []string{"-count=1", "-mutate=./..."}, want: "unsupported argument"},
-		"leftover after -mutatemin": {args: []string{"-mutate=./...", "-mutatemin=0.5", "extra"}, want: "unsupported argument"},
+		"bare -mutate":          {args: []string{"-mutate", "."}, want: "= form"},
+		"bare -mutatescope":     {args: []string{"-mutate=.", "-mutatescope"}, want: "= form"},
+		"bare -mutateparallel":  {args: []string{"-mutateparallel"}, want: "= form"},
+		"invalid regexp":        {args: []string{"-mutate=(unclosed"}, want: "mutate"},
+		"unknown mutate flag":   {args: []string{"-mutate=.", "-mutatescopes=full"}, want: "unknown flag"},
+		"unknown scope":         {args: []string{"-mutate=.", "-mutatescope=module"}, want: "unknown scope"},
+		"non-numeric parallel":  {args: []string{"-mutate=.", "-mutateparallel=lots"}, want: "positive integer"},
+		"zero parallel":         {args: []string{"-mutate=.", "-mutateparallel=0"}, want: "positive integer"},
+		"bad duration":          {args: []string{"-mutate=.", "-mutatetimeout=30"}, want: "mutatetimeout"},
+		"negative duration":     {args: []string{"-mutate=.", "-mutatetimeout=-5s"}, want: "positive duration"},
+		"empty output":          {args: []string{"-mutate=.", "-mutateoutput="}, want: "requires a directory"},
+		"non-numeric min":       {args: []string{"-mutate=.", "-mutatemin=high"}, want: "mutatemin"},
+		"leftover go test flag": {args: []string{"-mutate=.", "-v"}, want: "unsupported flag"},
+		"leftover before the flag": {
+			args: []string{"-count=1", "-mutate=."}, want: "unsupported flag",
+		},
 	}
 
 	for name, tt := range tests {
@@ -205,7 +247,7 @@ func TestParseMutateFlagsErrors(t *testing.T) {
 func TestParseMutateFlagsIgnoresArgsTail(t *testing.T) {
 	t.Parallel()
 
-	cfg, err := parseMutateFlags([]string{"-mutate=./...", "-args", "-v", "whatever", "-mutatescope"})
+	cfg, err := parseMutateFlags([]string{"-mutate=.", "-args", "-v", "whatever", "-mutatescope"})
 	if err != nil {
 		t.Fatalf("parseMutateFlags() error = %v", err)
 	}
@@ -223,13 +265,13 @@ func TestRunRejectsBadFlags(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 
-	code := run(context.Background(), []string{"turango", "test", "-mutate=./...", "-v"}, &stdout, &stderr)
+	code := run(context.Background(), []string{"turango", "test", "-mutate=.", "-v"}, &stdout, &stderr)
 	if code != exitUsage {
 		t.Errorf("exit code = %d, want %d", code, exitUsage)
 	}
 
-	if !strings.Contains(stderr.String(), "unsupported argument") {
-		t.Errorf("stderr = %q, want it to name the unsupported argument", stderr.String())
+	if !strings.Contains(stderr.String(), "unsupported flag") {
+		t.Errorf("stderr = %q, want it to name the unsupported flag", stderr.String())
 	}
 }
 

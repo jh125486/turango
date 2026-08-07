@@ -30,6 +30,7 @@ package mutator
 import (
 	"fmt"
 	"go/ast"
+	"go/types"
 	"sort"
 	"sync"
 )
@@ -74,6 +75,27 @@ type Mutator interface {
 	// [Mutation.Apply] funcs do. Mutate must return nil whenever Applies
 	// reports false.
 	Mutate(node ast.Node) []Mutation
+}
+
+// TypedMutator is implemented by an operator whose eligibility depends on
+// static type information the plain [Mutator] interface has no way to
+// receive. It is checked once per run (engine.needsTypes) and, when present,
+// invoked once per package.
+//
+// This is deliberately a second, optional interface rather than a change to
+// [Mutator] itself: [Mutator] is implemented by every operator, most of them
+// purely syntactic, and threading type information through Applies/Mutate's
+// signatures would force all of them to accept a parameter they ignore. See
+// identifier/constswap, the first (and, as of this writing, only) operator
+// that implements it.
+type TypedMutator interface {
+	// WithScope returns a Mutator bound to one package's type information.
+	// The returned value is used for every file of that package; it is never
+	// the same value WithScope was called on, so the original, registry-held
+	// instance stays stateless and safe to reuse — including concurrently
+	// across the other packages in the same run — exactly as Mutator's
+	// contract already requires.
+	WithScope(info *types.Info, pkg *types.Package) Mutator
 }
 
 var (

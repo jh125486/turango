@@ -141,12 +141,26 @@ crypto to ordinary stdlib logic bugs.
 
 ## Proposal
 
-Add a `-mutate=<pattern>` flag to `go test`, analogous in spirit to
-`-fuzz=<pattern>`:
+Add a `-mutate=<regexp>` flag to `go test`, behaving exactly like
+`-run`/`-bench`/`-fuzz`: its value is a regular expression matched against
+declared function/method names in the target packages, not a package
+selector. Package selection is the ordinary trailing package arguments —
+entirely separate from the flag's value, the same separation `-run` and
+`-fuzz` already have between "which package(s)" and "which named target
+within them":
 
 ```
-go test -mutate=./...
+go test -mutate=. ./...
 ```
+
+`-mutate=.` matches every function, mirroring `-bench=.`'s "run every
+benchmark" convention — the same way an unset `-run`/`-bench` means "match
+nothing narrower," using the flag at all with a maximally permissive
+pattern is how you get "everything." Unlike `-fuzz`, whose regexp must
+match *exactly one* fuzz target (continuous fuzzing only runs one target at
+a time), `-mutate` is a broad matcher like `-run`/`-bench`: mutation testing
+naturally wants to mutate every function that matches, not narrow to a
+single one.
 
 Sibling flags, mirroring how `-fuzz` has `-fuzztime`/`-fuzzminimizetime`/
 `-parallel`:
@@ -180,22 +194,33 @@ documented trailing-comment edge cases ([golang/go#21755],
 [golang/go#21755]: https://github.com/golang/go/issues/21755
 [golang/go#33451]: https://github.com/golang/go/issues/33451
 
-### The 9 mutation operators (v1 set)
+### The 11 mutation operators (v1 set)
 
 Ported and modernized from the 2018 prototype: `if`/`else`/`case`
 body-removal, `&&`/`||` short-circuit-operand elimination, statement
 removal, and four token-swap operators (assignment, binary, increment/
 decrement, unary-strip) covering the classic arithmetic/relational/logical
-scalar mutations.
+scalar mutations. Two operators were added since this set was first drafted:
+`operator/boundary`, a relational boundary shift (`<`↔`<=`, `>`↔`>=`) — the
+classic off-by-one mutant, distinct from `operator/binary`'s negation swap
+(`<`↔`>=`) and named to match PIT's "Conditionals Boundary Mutator" (PIT is
+cited in Related Work, below); and a pair of literal operators,
+`literal/number` (shifts an int/float literal by ±1, e.g. `x < 0` →
+`x < 1`) and `literal/boolean` (swaps `true`↔`false`).
 
-**Known gap, found during validation, worth stating up front**: this
-operator set proves "this code path is exercised," not "this specific
-input shape is tested," and cannot currently reproduce a wrong-constant or
-wrong-identifier substitution bug (e.g. the historical
+**Known gap, found during validation, worth stating up front — now
+partially closed**: this operator set proves "this code path is
+exercised," not "this specific input shape is tested." `literal/number`
+and `literal/boolean` now cover literal-value mutations like `x < 0` →
+`x < 1`, but they do not reproduce the historical
 [strconv#21278](https://github.com/golang/go/issues/21278) `ParseUint`
-overflow bug, which returned the wrong bit-width constant — a mutation
-shape none of these 9 operators produce). An identifier/constant-swap
-operator is a natural, scoped follow-up, not a blocker for this proposal.
+overflow bug, whose actual shape was a wrong-*identifier* substitution —
+the existing named constant `maxVal` was swapped for a different,
+same-type, in-scope identifier (`maxUint64`), not a literal value change.
+Producing that mutation requires knowing which in-scope identifiers are
+type-compatible substitutes, which needs `go/types`, not just `go/ast`;
+none of the 11 operators above do this. An identifier-swap operator
+remains a natural, scoped follow-up, not a blocker for this proposal.
 
 ## Rationale
 
@@ -256,9 +281,11 @@ verb breaking every tool on a machine that shells out to `go`.
   filters *syntactic* no-ops (byte-identical printed output), and
   `//nomutant` handles the remaining semantic cases, matching how every
   mature mutation tester handles this class of noise.
-- **Operator coverage is incomplete**, as documented above (no
-  constant/identifier-swap operator yet) — stated as a known limitation,
-  not a blocker.
+- **Operator coverage is incomplete**, as documented above: literal-value
+  mutation is covered (`literal/number`, `literal/boolean`), but the
+  wrong-identifier-substitution shape (as in `strconv#21278`) requires
+  `go/types` and has no operator yet — stated as a known limitation, not a
+  blocker.
 
 ## Open questions
 

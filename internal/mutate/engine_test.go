@@ -87,6 +87,37 @@ func TestScore(t *testing.T) {
 	}
 }
 `,
+		"mathx/limits.go": `package mathx
+
+// LowLimit and HighLimit are two package-level constants of the same type,
+// declared in the same const block, deliberately close enough in value that
+// swapping one for the other is both compilable and behaviourally different
+// — the fixture identifier/constswap needs.
+const (
+	LowLimit  = 3
+	HighLimit = 30
+)
+
+// Bounded reports whether n is at least LowLimit. Swapping in HighLimit
+// changes Bounded's result for every n in [LowLimit, HighLimit), which
+// mathx_test.go's TestBounded exercises.
+func Bounded(n int) bool {
+	return n >= LowLimit
+}
+`,
+		"mathx/limits_test.go": `package mathx
+
+import "testing"
+
+func TestBounded(t *testing.T) {
+	if !Bounded(LowLimit) {
+		t.Fatalf("Bounded(LowLimit) = false, want true")
+	}
+	if Bounded(LowLimit - 1) {
+		t.Fatalf("Bounded(LowLimit-1) = true, want false")
+	}
+}
+`,
 	}
 
 	for rel, content := range files {
@@ -305,8 +336,16 @@ func TestRunWithImpactScope(t *testing.T) {
 	// be a survivor decided by the coverage map rather than by a test run.
 	var describeMutants int
 
+	mathxGo := filepath.Join(root, "mathx", "mathx.go")
+	descLine := describeLine(t, mathxGo)
+
 	for _, m := range result.Mutants {
-		if m.Line >= describeLine(t, filepath.Join(root, "mathx", "mathx.go")) {
+		// Matched by file as well as line: fixtureModule has more than one
+		// file under mathx, each with its own independent line numbering, so
+		// a line-only check would also sweep up limits.go's (covered)
+		// mutants whenever their line number happens to land past
+		// Describe's.
+		if m.File == mathxGo && m.Line >= descLine {
 			describeMutants++
 
 			if m.Status != Survived {
@@ -343,6 +382,100 @@ func describeLine(t *testing.T, path string) int {
 	t.Fatalf("no Describe function in %s", path)
 
 	return 0
+}
+
+// TestRunConstSwapOperator is the engine-level check for gap 1
+// (identifier/constswap): selecting the operator against a real module
+// produces the expected swap, on the expected line, and the swap is
+// compilable and behaviourally different enough that the fixture's own test
+// kills it.
+func TestRunConstSwapOperator(t *testing.T) {
+	if testing.Short() {
+		t.Skip("end-to-end run compiles and tests one module copy per mutant")
+	}
+
+	t.Parallel()
+
+	root := fixtureModule(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	result, err := Run(ctx, Options{
+		Packages:  []string{"./..."},
+		Dir:       root,
+		Operators: []string{"identifier/constswap"},
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	// LowLimit is the fixture's only const *use* in scope for the operator:
+	// HighLimit is declared but never referenced, and every other constant in
+	// the module either does not exist or has no same-block sibling.
+	if len(result.Mutants) != 1 {
+		t.Fatalf("Run() produced %d mutants, want exactly 1: %+v", len(result.Mutants), result.Mutants)
+	}
+
+	got := result.Mutants[0]
+
+	if got.Operator != "identifier/constswap" {
+		t.Errorf("Operator = %q, want %q", got.Operator, "identifier/constswap")
+	}
+
+	if got.Description != "LowLimit -> HighLimit" {
+		t.Errorf("Description = %q, want %q", got.Description, "LowLimit -> HighLimit")
+	}
+
+	if !strings.HasSuffix(got.File, filepath.Join("mathx", "limits.go")) {
+		t.Errorf("File = %q, want it to end in %s", got.File, filepath.Join("mathx", "limits.go"))
+	}
+
+	if got.Status != Killed {
+		t.Errorf("Status = %v, want %v: TestBounded should catch this swap", got.Status, Killed)
+	}
+}
+
+// TestRunWithoutConstSwapNeverLoadsTypes is the concrete regression test for
+// the "a run that does not select a TypedMutator operator pays nothing for
+// type information" claim: it asserts loadTyped is never invoked during the
+// run, rather than only inferring the claim from the run's output looking
+// otherwise normal.
+//
+// It deliberately does not call t.Parallel(). loadTypedCalls is a
+// process-wide counter, and every other test in this file that calls Run()
+// with the default operator set now selects identifier/constswap too (it is
+// a registered TypedMutator, per mutator.All()'s "enabled purely by being
+// imported" contract), which would otherwise inflate the counter for reasons
+// having nothing to do with this test. Go's test runner runs every
+// non-parallel top-level test to completion before any t.Parallel() test's
+// body resumes past its own Parallel() call, so running this one
+// non-parallel — and first, textually, though order is not what makes this
+// safe — is what makes the delta assertion reliable rather than a race
+// against its siblings.
+func TestRunWithoutConstSwapNeverLoadsTypes(t *testing.T) {
+	if testing.Short() {
+		t.Skip("runs the real toolchain against every mutant of the fixture module")
+	}
+
+	root := fixtureModule(t)
+
+	before := loadTypedCalls.Load()
+
+	_, err := Run(context.Background(), Options{
+		Packages:    []string{"./..."},
+		Dir:         root,
+		Operators:   []string{"operator/binary"},
+		Scope:       ScopePackage,
+		TestTimeout: time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if after := loadTypedCalls.Load(); after != before {
+		t.Errorf("loadTyped was called %d time(s) during a run selecting no TypedMutator operator, want 0", after-before)
+	}
 }
 
 func TestParseScope(t *testing.T) {

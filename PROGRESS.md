@@ -14,17 +14,41 @@ Plan: `/Users/jacob.hochstetler/.claude/plans/wondrous-crunching-avalanche.md` (
 
 ## Extra: example/legacy package (added after phase 6, committed)
 
-Ported the original go-turango prototype's example.go/example_test.go unchanged (foo/bar, single coarse `assert.Equal(t, 16, foo())`). Demonstrates the engine on real prior-art weak-test code: 38 mutants, 24 killed, 12 survived, 66.7% score. Survivors land exactly on the unreachable switch case, dead if-branch, and discarded bar() calls — a clean, concrete demo of what mutation testing catches that a single overall-result assertion misses.
+Ported the original go-turango prototype's example.go/example_test.go unchanged (foo/bar, single coarse assertion). Demonstrates the engine on real prior-art weak-test code: 38 mutants, 24 killed, 12 survived, 66.7% score. Survivors land exactly on the unreachable switch case, dead if-branch, and discarded bar() calls — a clean, concrete demo of what mutation testing catches that a single overall-result assertion misses. The one assertion originally used `testify/assert.Equal`; it's now a plain `t.Errorf` check (see "Dependency cleanup" below) — same demo, same behavior.
 
-## State as of last check (all phases 1-6 independently re-verified by coordinator, not just trusted from agent reports)
+## Extra: two new mutation operators + a literal package (post phase-7, committed)
+
+Added after the phase-7 historical-bug validation surfaced a concrete gap ("no constant-mutation operator" — see task 7 above and PROPOSAL.md's Evidence section):
+
+- **`operator/boundary`** (`internal/mutator/operator/boundary.go`) — relational boundary shift: `<`↔`<=`, `>`↔`>=`. The classic off-by-one mutant. Distinct from `operator/binary`, which does negation-style swaps (`==`↔`!=`, `&&`↔`||`, etc.) and never touches boundary relations.
+- **`internal/mutator/literal/`** (new package) — `literal/number` (shifts an int or float literal by ±1) and `literal/boolean` (`true`↔`false`).
+
+This closes *part* of the constant-mutation gap — literal ints/floats/bools and relational boundaries are now covered. A full identifier/constant-swap operator (rewriting a named constant or identifier reference, e.g. the historical strconv#21278 wrong-bit-width-constant shape) still requires `go/types` to resolve identifier bindings and is not built — that remains open, documented as a known limitation in PROPOSAL.md.
+
+Total operator count is now 12 (the original 9 plus these 3), across 5 packages: `control`, `expression`, `literal`, `operator`, `statement`.
+
+## Extra: dependency cleanup + PROPOSAL.md (post phase-7, committed)
+
+- **Removed `github.com/stretchr/testify`.** Project policy is stdlib + `golang.org/x/*` only, no other third-party deps. The one test that used it, `example/legacy/legacy_test.go`, was rewritten to a plain `if got != want { t.Errorf(...) }` check — same assertion, no dependency. `go.sum` no longer references testify (the only remaining non-`golang.org/x` line is `google/go-cmp`, a transitive test-only dependency of `golang.org/x/tools`, not a direct import).
+- **`go.mod`** had two separate `require(...)` blocks (an artifact of `go get` being run at different times); merged into one alphabetized block (`golang.org/x/mod`, `golang.org/x/sync`, `golang.org/x/tools`).
+- **Added `PROPOSAL.md`** at repo root: a golang/go-style proposal document arguing for `go test -mutate` as a stdlib feature, modeled directly on the real `-fuzz` design draft. Cites the project's 2018 predecessor paper's crypto findings (crypto/aes's volatile mutation score across early Go versions, crypto/x509/pkix at 0%), a fresh 2026 re-validation of those same two findings against current `golang/go` HEAD, the phase-7 case study where a real historical stdlib bug shape (encoding/base64 CorruptInputError) was reproduced and a live sibling survivor found, and frames the proposal as complementary to `golang/go#75315` (a real, currently-open, narrower Go proposal for assembly-only mutation testing filed by Filippo Valsorda). Not a code change; purely a document making the case for upstreaming.
+
+## State as of last check (verified directly against the repo, not trusted from old notes)
 
 - `go build ./...`, `go vet ./...`, `go test ./...`, `go test -race ./...`, `gofmt -l .` all clean.
-- 410 tests passing across 9 packages.
-- No git commits made anywhere in this build — everything is untracked/unstaged in the repo. User has not asked for a commit yet.
+- 442 tests passing across 11 packages (`cmd/turango`, `example`, `example/legacy`, `internal/goproxy`, `internal/mutate`, `internal/mutator`, `internal/mutator/control`, `internal/mutator/expression`, `internal/mutator/literal`, `internal/mutator/operator`, `internal/mutator/statement`).
+- Git history now has real commits (this was untracked at the point this doc last said otherwise):
+  ```
+  bc92dc5 Remove testify dependency; add mutation-testing proposal doc
+  6524cf9 Add operator/boundary and literal/{number,boolean} mutators
+  f804ab7 Add example/legacy: weak-test demo ported from go-turango
+  3554d64 Add turango: mutation testing as a go command shim
+  4332a9e Initial commit
+  ```
 
 ## Two known limitations found during phase 6's final verification (not bugs, but worth knowing)
 
-1. **Default full-scope `-mutate` against turango's own module is pathological**: `turango test -mutate=./example/...` from this repo, with default `-mutatescope=full`, took 17+ minutes because each mutant's `go test ./...` re-runs turango's *entire* module including its own end-to-end mutation-engine tests (which themselves spawn nested `go test` children) — every mutant blows the ~10s derived timeout and gets misclassified `Killed` via the (correct, documented) "timeout counts as Killed" rule. Not a defect in the timeout logic itself, just a bad interaction when dogfooding turango on its own repo. `example/README.md` recommends `-mutatescope=package` for this reason. Worth considering later: detect/warn when the target module IS turango's own module, or just always recommend package/impact scope for local dogfooding in docs.
+1. **Default full-scope `-mutate` against turango's own module is pathological**: `turango test -mutate=./example/...` from this repo (CLI syntax at the time this was written — `-mutate` has since changed to a `-run`/`-bench`/`-fuzz`-style function-name regexp, not a package pattern; the equivalent invocation today is `turango test -mutate=. ./example/...`), with default `-mutatescope=full`, took 17+ minutes because each mutant's `go test ./...` re-runs turango's *entire* module including its own end-to-end mutation-engine tests (which themselves spawn nested `go test` children) — every mutant blows the ~10s derived timeout and gets misclassified `Killed` via the (correct, documented) "timeout counts as Killed" rule. Not a defect in the timeout logic itself, just a bad interaction when dogfooding turango on its own repo. `example/README.md` recommends `-mutatescope=package` for this reason. Worth considering later: detect/warn when the target module IS turango's own module, or just always recommend package/impact scope for local dogfooding in docs.
 2. **`-mutatescope=impact` reports zero-coverage lines (e.g. a bare `const` declaration) as `Survived`** rather than skipping them — inherent to coverage-based test selection (no test exercises a const decl directly), not a defect, but worth noting if the score looks unexpectedly low under impact scope.
 
 ## Key design decisions locked in (don't re-litigate, see plan file for full rationale)
@@ -39,7 +63,6 @@ Ported the original go-turango prototype's example.go/example_test.go unchanged 
 
 ## If resuming after a break
 
-1. Check task list (TaskList tool) for current status.
-2. If phase 6 agent (`a5970b3a0d6ed4040`) already finished, there will be a task-notification in conversation history — look for it before re-dispatching anything.
-3. Once phase 6 is confirmed done: mark task 6 complete, task 7 (historical-bug validation) becomes unblocked — that's genuinely separate future work, not urgent.
-4. Nothing has been committed to git. Ask the user before committing.
+1. All 7 tasks above are done, plus the three post-phase-7 extras (operator/boundary + literal/, testify removal, PROPOSAL.md) — all committed (see git log in "State as of last check"). There is nothing mid-flight.
+2. The remaining known-open item is the identifier/constant-swap operator (needs `go/types`) — see the "two new mutation operators" section above and PROPOSAL.md's "Known gap" callout. That's the natural next-work item if this project is picked back up.
+3. Ask the user before committing anything new — this doc records what's already committed, not a standing permission to keep committing.

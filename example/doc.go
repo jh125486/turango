@@ -3,11 +3,14 @@
 //
 // Nothing in turango imports it. It exists to be mutated:
 //
-//	turango test -mutate=./example/... -mutatescope=package
+//	turango test -mutate=. -mutatescope=package ./example
+//
+// (-mutate is a function-name regexp, like -run/-bench/-fuzz — "." matches
+// every function; ./example is the ordinary trailing package argument.)
 //
 // The code is ordinary order-pricing arithmetic — conditionals, loops, boolean
-// logic, compound assignment, increments — chosen so that every one of
-// turango's nine operators has something to bite on. The tests are ordinary
+// logic, compound assignment, increments — chosen so that most of turango's
+// operators have something to bite on. The tests are ordinary
 // too, and that is the point: they are the kind of tests a careful person
 // writes and they still leave gaps, which turango reports as surviving mutants.
 // A package that scored 100% would demonstrate nothing.
