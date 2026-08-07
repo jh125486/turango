@@ -26,6 +26,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -61,6 +62,11 @@ const (
 	flagMin       = "mutatemin"
 )
 
+// flagArgsSeparator is go test's own "-args" boundary: everything after it
+// belongs to the compiled test binary, not to go test (or turango) to
+// interpret. See parseMutateFlags.
+const flagArgsSeparator = "-args"
+
 // mutateFlags is the recognised set, in the order they are documented.
 var mutateFlags = []string{
 	flagMutate, flagScope, flagOperators, flagParallel, flagTimeout, flagOutput, flagMin,
@@ -70,6 +76,12 @@ var mutateFlags = []string{
 const reportFile = "mutate-report.json"
 
 func main() {
+	os.Exit(mainRun())
+}
+
+// mainRun is main's body, split out so the signal-handler `defer stop()`
+// below actually runs before exit instead of being skipped by os.Exit.
+func mainRun() int {
 	// The engine's unit of work is a full `go test` run, so a Ctrl+C that only
 	// killed turango would leave the child toolchain running and throw away
 	// however many hours of mutants had already been tested. Cancelling the
@@ -78,7 +90,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	os.Exit(run(ctx, os.Args, os.Stdout, os.Stderr))
+	return run(ctx, os.Args, os.Stdout, os.Stderr)
 }
 
 // run is main's testable body. args is the full argv, including argv[0].
@@ -98,15 +110,15 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	rest := args[1:]
 
 	if len(rest) > 0 && rest[0] == "test" {
-		cfg, err := parseMutateFlags(rest[1:])
+		cfg, found, err := parseMutateFlags(rest[1:])
 		if err != nil {
 			fmt.Fprintf(stderr, "%v\n", err)
 
 			return exitUsage
 		}
 
-		if cfg != nil {
-			return mutateRun(ctx, cfg, stdout, stderr)
+		if found {
+			return mutateRun(ctx, &cfg, stdout, stderr)
 		}
 	}
 
@@ -224,8 +236,10 @@ func displayBase() string {
 // The paths in the JSON are relativised exactly as the console summary's are, so
 // a report produced in CI is readable after it is downloaded somewhere else, and
 // so a line in the summary and its row in the report are the same string.
+//
+//nolint:gosec // dir is -mutateoutput, a path the invoking user typed on their own command line, not external/tainted input
 func writeReport(dir string, result *mutate.Result) error {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return fmt.Errorf("creating %s: %w", dir, err)
 	}
 
@@ -235,7 +249,7 @@ func writeReport(dir string, result *mutate.Result) error {
 	}
 
 	path := filepath.Join(dir, reportFile)
-	if err := os.WriteFile(path, data, 0o644); err != nil {
+	if err := os.WriteFile(path, data, 0o600); err != nil {
 		return fmt.Errorf("writing %s: %w", path, err)
 	}
 
@@ -261,6 +275,7 @@ func checkAlias(argv0 string) error {
 		return nil
 	}
 
+	//nolint:revive,staticcheck // this is a direct top-level CLI message, printed as-is and never wrapped with %w; the usual lowercase/no-punctuation error-string convention is for errors that get wrapped and re-logged elsewhere.
 	return fmt.Errorf(`turango: refusing to run as %q.
 
 Running turango under the name "go" (rename or symlink, placed ahead of the
@@ -295,16 +310,17 @@ type mutateConfig struct {
 // flags plus, exactly as with `-run`/`-bench`/`-fuzz`, ordinary trailing
 // package arguments.
 //
-// It returns (nil, nil) when the arguments are not a mutation request at all —
-// the ordinary `turango test ./...` case — which is what sends the invocation
-// on to the real go command untouched.
+// found reports whether -mutate was actually given. When it is false the
+// arguments are not a mutation request at all — the ordinary
+// `turango test ./...` case — which is what sends the invocation on to the
+// real go command untouched; cfg is meaningless in that case.
 //
 // The scan stops at a literal "-args", matching go test's own rule that
 // everything after -args belongs to the compiled test binary and is not go
 // test's (or turango's) to interpret. A -mutate= appearing after -args is left
 // alone and passed straight through.
-func parseMutateFlags(args []string) (*mutateConfig, error) {
-	cfg := &mutateConfig{
+func parseMutateFlags(args []string) (cfg mutateConfig, found bool, err error) {
+	cfg = mutateConfig{
 		options: mutate.Options{
 			Scope: mutate.ScopeFull,
 			// GOMAXPROCS rather than NumCPU so that a container CPU limit, or
@@ -315,19 +331,16 @@ func parseMutateFlags(args []string) (*mutateConfig, error) {
 		},
 	}
 
-	var (
-		found    bool
-		leftover []string
-	)
+	var leftover []string
 
 	for _, arg := range args {
-		if arg == "-args" || arg == "--args" {
+		if arg == flagArgsSeparator || arg == "--args" {
 			break
 		}
 
-		name, value, ok, err := splitMutateFlag(arg)
-		if err != nil {
-			return nil, err
+		name, value, ok, splitErr := splitMutateFlag(arg)
+		if splitErr != nil {
+			return mutateConfig{}, false, splitErr
 		}
 
 		if !ok {
@@ -336,8 +349,8 @@ func parseMutateFlags(args []string) (*mutateConfig, error) {
 			continue
 		}
 
-		if err := cfg.set(name, value); err != nil {
-			return nil, err
+		if setErr := cfg.set(name, value); setErr != nil {
+			return mutateConfig{}, false, setErr
 		}
 
 		if name == flagMutate {
@@ -352,7 +365,7 @@ func parseMutateFlags(args []string) (*mutateConfig, error) {
 	// none of turango's business unless mutation mode was actually
 	// requested.
 	if !found {
-		return nil, nil
+		return mutateConfig{}, false, nil
 	}
 
 	var packages []string
@@ -366,7 +379,7 @@ func parseMutateFlags(args []string) (*mutateConfig, error) {
 		// bad, so it is rejected rather than silently ignored or
 		// misapplied.
 		if strings.HasPrefix(arg, "-") {
-			return nil, fmt.Errorf(
+			return mutateConfig{}, false, fmt.Errorf(
 				"turango: unsupported flag %q alongside -%s: mutation mode understands only the -mutateXXX= flags (%s) plus trailing package patterns",
 				arg, flagMutate, strings.Join(mutateFlags, ", "))
 		}
@@ -376,7 +389,7 @@ func parseMutateFlags(args []string) (*mutateConfig, error) {
 
 	cfg.options.Packages = packages
 
-	return cfg, nil
+	return cfg, true, nil
 }
 
 // splitMutateFlag classifies one argument.
@@ -419,81 +432,112 @@ func splitMutateFlag(arg string) (name, value string, ok bool, err error) {
 
 // isMutateFlag reports whether name is one of turango's flags.
 func isMutateFlag(name string) bool {
-	for _, flag := range mutateFlags {
-		if name == flag {
-			return true
-		}
-	}
-
-	return false
+	return slices.Contains(mutateFlags, name)
 }
 
 // set applies one parsed flag.
 func (c *mutateConfig) set(name, value string) error {
 	switch name {
 	case flagMutate:
-		// Validated here, at parse time, rather than left for Run() to reject
-		// later — the same early-fail shape flagScope's ParseScope call below
-		// already has. -mutate's value is a regexp matched against function
-		// names (mirroring -run/-bench/-fuzz), not a package pattern: package
-		// selection is the ordinary trailing positional arguments, collected
-		// separately in parseMutateFlags.
-		if _, err := regexp.Compile(value); err != nil {
-			return fmt.Errorf("turango: -%s=%q: %w", flagMutate, value, err)
-		}
-
-		c.options.FuncPattern = value
-
+		return c.setMutate(value)
 	case flagScope:
-		scope, err := mutate.ParseScope(value)
-		if err != nil {
-			// Not re-wrapped with the flag name and value: ParseScope's message
-			// already names both the value it rejected and the ones it accepts.
-			return fmt.Errorf("turango: %w", err)
-		}
-
-		c.options.Scope = scope
-
+		return c.setScope(value)
 	case flagOperators:
 		// Unknown names are the engine's to reject: it owns the registry, and
 		// its error already lists what is registered.
 		c.options.Operators = splitList(value)
-
 	case flagParallel:
-		n, err := strconv.Atoi(value)
-		if err != nil || n < 1 {
-			return fmt.Errorf("turango: -%s=%q: want a positive integer", flagParallel, value)
-		}
-
-		c.options.Parallel = n
-
+		return c.setParallel(value)
 	case flagTimeout:
-		d, err := time.ParseDuration(value)
-		if err != nil {
-			return fmt.Errorf("turango: -%s=%q: %w", flagTimeout, value, err)
-		}
-
-		if d <= 0 {
-			return fmt.Errorf("turango: -%s=%q: want a positive duration, e.g. 30s", flagTimeout, value)
-		}
-
-		c.options.TestTimeout = d
-
+		return c.setTimeout(value)
 	case flagOutput:
-		if value == "" {
-			return fmt.Errorf("turango: -%s= requires a directory", flagOutput)
-		}
-
-		c.output = value
-
+		return c.setOutput(value)
 	case flagMin:
-		f, err := strconv.ParseFloat(value, 64)
-		if err != nil {
-			return fmt.Errorf("turango: -%s=%q: want a number between 0 and 1", flagMin, value)
-		}
-
-		c.min, c.hasMin = f, true
+		return c.setMin(value)
 	}
+
+	return nil
+}
+
+// setMutate validates and stores -mutate.
+//
+// Validated here, at parse time, rather than left for Run() to reject later —
+// the same early-fail shape setScope's ParseScope call already has. -mutate's
+// value is a regexp matched against function names (mirroring
+// -run/-bench/-fuzz), not a package pattern: package selection is the
+// ordinary trailing positional arguments, collected separately in
+// parseMutateFlags.
+func (c *mutateConfig) setMutate(value string) error {
+	if _, err := regexp.Compile(value); err != nil {
+		return fmt.Errorf("turango: -%s=%q: %w", flagMutate, value, err)
+	}
+
+	c.options.FuncPattern = value
+
+	return nil
+}
+
+// setScope validates and stores -mutatescope.
+func (c *mutateConfig) setScope(value string) error {
+	scope, err := mutate.ParseScope(value)
+	if err != nil {
+		// Not re-wrapped with the flag name and value: ParseScope's message
+		// already names both the value it rejected and the ones it accepts.
+		return fmt.Errorf("turango: %w", err)
+	}
+
+	c.options.Scope = scope
+
+	return nil
+}
+
+// setParallel validates and stores -mutateparallel.
+func (c *mutateConfig) setParallel(value string) error {
+	n, err := strconv.Atoi(value)
+	if err != nil || n < 1 {
+		return fmt.Errorf("turango: -%s=%q: want a positive integer", flagParallel, value)
+	}
+
+	c.options.Parallel = n
+
+	return nil
+}
+
+// setTimeout validates and stores -mutatetimeout.
+func (c *mutateConfig) setTimeout(value string) error {
+	d, err := time.ParseDuration(value)
+	if err != nil {
+		return fmt.Errorf("turango: -%s=%q: %w", flagTimeout, value, err)
+	}
+
+	if d <= 0 {
+		return fmt.Errorf("turango: -%s=%q: want a positive duration, e.g. 30s", flagTimeout, value)
+	}
+
+	c.options.TestTimeout = d
+
+	return nil
+}
+
+// setOutput validates and stores -mutateoutput.
+func (c *mutateConfig) setOutput(value string) error {
+	if value == "" {
+		return fmt.Errorf("turango: -%s= requires a directory", flagOutput)
+	}
+
+	c.output = value
+
+	return nil
+}
+
+// setMin validates and stores -mutatemin.
+func (c *mutateConfig) setMin(value string) error {
+	f, err := strconv.ParseFloat(value, 64)
+	if err != nil {
+		return fmt.Errorf("turango: -%s=%q: want a number between 0 and 1", flagMin, value)
+	}
+
+	c.min, c.hasMin = f, true
 
 	return nil
 }

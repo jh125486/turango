@@ -38,46 +38,48 @@ the right one: it is the only scope that catches a mutant killed by a
 Real output, unedited:
 
 ```
-mutants:    160
-killed:     117
-survived:   31
+mutants:    166
+killed:     121
+survived:   33
 not-viable: 12
 
-score:      79.1% (117 killed of 148 viable)
-suppressed: 2 of 150 nodes (1.3% excluded from the score by //nomutant)
+score:      78.6% (121 killed of 154 viable)
+suppressed: 2 of 156 nodes (1.3% excluded from the score by //nomutant)
 
-Surviving mutants (31):
-  example/pricing.go:9    literal/number     5000 -> 4999
-  example/pricing.go:9    literal/number     5000 -> 5001
-  example/pricing.go:54   literal/number     0 -> -1
-  example/pricing.go:54   literal/number     0 -> 1
-  example/pricing.go:54   operator/boundary  <= -> <
-  example/pricing.go:74   literal/number     1000 -> 1001
-  example/pricing.go:74   operator/boundary  < -> <=
-  example/pricing.go:81   control/if         remove if body
-  example/pricing.go:82   literal/number     0 -> -1
-  example/pricing.go:82   literal/number     0 -> 1
-  example/pricing.go:97   operator/boundary  >= -> >
-  example/pricing.go:116  control/if         remove if body
-  example/pricing.go:116  operator/boundary  > -> >=
-  example/pricing.go:116  statement/remover  remove statement: discount = subtotal
-  example/pricing.go:128  literal/number     0 -> -1
-  example/pricing.go:128  literal/number     0 -> 1
-  example/pricing.go:128  operator/boundary  <= -> <
-  example/stats.go:6      literal/number     1 -> 2
-  example/stats.go:6      literal/number     40 -> 39
-  example/stats.go:6      literal/number     40 -> 41
-  example/stats.go:61     literal/number     1 -> 0
-  example/stats.go:62     control/if         remove if body
-  example/stats.go:62     operator/boundary  < -> <=
-  example/stats.go:62     statement/remover  remove statement: low = value
-  example/stats.go:64     operator/boundary  > -> >=
-  example/stats.go:79     literal/number     1 -> 2
-  example/stats.go:83     control/case       remove case body
-  example/stats.go:83     literal/number     1 -> 0
-  example/stats.go:83     statement/remover  remove statement: down++
-  example/stats.go:84     operator/inc_dec   ++ -> --
-  example/stats.go:92     control/if         remove if body
+Surviving mutants (33):
+  example/pricing.go:9    literal/number        5000 -> 4999
+  example/pricing.go:9    literal/number        5000 -> 5001
+  example/pricing.go:54   literal/number        0 -> -1
+  example/pricing.go:54   literal/number        0 -> 1
+  example/pricing.go:54   operator/boundary     <= -> <
+  example/pricing.go:74   literal/number        1000 -> 1001
+  example/pricing.go:74   operator/boundary     < -> <=
+  example/pricing.go:81   control/if            remove if body
+  example/pricing.go:82   literal/number        0 -> -1
+  example/pricing.go:82   literal/number        0 -> 1
+  example/pricing.go:97   operator/boundary     >= -> >
+  example/pricing.go:116  control/if            remove if body
+  example/pricing.go:116  operator/boundary     > -> >=
+  example/pricing.go:116  statement/remover     remove statement: discount = subtotal
+  example/pricing.go:128  literal/number        0 -> -1
+  example/pricing.go:128  literal/number        0 -> 1
+  example/pricing.go:128  operator/boundary     <= -> <
+  example/stats.go:6      literal/number        1 -> 2
+  example/stats.go:6      literal/number        40 -> 39
+  example/stats.go:6      literal/number        40 -> 41
+  example/stats.go:61     literal/number        1 -> 0
+  example/stats.go:62     control/if            remove if body
+  example/stats.go:62     operator/boundary     < -> <=
+  example/stats.go:62     statement/remover     remove statement: low = value
+  example/stats.go:64     operator/boundary     > -> >=
+  example/stats.go:86     literal/number        1 -> 2
+  example/stats.go:90     control/case          remove case body
+  example/stats.go:90     literal/number        1 -> 0
+  example/stats.go:90     statement/remover     remove statement: down++
+  example/stats.go:91     operator/inc_dec      ++ -> --
+  example/stats.go:99     control/if            remove if body
+  example/stats.go:100    identifier/constswap  TrendFalling -> TrendFlat
+  example/stats.go:100    identifier/constswap  TrendFalling -> TrendRising
 ```
 
 Only survivors are listed, because they are the only actionable result. A killed
@@ -85,10 +87,11 @@ mutant is the suite doing its job, and a not-viable one is an operator producing
 code that does not compile, which says nothing about the tests either way.
 
 The survivor list has grown since operators were added beyond the original
-nine (`operator/boundary`'s off-by-one shifts and `literal/number`'s ±1
-literal shifts account for most of the new entries above) — the shape of the
-finding is the same either way: each survivor is a boundary or branch nothing
-asserts on. A representative sample, each fixable with a single test case:
+nine (`operator/boundary`'s off-by-one shifts, `literal/number`'s ±1 literal
+shifts, and `identifier/constswap`'s const-for-const swap account for most of
+the new entries above) — the shape of the finding is the same either way: each
+survivor is a boundary, branch, or constant choice nothing asserts on. A
+representative sample, each fixable with a single test case:
 
 | Survivor | The missing test |
 | --- | --- |
@@ -96,8 +99,8 @@ asserts on. A representative sample, each fixable with a single test case:
 | `pricing.go:116` | `Total`'s defensive clamp of a discount larger than the subtotal. No coupon can currently produce one, so the guard is unreachable — arguably the mutant is telling the truth and the guard should go. |
 | `pricing.go:54`, `:74`, `:97`, `:128` | Boundary values (`<=` vs `<`, `>=` vs `>`) at the exact threshold are never tested — every fixture picks a value clearly on one side. |
 | `stats.go:62` | `Bounds` with a value *below* the first one. Every fixture rises, so `low` is never updated. |
-| `stats.go:83`, `:84` | `Trend` on a falling series. Nothing counts down-steps, so the `down++` case can be deleted, or turned into `down--`, unnoticed. |
-| `stats.go:92` | ... and therefore the `"falling"` branch is dead in the tests too. |
+| `stats.go:90`, `:91` | `Trend` on a falling series. Nothing counts down-steps, so the `down++` case can be deleted, or turned into `down--`, unnoticed. |
+| `stats.go:99`, `:100` | ... and therefore the `TrendFalling` branch, and its constant, are dead in the tests too. |
 
 ## What the `//nomutant` directives demonstrate
 
@@ -144,13 +147,13 @@ mutating and running, so a suppressed node costs nothing and proves nothing.
 Delete both `//nomutant` lines and run again:
 
 ```
-mutants:    179
-killed:     127
-survived:   40
+mutants:    185
+killed:     131
+survived:   42
 not-viable: 12
 
-score:      76.0% (127 killed of 167 viable)
-suppressed: 0 of 167 nodes (0.0% excluded from the score by //nomutant)
+score:      75.7% (131 killed of 173 viable)
+suppressed: 0 of 173 nodes (0.0% excluded from the score by //nomutant)
 ```
 
 Nineteen more mutants: two from the single suppressed `return`
@@ -160,9 +163,9 @@ condition, a comparison, a compound-assignment, or the body's own removal or
 individual statements now gets a shot at that one `if` block, since the
 directive that used to skip the whole subtree is gone.
 
-And the score goes **up** with the directives in place, 76.0% → 79.1%,
+And the score goes **up** with the directives in place, 75.7% → 78.6%,
 without one line of the package or its tests changing. That is the whole
 reason the summary prints the suppression ratio next to the score: suppressed
 nodes leave the score's denominator, so a liberal `//nomutant` habit inflates
 the number the same way a `// nocoverage` pragma games a coverage report.
-1.3% is a rounding error and the 79.1% means something; at 30% it would not.
+1.3% is a rounding error and the 78.6% means something; at 30% it would not.

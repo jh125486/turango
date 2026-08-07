@@ -361,7 +361,7 @@ func baselineTimeout(ctx context.Context, runs, cpus int, timeSuite suiteTimer) 
 
 	var total time.Duration
 
-	for i := 0; i < runs; i++ {
+	for i := range runs {
 		elapsed, err := timeSuite(ctx)
 		if err != nil {
 			return 0, fmt.Errorf("mutate: baseline run %d of %d: %w", i+1, runs, err)
@@ -598,94 +598,109 @@ func plan(ctx context.Context, goBin string, opts Options, pkgs []*packages.Pack
 	var jobs []fileJob
 
 	for _, pkg := range pkgs {
-		if pkg.Module == nil || pkg.Module.Dir == "" {
+		pkgJobs, err := planPackage(ctx, goBin, opts, pkg, mutators, typedPkgs, funcPattern)
+		if err != nil {
+			return nil, err
+		}
+
+		jobs = append(jobs, pkgJobs...)
+	}
+
+	return jobs, nil
+}
+
+// planPackage builds pkg's file jobs, or nil if pkg has nothing mutable (no
+// module info, or no non-test .go files). See [plan] for the parameters.
+func planPackage(ctx context.Context, goBin string, opts Options, pkg *packages.Package, mutators []mutator.Mutator, typedPkgs map[string]*packages.Package, funcPattern *regexp.Regexp) ([]fileJob, error) {
+	if pkg.Module == nil || pkg.Module.Dir == "" {
+		return nil, nil
+	}
+
+	var files []string
+
+	for _, path := range pkg.GoFiles {
+		// GoFiles already excludes _test.go (Tests is false), but mutating
+		// a test file would be meaningless even if one slipped through: the
+		// mutant and its own detector would be the same code.
+		if strings.HasSuffix(path, "_test.go") {
 			continue
 		}
 
-		var files []string
+		files = append(files, path)
+	}
 
-		for _, path := range pkg.GoFiles {
-			// GoFiles already excludes _test.go (Tests is false), but mutating
-			// a test file would be meaningless even if one slipped through: the
-			// mutant and its own detector would be the same code.
-			if strings.HasSuffix(path, "_test.go") {
-				continue
-			}
+	if len(files) == 0 {
+		return nil, nil
+	}
 
-			files = append(files, path)
+	scope, cover := opts.Scope, (*impactMap)(nil)
+
+	if scope == ScopeImpact {
+		if err := ctx.Err(); err != nil {
+			return nil, err
 		}
 
-		if len(files) == 0 {
-			continue
+		var err error
+
+		cover, err = buildImpact(ctx, goBin, pkg.Module.Dir, filepath.Dir(files[0]), pkg.GoFiles)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+
+			// Fail soft, per package. Impact scope is an optimisation over
+			// package scope, and every way of building the map can fail on
+			// a package that is nonetheless perfectly mutable: an
+			// unparseable `go test -list` output, a coverage profile a
+			// future toolchain writes differently, a test that only passes
+			// when run alongside its siblings. Demoting this one package to
+			// package scope costs time and nothing else, whereas failing
+			// the run would throw away every other package's work.
+			scope, cover = ScopePackage, nil
+		}
+	}
+
+	// Per-package, not run-wide, only when a selected operator implements
+	// mutator.TypedMutator: most jobs keep pkgMutators == mutators (the
+	// identical, run-wide shared slice), so only packages where a typed
+	// operator is both selected and successfully bound pay anything extra
+	// here.
+	pkgMutators := mutators
+
+	var typedPkg *packages.Package
+
+	if typedPkgs != nil {
+		tp := typedPkgs[pkg.PkgPath]
+
+		// Fail soft, per package — the same shape as the ScopeImpact
+		// demotion above: a package that failed to type-check under
+		// loadTyped (or was not resolved by it at all) loses this
+		// operator's involvement for itself alone, not the whole run.
+		if tp != nil && !tp.IllTyped {
+			typedPkg = tp
 		}
 
-		scope, cover := opts.Scope, (*impactMap)(nil)
+		pkgMutators = bindMutators(mutators, typedPkg)
+	}
 
-		if scope == ScopeImpact {
-			if err := ctx.Err(); err != nil {
-				return nil, err
-			}
+	jobs := make([]fileJob, 0, len(files))
 
-			var err error
-
-			cover, err = buildImpact(ctx, goBin, pkg.Module.Dir, filepath.Dir(files[0]), pkg.GoFiles)
-			if err != nil {
-				if ctx.Err() != nil {
-					return nil, ctx.Err()
-				}
-
-				// Fail soft, per package. Impact scope is an optimisation over
-				// package scope, and every way of building the map can fail on
-				// a package that is nonetheless perfectly mutable: an
-				// unparseable `go test -list` output, a coverage profile a
-				// future toolchain writes differently, a test that only passes
-				// when run alongside its siblings. Demoting this one package to
-				// package scope costs time and nothing else, whereas failing
-				// the run would throw away every other package's work.
-				scope, cover = ScopePackage, nil
-			}
+	for _, path := range files {
+		job := fileJob{
+			moduleDir:   pkg.Module.Dir,
+			path:        path,
+			scope:       scope,
+			cover:       cover,
+			mutators:    pkgMutators,
+			funcPattern: funcPattern,
 		}
 
-		// Per-package, not run-wide, only when a selected operator implements
-		// mutator.TypedMutator: most jobs keep pkgMutators == mutators (the
-		// identical, run-wide shared slice), so only packages where a typed
-		// operator is both selected and successfully bound pay anything extra
-		// here.
-		pkgMutators := mutators
-
-		var typedPkg *packages.Package
-
-		if typedPkgs != nil {
-			tp := typedPkgs[pkg.PkgPath]
-
-			// Fail soft, per package — the same shape as the ScopeImpact
-			// demotion above: a package that failed to type-check under
-			// loadTyped (or was not resolved by it at all) loses this
-			// operator's involvement for itself alone, not the whole run.
-			if tp != nil && !tp.IllTyped {
-				typedPkg = tp
-			}
-
-			pkgMutators = bindMutators(mutators, typedPkg)
+		if typedPkg != nil {
+			job.typedFset = typedPkg.Fset
+			job.typedSyntax = syntaxFor(typedPkg, path)
 		}
 
-		for _, path := range files {
-			job := fileJob{
-				moduleDir:   pkg.Module.Dir,
-				path:        path,
-				scope:       scope,
-				cover:       cover,
-				mutators:    pkgMutators,
-				funcPattern: funcPattern,
-			}
-
-			if typedPkg != nil {
-				job.typedFset = typedPkg.Fset
-				job.typedSyntax = syntaxFor(typedPkg, path)
-			}
-
-			jobs = append(jobs, job)
-		}
+		jobs = append(jobs, job)
 	}
 
 	return jobs, nil
@@ -819,73 +834,88 @@ func mutateFile(ctx context.Context, run *runner, job fileJob, sink *collector) 
 			return false
 		}
 
-		// Returning false here skips this function's body entirely, the same
-		// cascade mechanism suppression uses below — a function whose name
-		// does not match FuncPattern (and everything nested inside it) is
-		// simply never visited, rather than visited-and-rejected node by
-		// node. Package-level declarations outside any function are not
-		// *ast.FuncDecl and so are never filtered by this check at all —
-		// there is no function name for the pattern to match against them.
-		//
-		// job.funcPattern is nil for any fileJob built without going through
-		// plan() (a directly-constructed test fixture, say); nil is treated
-		// the same as an empty, always-matching pattern rather than a panic,
-		// consistent with FuncPattern's own "empty means everything" zero
-		// value.
-		if fn, ok := node.(*ast.FuncDecl); ok && job.funcPattern != nil && !job.funcPattern.MatchString(fn.Name.Name) {
-			return false
-		}
-
-		// Returning false is what makes suppression cascade: ast.Inspect skips
-		// the node's children but carries on with its siblings, so a directive
-		// on a compound statement covers everything nested inside it without
-		// the walk having to carry any "am I inside a suppressed subtree" state.
-		if reason, ok := suppressed.anchored(fset, node); ok {
-			sink.suppression(SuppressionResult{
-				File:   path,
-				Line:   fset.Position(node.Pos()).Line,
-				Reason: reason,
-			})
+		visit, err := visitNode(ctx, run, job, suppressed, sink, &spec, node)
+		if err != nil {
+			walkErr = err
 
 			return false
 		}
 
-		for _, m := range job.mutators {
-			if !m.Applies(node) {
-				continue
-			}
-
-			spec.operator = m.Name()
-			spec.line = fset.Position(node.Pos()).Line
-			// Looked up per node rather than per mutant: every mutation of a
-			// node shares its line, and the map is only consulted at all under
-			// ScopeImpact (covering reports nil for a nil map).
-			spec.covering = job.cover.covering(path, spec.line)
-
-			for _, mutation := range m.Mutate(node) {
-				if err := ctx.Err(); err != nil {
-					walkErr = err
-
-					return false
-				}
-
-				spec.mutation = mutation
-
-				res, err := run.run(ctx, spec)
-				if err != nil {
-					walkErr = err
-
-					return false
-				}
-
-				if res != nil {
-					sink.mutant(*res)
-				}
-			}
-		}
-
-		return true
+		return visit
 	})
 
 	return walkErr
+}
+
+// visitNode handles one node of mutateFile's walk: function-pattern
+// filtering, //nomutant suppression, and running every mutation every
+// applicable operator in job.mutators offers for node. It reports whether
+// ast.Inspect should descend into node's children.
+//
+// spec is the walk's shared mutant template — mutateFile's per-file fields
+// (fset, file, path, baseline, moduleDir, pkgDir, scope) are already set; this
+// function only fills in the per-node/per-mutation fields before handing a
+// copy to run.run.
+func visitNode(ctx context.Context, run *runner, job fileJob, suppressed suppressions, sink *collector, spec *mutant, node ast.Node) (bool, error) {
+	// Returning false here skips this function's body entirely, the same
+	// cascade mechanism suppression uses below — a function whose name does
+	// not match FuncPattern (and everything nested inside it) is simply
+	// never visited, rather than visited-and-rejected node by node.
+	// Package-level declarations outside any function are not *ast.FuncDecl
+	// and so are never filtered by this check at all — there is no function
+	// name for the pattern to match against them.
+	//
+	// job.funcPattern is nil for any fileJob built without going through
+	// plan() (a directly-constructed test fixture, say); nil is treated the
+	// same as an empty, always-matching pattern rather than a panic,
+	// consistent with FuncPattern's own "empty means everything" zero value.
+	if fn, ok := node.(*ast.FuncDecl); ok && job.funcPattern != nil && !job.funcPattern.MatchString(fn.Name.Name) {
+		return false, nil
+	}
+
+	// Returning false is what makes suppression cascade: ast.Inspect skips the
+	// node's children but carries on with its siblings, so a directive on a
+	// compound statement covers everything nested inside it without the walk
+	// having to carry any "am I inside a suppressed subtree" state.
+	if reason, ok := suppressed.anchored(spec.fset, node); ok {
+		sink.suppression(SuppressionResult{
+			File:   spec.path,
+			Line:   spec.fset.Position(node.Pos()).Line,
+			Reason: reason,
+		})
+
+		return false, nil
+	}
+
+	for _, m := range job.mutators {
+		if !m.Applies(node) {
+			continue
+		}
+
+		spec.operator = m.Name()
+		spec.line = spec.fset.Position(node.Pos()).Line
+		// Looked up per node rather than per mutant: every mutation of a node
+		// shares its line, and the map is only consulted at all under
+		// ScopeImpact (covering reports nil for a nil map).
+		spec.covering = job.cover.covering(spec.path, spec.line)
+
+		for _, mutation := range m.Mutate(node) {
+			if err := ctx.Err(); err != nil {
+				return false, err
+			}
+
+			spec.mutation = mutation
+
+			res, ok, err := run.run(ctx, *spec)
+			if err != nil {
+				return false, err
+			}
+
+			if ok {
+				sink.mutant(res)
+			}
+		}
+	}
+
+	return true, nil
 }

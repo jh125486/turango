@@ -1,0 +1,91 @@
+version: "2"
+
+run:
+  go: "1.23"
+  tests: true
+  timeout: 5m
+  allow-parallel-runners: true
+
+output:
+  show-stats: true
+
+linters:
+  enable:
+    - bodyclose
+    - copyloopvar
+    - errcheck
+    - errorlint
+    - goconst
+    - gocritic
+    - gocyclo
+    - gosec
+    - govet
+    - ineffassign
+    - makezero
+    - nilnil
+    - prealloc
+    - revive
+    - staticcheck
+    - tagalign
+    - unconvert
+    - unparam
+    - unused
+    - wastedassign
+
+  settings:
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - experimental
+        - opinionated
+        - performance
+        - style
+      disabled-checks:
+        # hugeParam/ptrToRefParam flag 80-176 byte value params (Options,
+        # mutant, corpus.Entry, resolver, ...) as pointer candidates on
+        # copy-cost grounds. turango is a CLI that runs a handful of `go
+        # test` subprocesses per mutant, each costing milliseconds to
+        # seconds; a struct copy on that path is immaterial, and several of
+        # these types (mutate.Options especially) are public API passed by
+        # value on purpose. Not worth the call-site churn these checks would
+        # otherwise force.
+        - hugeParam
+        - ptrToRefParam
+    gocyclo:
+      min-complexity: 15
+    staticcheck:
+      checks:
+        - all
+
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - std-error-handling
+    rules:
+      - path: _test\.go
+        linters:
+          - goconst
+          - gocyclo
+        # goconst: test data (fixture strings, subtest labels) legitimately
+        # repeats literals a production const wouldn't.
+        # gocyclo: table-driven tests with many t.Run/switch-case assertions
+        # rack up "complexity" that isn't a signal about the test's quality,
+        # unlike the same metric on production control flow.
+      - path: corpus/stdlib-.*
+        linters:
+          - gocritic
+          - gocyclo
+          - gosec
+          - govet
+          - revive
+          - staticcheck
+      - path: example/legacy/legacy\.go
+        linters:
+          - gocritic
+        text: "ifElseChain"
+        # Ported byte-for-byte from the 2018 go-turango prototype (see the
+        # package doc comment). Rewriting the if-chain to a switch would
+        # change its AST shape and silently change the corpus fixture's
+        # expected mutant count.

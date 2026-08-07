@@ -69,10 +69,17 @@ func Bounds(values []int) (low, high int, ok bool) {
 	return low, high, true
 }
 
-// Trend classifies a series as rising, falling or flat by comparing how many
-// steps go up against how many go down.
+// Trend's three possible results.
+const (
+	TrendRising  = "rising"
+	TrendFalling = "falling"
+	TrendFlat    = "flat"
+)
+
+// Trend classifies a series as [TrendRising], [TrendFalling] or [TrendFlat]
+// by comparing how many steps go up against how many go down.
 //
-// A series of fewer than two values has no steps and is flat.
+// A series of fewer than two values has no steps and is [TrendFlat].
 func Trend(values []int) string {
 	up, down := 0, 0
 
@@ -86,12 +93,12 @@ func Trend(values []int) string {
 	}
 
 	if up > down {
-		return "rising"
+		return TrendRising
 	}
 
 	if down > up {
-		return "falling"
+		return TrendFalling
 	}
 
-	return "flat"
+	return TrendFlat
 }

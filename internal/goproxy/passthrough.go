@@ -28,9 +28,12 @@ import (
 // ErrNotFound is returned when no usable real "go" binary can be located.
 var ErrNotFound = errors.New("goproxy: unable to locate the real go toolchain binary")
 
+// goosWindows is runtime.GOOS's value on Windows.
+const goosWindows = "windows"
+
 // goBinaryName is the name of the Go toolchain's frontend binary.
 var goBinaryName = func() string {
-	if runtime.GOOS == "windows" {
+	if runtime.GOOS == goosWindows {
 		return "go.exe"
 	}
 
@@ -138,7 +141,7 @@ func samePath(a, b string) bool {
 		return false
 	}
 
-	if runtime.GOOS == "windows" {
+	if runtime.GOOS == goosWindows {
 		return strings.EqualFold(ra, rb)
 	}
 

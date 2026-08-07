@@ -14,7 +14,7 @@ import (
 func fakeGo(t *testing.T, dir string) string {
 	t.Helper()
 
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o750); err != nil {
 		t.Fatalf("mkdir %s: %v", dir, err)
 	}
 
@@ -24,7 +24,8 @@ func fakeGo(t *testing.T, dir string) string {
 		body = "@echo off\r\nexit /b 0\r\n"
 	}
 
-	if err := os.WriteFile(path, []byte(body), 0o755); err != nil {
+	//nolint:gosec // this is the fake "go" binary the test executes; it needs the exec bit
+	if err := os.WriteFile(path, []byte(body), 0o700); err != nil {
 		t.Fatalf("write %s: %v", path, err)
 	}
 
@@ -172,7 +173,8 @@ func TestResolveSkipsSelfViaSymlink(t *testing.T) {
 
 	binDir := t.TempDir()
 	self := filepath.Join(binDir, "turango")
-	if err := os.WriteFile(self, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+	//nolint:gosec // this is the fake "go" binary the test executes; it needs the exec bit
+	if err := os.WriteFile(self, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
 		t.Fatalf("write self: %v", err)
 	}
 
@@ -282,7 +284,7 @@ func TestResolveNotFound(t *testing.T) {
 
 func TestResolveSkipsDirectoriesNamedGo(t *testing.T) {
 	pathDir := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(pathDir, goBinaryName), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Join(pathDir, goBinaryName), 0o750); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
 

@@ -41,13 +41,13 @@ func TestParseMutateFlagsRecognition(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			cfg, err := parseMutateFlags(tt.args)
+			_, found, err := parseMutateFlags(tt.args)
 			if err != nil {
 				t.Fatalf("parseMutateFlags(%q) error = %v", tt.args, err)
 			}
 
-			if got := cfg != nil; got != tt.want {
-				t.Errorf("parseMutateFlags(%q) recognised = %v, want %v", tt.args, got, tt.want)
+			if found != tt.want {
+				t.Errorf("parseMutateFlags(%q) recognised = %v, want %v", tt.args, found, tt.want)
 			}
 		})
 	}
@@ -61,7 +61,7 @@ func TestParseMutateFlagsValues(t *testing.T) {
 	t.Run("defaults", func(t *testing.T) {
 		t.Parallel()
 
-		cfg, err := parseMutateFlags([]string{"-mutate=."})
+		cfg, _, err := parseMutateFlags([]string{"-mutate=."})
 		if err != nil {
 			t.Fatalf("parseMutateFlags() error = %v", err)
 		}
@@ -93,7 +93,7 @@ func TestParseMutateFlagsValues(t *testing.T) {
 	t.Run("every flag set", func(t *testing.T) {
 		t.Parallel()
 
-		cfg, err := parseMutateFlags([]string{
+		cfg, _, err := parseMutateFlags([]string{
 			"-mutate=Foo.*",
 			"-mutatescope=impact",
 			"-mutateoperators=control/if,operator/binary",
@@ -133,7 +133,7 @@ func TestParseMutateFlagsValues(t *testing.T) {
 		// Package selection is ordinary trailing positional arguments now,
 		// exactly as with -run/-bench/-fuzz — not a comma-separated -mutate
 		// value. Each space-separated pattern is its own argument.
-		cfg, err := parseMutateFlags([]string{"-mutate=.", "./a/...", "./b"})
+		cfg, _, err := parseMutateFlags([]string{"-mutate=.", "./a/...", "./b"})
 		if err != nil {
 			t.Fatalf("parseMutateFlags() error = %v", err)
 		}
@@ -146,7 +146,7 @@ func TestParseMutateFlagsValues(t *testing.T) {
 	t.Run("a zero threshold is still a threshold", func(t *testing.T) {
 		t.Parallel()
 
-		cfg, err := parseMutateFlags([]string{"-mutate=.", "-mutatemin=0"})
+		cfg, _, err := parseMutateFlags([]string{"-mutate=.", "-mutatemin=0"})
 		if err != nil {
 			t.Fatalf("parseMutateFlags() error = %v", err)
 		}
@@ -159,7 +159,7 @@ func TestParseMutateFlagsValues(t *testing.T) {
 	t.Run("scope defaults survive an unrelated flag", func(t *testing.T) {
 		t.Parallel()
 
-		cfg, err := parseMutateFlags([]string{"-mutateparallel=2", "-mutate=."})
+		cfg, _, err := parseMutateFlags([]string{"-mutateparallel=2", "-mutate=."})
 		if err != nil {
 			t.Fatalf("parseMutateFlags() error = %v", err)
 		}
@@ -176,7 +176,7 @@ func TestParseMutateFlagsValues(t *testing.T) {
 		// positional package pattern, exactly like -run/-bench/-fuzz's own
 		// trailing package args — this used to be rejected as "unsupported
 		// argument" before -mutate stopped taking packages as its own value.
-		cfg, err := parseMutateFlags([]string{"-mutate=.", "./cmd/..."})
+		cfg, _, err := parseMutateFlags([]string{"-mutate=.", "./cmd/..."})
 		if err != nil {
 			t.Fatalf("parseMutateFlags() error = %v", err)
 		}
@@ -189,7 +189,7 @@ func TestParseMutateFlagsValues(t *testing.T) {
 	t.Run("trailing package pattern after other mutate flags", func(t *testing.T) {
 		t.Parallel()
 
-		cfg, err := parseMutateFlags([]string{"-mutate=.", "-mutatemin=0.5", "extra"})
+		cfg, _, err := parseMutateFlags([]string{"-mutate=.", "-mutatemin=0.5", "extra"})
 		if err != nil {
 			t.Fatalf("parseMutateFlags() error = %v", err)
 		}
@@ -230,7 +230,7 @@ func TestParseMutateFlagsErrors(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
-			cfg, err := parseMutateFlags(tt.args)
+			cfg, _, err := parseMutateFlags(tt.args)
 			if err == nil {
 				t.Fatalf("parseMutateFlags(%q) = %+v, want an error", tt.args, cfg)
 			}
@@ -247,13 +247,13 @@ func TestParseMutateFlagsErrors(t *testing.T) {
 func TestParseMutateFlagsIgnoresArgsTail(t *testing.T) {
 	t.Parallel()
 
-	cfg, err := parseMutateFlags([]string{"-mutate=.", "-args", "-v", "whatever", "-mutatescope"})
+	_, found, err := parseMutateFlags([]string{"-mutate=.", "-args", "-v", "whatever", "-mutatescope"})
 	if err != nil {
 		t.Fatalf("parseMutateFlags() error = %v", err)
 	}
 
-	if cfg == nil {
-		t.Fatal("parseMutateFlags() = nil, want a mutation request")
+	if !found {
+		t.Fatal("parseMutateFlags() found = false, want a mutation request")
 	}
 }
 

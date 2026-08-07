@@ -9,6 +9,12 @@ import (
 // BooleanName is the registry name of the boolean-literal flip operator.
 const BooleanName = "literal/boolean"
 
+// The two predeclared boolean identifiers this operator flips between.
+const (
+	trueLit  = "true"
+	falseLit = "false"
+)
+
 func init() {
 	mutator.Register(BooleanName, func() mutator.Mutator { return &BooleanMutator{} })
 }
@@ -35,7 +41,7 @@ func (*BooleanMutator) Name() string { return BooleanName }
 func (*BooleanMutator) Applies(node ast.Node) bool {
 	ident, ok := node.(*ast.Ident)
 
-	return ok && (ident.Name == "true" || ident.Name == "false")
+	return ok && (ident.Name == trueLit || ident.Name == falseLit)
 }
 
 // Mutate returns the single flip available for node, or nil for anything
@@ -49,10 +55,10 @@ func (*BooleanMutator) Mutate(node ast.Node) []mutator.Mutation {
 	var swapped string
 
 	switch ident.Name {
-	case "true":
-		swapped = "false"
-	case "false":
-		swapped = "true"
+	case trueLit:
+		swapped = falseLit
+	case falseLit:
+		swapped = trueLit
 	default:
 		return nil
 	}

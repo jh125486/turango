@@ -16,7 +16,10 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.23'
+          # 1.23 is the main module's own `go` directive (go.mod); the
+          # toolchain must also satisfy tools/golangci-lint/go.mod's `go
+          # 1.25.0`, which the lint step below invokes via -modfile.
+          go-version: '1.25'
 
       - name: Build
         run: go build ./...
@@ -32,6 +35,9 @@ jobs:
             echo "$fmt_out"
             exit 1
           fi
+
+      - name: Lint
+        run: go tool -modfile=tools/golangci-lint/go.mod golangci-lint run ./...
 
       - name: Test
         run: go test ./...

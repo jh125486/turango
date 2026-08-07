@@ -123,11 +123,11 @@ func TestBounded(t *testing.T) {
 	for rel, content := range files {
 		path := filepath.Join(root, filepath.FromSlash(rel))
 
-		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 			t.Fatalf("MkdirAll(%s) error = %v", filepath.Dir(path), err)
 		}
 
-		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 			t.Fatalf("WriteFile(%s) error = %v", path, err)
 		}
 	}
@@ -220,7 +220,7 @@ func TestMutateFileStopsWhenCancelled(t *testing.T) {
 	job := fileJob{moduleDir: root, path: path, mutators: mutator.All()}
 
 	err := mutateFile(ctx, run, job, sink)
-	if err != context.Canceled {
+	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("mutateFile() error = %v, want %v", err, context.Canceled)
 	}
 
@@ -768,7 +768,7 @@ func TestRunFailsOnBrokenBaseline(t *testing.T) {
 
 	// Break the suite without breaking the build.
 	broken := "package mathx\n\nimport \"testing\"\n\nfunc TestBroken(t *testing.T) {\n\tt.Fatal(\"already red\")\n}\n"
-	if err := os.WriteFile(filepath.Join(root, "mathx", "mathx_test.go"), []byte(broken), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "mathx", "mathx_test.go"), []byte(broken), 0o600); err != nil {
 		t.Fatalf("WriteFile() error = %v", err)
 	}
 

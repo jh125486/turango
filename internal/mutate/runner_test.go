@@ -21,6 +21,7 @@ import (
 // does not read. They are the contract this classifier is written against, so
 // they are pasted rather than generated.
 
+//nolint:gosec // false positive: "pass" here means a captured `go test -json` PASS action, not a credential
 const passStream = `{"Time":"2026-08-05T16:03:00.089842-07:00","Action":"start","Package":"example.com/fixture/mathx"}
 {"Time":"2026-08-05T16:03:00.566645-07:00","Action":"run","Package":"example.com/fixture/mathx","Test":"TestClamp"}
 {"Time":"2026-08-05T16:03:00.569463-07:00","Action":"output","Package":"example.com/fixture/mathx","Test":"TestClamp","Output":"=== RUN   TestClamp\n"}
@@ -198,7 +199,7 @@ func f(a, b int) int {
 
 	r := &runner{goBin: "/nonexistent/go", testTimeout: MinBaselineTimeout}
 
-	got, err := r.run(context.Background(), mutant{
+	got, ok, err := r.run(context.Background(), mutant{
 		fset:      fset,
 		file:      file,
 		path:      "/nowhere/p.go",
@@ -217,8 +218,8 @@ func f(a, b int) int {
 		t.Fatalf("run() error = %v, want nil", err)
 	}
 
-	if got != nil {
-		t.Errorf("run() = %+v, want nil for a no-op mutation", got)
+	if ok {
+		t.Errorf("run() = %+v, ok = true, want ok = false for a no-op mutation", got)
 	}
 
 	if !applied || !reverted {
@@ -325,7 +326,7 @@ func f(a, b int) int {
 
 	r := &runner{goBin: "/nonexistent/go", testTimeout: MinBaselineTimeout}
 
-	got, err := r.run(context.Background(), mutant{
+	got, ok, err := r.run(context.Background(), mutant{
 		fset:      fset,
 		file:      file,
 		path:      "/nowhere/p.go",
@@ -346,8 +347,8 @@ func f(a, b int) int {
 		t.Fatalf("run() error = %v", err)
 	}
 
-	if got == nil {
-		t.Fatal("run() = nil, want a survived verdict for an uncovered line")
+	if !ok {
+		t.Fatal("run() ok = false, want a survived verdict for an uncovered line")
 	}
 
 	if got.Status != Survived {
@@ -476,6 +477,7 @@ replace example.com/lib => ../lib
 	}
 
 	resolved := filepath.Join(copied, filepath.FromSlash(target))
+	//nolint:gosec // resolved is derived from this test's own fixture go.mod, not external input
 	if _, err := os.Stat(filepath.Join(resolved, "go.mod")); err != nil {
 		t.Errorf("replace target %q does not resolve to a copied module: %v", target, err)
 	}
@@ -504,11 +506,11 @@ func writeFiles(t *testing.T, files map[string]string) {
 	t.Helper()
 
 	for path, content := range files {
-		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 			t.Fatalf("MkdirAll(%s) error = %v", filepath.Dir(path), err)
 		}
 
-		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 			t.Fatalf("WriteFile(%s) error = %v", path, err)
 		}
 	}

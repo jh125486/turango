@@ -85,15 +85,18 @@ const timeoutGrace = 15 * time.Second
 // where the failure is.
 const maxOutputBytes = 16 << 10
 
+// allPackages is the "everything" package pattern go test itself understands.
+const allPackages = "./..."
+
 // run executes a single mutation end to end and reports the verdict.
 //
-// It returns (nil, nil) — deliberately, not an error and not a result — when the
+// It returns ok false — deliberately, not an error and not a result — when the
 // mutation produces source byte-identical to the original. Such a mutation is
 // not a mutant at all: go/printer normalised it away (an implicit empty
 // statement replacing an already-empty one, say), so testing it would waste a
 // full `go test` cycle to learn nothing, and recording it would inflate the
 // denominator of the score with a mutant that does not exist.
-func (r *runner) run(ctx context.Context, m mutant) (*MutantResult, error) {
+func (r *runner) run(ctx context.Context, m mutant) (result MutantResult, ok bool, err error) {
 	m.mutation.Apply()
 	// Revert unconditionally, including on every error path: the AST is shared
 	// with the rest of the walk, so leaving a mutation applied would silently
@@ -102,15 +105,15 @@ func (r *runner) run(ctx context.Context, m mutant) (*MutantResult, error) {
 
 	var mutated bytes.Buffer
 	if err := printer.Fprint(&mutated, m.fset, m.file); err != nil {
-		return nil, fmt.Errorf("mutate: printing mutated %s: %w", m.path, err)
+		return MutantResult{}, false, fmt.Errorf("mutate: printing mutated %s: %w", m.path, err)
 	}
 
 	src := mutated.Bytes()
 	if bytes.Equal(src, m.baseline) {
-		return nil, nil
+		return MutantResult{}, false, nil
 	}
 
-	result := &MutantResult{
+	result = MutantResult{
 		File:        m.path,
 		Line:        m.line,
 		Operator:    m.operator,
@@ -127,38 +130,38 @@ func (r *runner) run(ctx context.Context, m mutant) (*MutantResult, error) {
 		result.Status = Survived
 		result.Output = "turango: no test in this package executes this line, so nothing could have caught the mutation"
 
-		return result, nil
+		return result, true, nil
 	}
 
 	args, err := m.testArgs()
 	if err != nil {
-		return nil, err
+		return MutantResult{}, false, err
 	}
 
 	tmp, err := os.MkdirTemp("", "turango-mutant-")
 	if err != nil {
-		return nil, fmt.Errorf("mutate: creating workspace: %w", err)
+		return MutantResult{}, false, fmt.Errorf("mutate: creating workspace: %w", err)
 	}
 
 	defer func() { _ = os.RemoveAll(tmp) }()
 
 	moduleDir, err := copyModule(tmp, m.moduleDir)
 	if err != nil {
-		return nil, err
+		return MutantResult{}, false, err
 	}
 
 	rel, err := filepath.Rel(m.moduleDir, m.path)
 	if err != nil {
-		return nil, fmt.Errorf("mutate: locating %s within %s: %w", m.path, m.moduleDir, err)
+		return MutantResult{}, false, fmt.Errorf("mutate: locating %s within %s: %w", m.path, m.moduleDir, err)
 	}
 
-	if err := os.WriteFile(filepath.Join(moduleDir, rel), src, 0o644); err != nil {
-		return nil, fmt.Errorf("mutate: writing mutated %s: %w", rel, err)
+	if err := os.WriteFile(filepath.Join(moduleDir, rel), src, 0o600); err != nil {
+		return MutantResult{}, false, fmt.Errorf("mutate: writing mutated %s: %w", rel, err)
 	}
 
 	stdout, stderr, timedOut, err := r.goTest(ctx, moduleDir, args)
 	if err != nil {
-		return nil, err
+		return MutantResult{}, false, err
 	}
 
 	if timedOut {
@@ -169,12 +172,12 @@ func (r *runner) run(ctx context.Context, m mutant) (*MutantResult, error) {
 		result.Status = Killed
 		result.Output = truncate(string(stdout) + string(stderr) + "\nturango: mutant exceeded the per-mutant timeout")
 
-		return result, nil
+		return result, true, nil
 	}
 
 	result.Status, result.Output = classify(stdout, stderr)
 
-	return result, nil
+	return result, true, nil
 }
 
 // testArgs renders the trailing `go test` arguments that decide which tests get
@@ -185,7 +188,7 @@ func (r *runner) run(ctx context.Context, m mutant) (*MutantResult, error) {
 // sources, which are unmutated.
 func (m mutant) testArgs() ([]string, error) {
 	if m.scope == ScopeFull {
-		return []string{"./..."}, nil
+		return []string{allPackages}, nil
 	}
 
 	pattern, err := packagePattern(m.moduleDir, m.pkgDir)
@@ -267,6 +270,7 @@ func (r *runner) goTest(ctx context.Context, dir string, args []string) (stdout,
 		"-timeout=" + r.testTimeout.String(),
 	}, args...)
 
+	//nolint:gosec // running "go test" against a mutated copy of the module is turango's core function, not attacker-controlled input
 	cmd := exec.CommandContext(runCtx, r.goBin, argv...)
 	cmd.Dir = dir
 
@@ -349,15 +353,28 @@ var compileError = regexp.MustCompile(`(?m)^.*\.go:\d+(:\d+)?: `)
 //   - Tests ran and nothing failed: Survived. A package with no test files at
 //     all lands here too, which is correct: nothing was watching, so nothing
 //     caught it.
-func classify(stdout, stderr []byte) (Status, string) {
-	var (
-		sawTest    bool
-		testFailed bool
-		pkgFailed  bool
-		buildFail  bool
-		text       strings.Builder
-		raw        strings.Builder
-	)
+func classify(stdout, stderr []byte) (status Status, output string) {
+	sawTest, testFailed, pkgFailed, buildFail, text := parseTestEvents(stdout)
+	out := text + string(stderr)
+
+	switch {
+	case buildFail:
+		return NotViable, truncate(out)
+	case !sawTest && (pkgFailed || compileError.MatchString(out)):
+		return NotViable, truncate(out)
+	case testFailed || pkgFailed:
+		return Killed, truncate(out)
+	default:
+		return Survived, truncate(out)
+	}
+}
+
+// parseTestEvents walks a `go test -json` stdout stream and extracts the
+// signals classify needs: whether any test ran, whether a test or the
+// package failed, whether the build itself failed, and the reconstructed
+// plain-text output.
+func parseTestEvents(stdout []byte) (sawTest, testFailed, pkgFailed, buildFail bool, out string) {
+	var text, raw strings.Builder
 
 	for _, line := range strings.Split(string(stdout), "\n") {
 		if strings.TrimSpace(line) == "" {
@@ -395,18 +412,7 @@ func classify(stdout, stderr []byte) (Status, string) {
 		}
 	}
 
-	out := text.String() + raw.String() + string(stderr)
-
-	switch {
-	case buildFail:
-		return NotViable, truncate(out)
-	case !sawTest && (pkgFailed || compileError.MatchString(out)):
-		return NotViable, truncate(out)
-	case testFailed || pkgFailed:
-		return Killed, truncate(out)
-	default:
-		return Survived, truncate(out)
-	}
+	return sawTest, testFailed, pkgFailed, buildFail, text.String() + raw.String()
 }
 
 // truncate caps captured output at maxOutputBytes, keeping the tail.
@@ -572,10 +578,7 @@ func commonDir(paths []string) string {
 	for _, p := range paths[1:] {
 		other := strings.Split(filepath.Clean(p), sep)
 
-		n := len(parts)
-		if len(other) < n {
-			n = len(other)
-		}
+		n := min(len(other), len(parts))
 
 		i := 0
 		for i < n && parts[i] == other[i] {
@@ -639,7 +642,8 @@ func rewriteReplaces(moduleDir string, replaces []localReplace, dests map[string
 		return fmt.Errorf("mutate: formatting copied go.mod: %w", err)
 	}
 
-	if err := os.WriteFile(path, out, 0o644); err != nil {
+	//nolint:gosec // path is moduleDir/go.mod inside turango's own temp workspace copy, not external input
+	if err := os.WriteFile(path, out, 0o600); err != nil {
 		return fmt.Errorf("mutate: writing copied go.mod: %w", err)
 	}
 
@@ -683,6 +687,7 @@ func copyTree(src, dst string) error {
 				return err
 			}
 
+			//nolint:gosec // copying the developer's own trusted module into a temp workspace, not a multi-tenant or attacker-controlled path
 			return os.Symlink(link, target)
 
 		case entry.Type().IsRegular():

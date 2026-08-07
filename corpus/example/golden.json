@@ -6,10 +6,10 @@
   "operators": null,
   "timeout": "30s",
   "expect": {
-    "mutants": 219,
-    "killed": 151,
-    "survived": 60,
-    "notViable": 8,
+    "mutants": 240,
+    "killed": 164,
+    "survived": 62,
+    "notViable": 14,
     "suppressed": 2
   }
 }

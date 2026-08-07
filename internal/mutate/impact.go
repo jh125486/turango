@@ -42,7 +42,7 @@ func (m *impactMap) covering(file string, line int) []string {
 // testFuncName matches the names `go test -list` prints for things -run can
 // select. Benchmarks are deliberately excluded: -run does not start them, so
 // running one would measure nothing and cost a full build.
-var testFuncName = regexp.MustCompile(`^(Test|Fuzz|Example)[^\s]*$`)
+var testFuncName = regexp.MustCompile(`^(Test|Fuzz|Example)\S*$`)
 
 // buildImpact measures which tests cover which lines of one package.
 //
@@ -94,6 +94,7 @@ func buildImpact(ctx context.Context, goBin, moduleDir, pkgDir string, goFiles [
 
 		profile := filepath.Join(dir, fmt.Sprintf("cover%d.out", i))
 
+		//nolint:gosec // running "go test" against the module under mutation is turango's core function, not attacker-controlled input
 		cmd := exec.CommandContext(ctx, goBin,
 			"test",
 			"-count=1",
