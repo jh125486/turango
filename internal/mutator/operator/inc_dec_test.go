@@ -1,4 +1,4 @@
-package operator
+package operator_test
 
 import (
 	"go/ast"
@@ -6,6 +6,8 @@ import (
 )
 
 func TestIncDecMutate(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		name string
 		src  string
@@ -16,10 +18,12 @@ func TestIncDecMutate(t *testing.T) {
 		{name: "dec to inc", src: "i--", want: "i++", desc: "-- -> ++"},
 	}
 
-	var m incDec
+	m := newMutator(t, "operator/inc_dec")
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
 			fset, file := parseFunc(t, tt.src)
 			stmt := findNode[*ast.IncDecStmt](t, file)
 
@@ -51,9 +55,11 @@ func TestIncDecMutate(t *testing.T) {
 // TestIncDecInsideForPost covers the common shape, a loop's post statement,
 // where the mutant flips a counting-up loop to counting down.
 func TestIncDecInsideForPost(t *testing.T) {
+	t.Parallel()
+
 	fset, file := parseFunc(t, "for i := 0; i < n; i++ {\n\t}")
 
-	var m incDec
+	m := newMutator(t, "operator/inc_dec")
 
 	stmt := findNode[*ast.IncDecStmt](t, file)
 	loop := findNode[*ast.ForStmt](t, file)
@@ -67,9 +73,11 @@ func TestIncDecInsideForPost(t *testing.T) {
 }
 
 func TestIncDecIgnoresOtherNodes(t *testing.T) {
+	t.Parallel()
+
 	_, file := parseFunc(t, "a += 1")
 
-	var m incDec
+	m := newMutator(t, "operator/inc_dec")
 
 	stmt := findNode[*ast.AssignStmt](t, file)
 

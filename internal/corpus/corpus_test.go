@@ -83,7 +83,7 @@ func runEntry(t *testing.T, root string, entry corpus.Entry) {
 
 	opts := buildOptions(t, root, entry)
 
-	ctx, cancel := context.WithTimeout(context.Background(), corpusRunTimeout)
+	ctx, cancel := context.WithTimeout(t.Context(), corpusRunTimeout)
 	defer cancel()
 
 	result, err := mutate.Run(ctx, opts)

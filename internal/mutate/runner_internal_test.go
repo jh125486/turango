@@ -1,8 +1,11 @@
+// Whitebox: runner.go exports no identifiers at all — mutant, runner,
+// classify, parseTestEvents, copyModule and the rest are all unexported —
+// so every test here needs direct package access; there is no exported
+// surface left for a blackbox file to cover.
 package mutate
 
 import (
 	"bytes"
-	"context"
 	"go/ast"
 	"go/parser"
 	"go/printer"
@@ -12,6 +15,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"golang.org/x/tools/go/packages"
 
 	"github.com/jh125486/turango/internal/mutator"
 )
@@ -199,7 +204,7 @@ func f(a, b int) int {
 
 	r := &runner{goBin: "/nonexistent/go", testTimeout: MinBaselineTimeout}
 
-	got, ok, err := r.run(context.Background(), mutant{
+	got, ok, equivalent, err := r.run(t.Context(), mutant{
 		fset:      fset,
 		file:      file,
 		path:      "/nowhere/p.go",
@@ -218,8 +223,8 @@ func f(a, b int) int {
 		t.Fatalf("run() error = %v, want nil", err)
 	}
 
-	if ok {
-		t.Errorf("run() = %+v, ok = true, want ok = false for a no-op mutation", got)
+	if ok || equivalent {
+		t.Errorf("run() = %+v, ok = %v, equivalent = %v, want both false for a no-op mutation", got, ok, equivalent)
 	}
 
 	if !applied || !reverted {
@@ -326,7 +331,7 @@ func f(a, b int) int {
 
 	r := &runner{goBin: "/nonexistent/go", testTimeout: MinBaselineTimeout}
 
-	got, ok, err := r.run(context.Background(), mutant{
+	got, ok, equivalent, err := r.run(t.Context(), mutant{
 		fset:      fset,
 		file:      file,
 		path:      "/nowhere/p.go",
@@ -337,6 +342,7 @@ func f(a, b int) int {
 		line:      4,
 		scope:     ScopeImpact,
 		covering:  nil,
+		node:      stmt,
 		mutation: mutator.Mutation{
 			Description: "if -> false",
 			Apply:       func() { stmt.Cond = ast.NewIdent("false") },
@@ -345,6 +351,10 @@ func f(a, b int) int {
 	})
 	if err != nil {
 		t.Fatalf("run() error = %v", err)
+	}
+
+	if equivalent {
+		t.Error("run() equivalent = true, want false: TCE is not active in this test")
 	}
 
 	if !ok {
@@ -359,8 +369,94 @@ func f(a, b int) int {
 		t.Errorf("run() output = %q, want it to explain that no test covers the line", got.Output)
 	}
 
+	// Before/After: mutation.Node was left nil, so the fallback is m.node
+	// (stmt, the whole if statement) — printed before Apply and again
+	// after, a concrete assertion that the render captures the actual
+	// condition swap, not just that the fields are non-empty.
+	if !strings.Contains(got.Before, "a > b") {
+		t.Errorf("run() Before = %q, want it to contain the original condition", got.Before)
+	}
+
+	if !strings.Contains(got.After, "false") || strings.Contains(got.After, "a > b") {
+		t.Errorf("run() After = %q, want the swapped condition, not the original", got.After)
+	}
+
 	if stmt.Cond != original {
 		t.Error("run() left the mutation applied to the shared AST")
+	}
+}
+
+// TestRunReportsEmptyAfterForRemoval covers MutantResult.After's documented
+// special case: when mutation.Node's own printed text is identical before
+// and after Apply — because Apply repointed the containing list's slot
+// rather than editing Node's fields — After must be empty, not a stale
+// duplicate of Before. statement/remover is the concrete case this protects
+// (see its own doc comment on the Mutation literal it returns), reproduced
+// directly here rather than through the real operator so the test pins the
+// runner's contract independent of that operator's own behavior.
+func TestRunReportsEmptyAfterForRemoval(t *testing.T) {
+	t.Parallel()
+
+	const src = `package p
+
+func f() int {
+	x := 1
+	return x
+}
+`
+
+	fset := token.NewFileSet()
+
+	file, err := parser.ParseFile(fset, "p.go", src, parser.ParseComments)
+	if err != nil {
+		t.Fatalf("ParseFile() error = %v", err)
+	}
+
+	var baseline bytes.Buffer
+	if err := printer.Fprint(&baseline, fset, file); err != nil {
+		t.Fatalf("Fprint() error = %v", err)
+	}
+
+	decl := file.Decls[0].(*ast.FuncDecl)
+	list := &decl.Body.List
+	stmt := (*list)[0]
+	blank := &ast.EmptyStmt{Semicolon: stmt.Pos(), Implicit: true}
+
+	r := &runner{goBin: "/nonexistent/go", testTimeout: MinBaselineTimeout}
+
+	got, ok, _, err := r.run(t.Context(), mutant{
+		fset:      fset,
+		file:      file,
+		path:      "/nowhere/p.go",
+		baseline:  baseline.Bytes(),
+		moduleDir: "/nowhere",
+		pkgDir:    "/nowhere",
+		operator:  "statement/remover",
+		line:      4,
+		scope:     ScopeImpact,
+		covering:  nil,
+		node:      decl.Body,
+		mutation: mutator.Mutation{
+			Description: "remove statement: x := 1",
+			Apply:       func() { (*list)[0] = blank },
+			Revert:      func() { (*list)[0] = stmt },
+			Node:        stmt,
+		},
+	})
+	if err != nil {
+		t.Fatalf("run() error = %v", err)
+	}
+
+	if !ok {
+		t.Fatal("run() ok = false, want a survived verdict for an uncovered line")
+	}
+
+	if !strings.Contains(got.Before, "x := 1") {
+		t.Errorf("run() Before = %q, want the removed statement's text", got.Before)
+	}
+
+	if got.After != "" {
+		t.Errorf("run() After = %q, want empty: the node's own text does not change when it is removed, not edited", got.After)
 	}
 }
 
@@ -488,7 +584,7 @@ replace example.com/lib => ../lib
 func replaceTarget(t *testing.T, gomod string) string {
 	t.Helper()
 
-	for _, line := range strings.Split(gomod, "\n") {
+	for line := range strings.SplitSeq(gomod, "\n") {
 		fields := strings.Fields(line)
 		if len(fields) == 4 && fields[0] == "replace" && fields[2] == "=>" {
 			return fields[3]
@@ -513,5 +609,310 @@ func writeFiles(t *testing.T, files map[string]string) {
 		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 			t.Fatalf("WriteFile(%s) error = %v", path, err)
 		}
+	}
+}
+
+// The tests below cover ROADMAP.md gap 5's not-yet-wired components
+// (closureDirs, hasEmbedDirective, resolveClosure, copyClosure,
+// copyDirFiles) in isolation. Nothing in the engine calls these yet — see
+// closureDirs' own doc comment for why activating them is a deliberately
+// separate step — but they're real, reachable code, tested the same as
+// anything else in this file.
+
+// TestHasEmbedDirective covers the fail-toward-safety rule: a real
+// directive is a match, an unrelated mention of the string is (honestly, a
+// false positive, but the safe direction) also a match, and an unreadable
+// file is treated as a match too, since a false negative here is not
+// survivable (a missing embedded asset fails the build) while a false
+// positive only costs an unnecessary fallback to the full-module copy.
+func TestHasEmbedDirective(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+
+	withDirective := filepath.Join(dir, "embed.go")
+	writeFiles(t, map[string]string{
+		withDirective: "package p\n\n//go:embed data.txt\nvar data string\n",
+	})
+
+	withoutDirective := filepath.Join(dir, "plain.go")
+	writeFiles(t, map[string]string{
+		withoutDirective: "package p\n\nfunc F() {}\n",
+	})
+
+	tests := map[string]struct {
+		files []string
+		want  bool
+	}{
+		"real directive":        {files: []string{withoutDirective, withDirective}, want: true},
+		"no directive":          {files: []string{withoutDirective}, want: false},
+		"unreadable, fail safe": {files: []string{filepath.Join(dir, "does-not-exist.go")}, want: true},
+		"no files at all":       {files: nil, want: false},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := hasEmbedDirective(tt.files); got != tt.want {
+				t.Errorf("hasEmbedDirective(%v) = %v, want %v", tt.files, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestCopyDirFiles covers the shallow-copy contract: files directly in src
+// land in dst, subdirectories (a different Go package, per closureDirs' own
+// doc comment) are left alone.
+func TestCopyDirFiles(t *testing.T) {
+	t.Parallel()
+
+	src := t.TempDir()
+	dst := filepath.Join(t.TempDir(), "out")
+
+	writeFiles(t, map[string]string{
+		filepath.Join(src, "a.go"):        "package p\n",
+		filepath.Join(src, "a_test.go"):   "package p\n",
+		filepath.Join(src, "sub", "b.go"): "package sub\n",
+	})
+
+	if err := copyDirFiles(src, dst); err != nil {
+		t.Fatalf("copyDirFiles() error = %v", err)
+	}
+
+	for _, want := range []string{"a.go", "a_test.go"} {
+		if _, err := os.Stat(filepath.Join(dst, want)); err != nil {
+			t.Errorf("copyDirFiles() did not copy %s: %v", want, err)
+		}
+	}
+
+	if _, err := os.Stat(filepath.Join(dst, "sub")); err == nil {
+		t.Error("copyDirFiles() copied a subdirectory, want top-level files only")
+	}
+}
+
+// TestClosureDirs covers the forward-closure walk: same-module packages
+// (transitively) are included, a different module's packages are excluded
+// entirely (their subtrees never walked), and an embed directive anywhere
+// in the closure — even several imports deep — makes the whole result
+// unsafe. Every *packages.Package below is hand-built: closureDirs only
+// reads the fields it documents needing (Module, GoFiles, Imports, Errors),
+// so there is no need to drive a real go/packages.Load or real toolchain to
+// exercise it.
+func TestClosureDirs(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	moduleDir := filepath.Join(dir, "mod")
+	targetDir := filepath.Join(moduleDir, "target")
+	depDir := filepath.Join(moduleDir, "dep")
+
+	writeFiles(t, map[string]string{
+		filepath.Join(targetDir, "target.go"): "package target\n",
+		filepath.Join(depDir, "dep.go"):       "package dep\n",
+	})
+
+	mod := &packages.Module{Dir: moduleDir}
+
+	dep := &packages.Package{
+		PkgPath: "example.com/mod/dep",
+		Module:  mod,
+		GoFiles: []string{filepath.Join(depDir, "dep.go")},
+	}
+
+	stdlib := &packages.Package{
+		PkgPath: "fmt",
+		Module:  nil, // stdlib packages report no module
+		GoFiles: []string{"/goroot/src/fmt/print.go"},
+	}
+
+	target := &packages.Package{
+		PkgPath: "example.com/mod/target",
+		Module:  mod,
+		GoFiles: []string{filepath.Join(targetDir, "target.go")},
+		Imports: map[string]*packages.Package{
+			"example.com/mod/dep": dep,
+			"fmt":                 stdlib,
+		},
+	}
+
+	dirs, ok := closureDirs(target)
+	if !ok {
+		t.Fatal("closureDirs() ok = false, want true for a clean same-module closure")
+	}
+
+	want := map[string]bool{targetDir: true, depDir: true}
+	if !reflect.DeepEqual(dirs, want) {
+		t.Errorf("closureDirs() = %v, want %v", dirs, want)
+	}
+
+	t.Run("embed anywhere in the closure is unsafe", func(t *testing.T) {
+		t.Parallel()
+
+		embedDepDir := filepath.Join(dir, "embed-mod", "dep")
+		writeFiles(t, map[string]string{
+			filepath.Join(embedDepDir, "dep.go"): "package dep\n\n//go:embed data.txt\nvar data string\n",
+		})
+
+		embedMod := &packages.Module{Dir: filepath.Join(dir, "embed-mod")}
+
+		embedDep := &packages.Package{
+			PkgPath: "example.com/mod/dep",
+			Module:  embedMod,
+			GoFiles: []string{filepath.Join(embedDepDir, "dep.go")},
+		}
+
+		embedTarget := &packages.Package{
+			PkgPath: "example.com/mod/target",
+			Module:  embedMod,
+			GoFiles: []string{filepath.Join(embedMod.Dir, "target", "target.go")},
+			Imports: map[string]*packages.Package{"example.com/mod/dep": embedDep},
+		}
+
+		writeFiles(t, map[string]string{
+			filepath.Join(embedMod.Dir, "target", "target.go"): "package target\n",
+		})
+
+		if _, ok := closureDirs(embedTarget); ok {
+			t.Error("closureDirs() ok = true, want false: an import several layers deep has a //go:embed directive")
+		}
+	})
+
+	t.Run("a package with load errors is unsafe", func(t *testing.T) {
+		t.Parallel()
+
+		broken := &packages.Package{
+			PkgPath: "example.com/mod/broken",
+			Module:  mod,
+			Errors:  []packages.Error{{Msg: "syntax error"}},
+		}
+
+		withBroken := &packages.Package{
+			PkgPath: "example.com/mod/target",
+			Module:  mod,
+			GoFiles: []string{filepath.Join(targetDir, "target.go")},
+			Imports: map[string]*packages.Package{"example.com/mod/broken": broken},
+		}
+
+		if _, ok := closureDirs(withBroken); ok {
+			t.Error("closureDirs() ok = true, want false: an imported package failed to load")
+		}
+	})
+
+	t.Run("no module info is unsafe", func(t *testing.T) {
+		t.Parallel()
+
+		if _, ok := closureDirs(&packages.Package{PkgPath: "example.com/mod/target"}); ok {
+			t.Error("closureDirs() ok = true, want false: pkg has no Module at all")
+		}
+	})
+}
+
+// TestResolveClosure covers the two fallback triggers closureDirs alone
+// doesn't know about: a vendor/ directory, and any local replace directive.
+// Either one means "give up, let the caller fall back to copyModule" — see
+// resolveClosure's own doc comment for why re-scoping either to a partial
+// closure is out of scope for v1.
+func TestResolveClosure(t *testing.T) {
+	t.Parallel()
+
+	newTarget := func(t *testing.T, moduleDir string) *packages.Package {
+		t.Helper()
+
+		targetDir := filepath.Join(moduleDir, "target")
+		writeFiles(t, map[string]string{filepath.Join(targetDir, "target.go"): "package target\n"})
+
+		return &packages.Package{
+			PkgPath: "example.com/mod/target",
+			Module:  &packages.Module{Dir: moduleDir},
+			GoFiles: []string{filepath.Join(targetDir, "target.go")},
+		}
+	}
+
+	t.Run("clean module resolves", func(t *testing.T) {
+		t.Parallel()
+
+		moduleDir := t.TempDir()
+		writeFiles(t, map[string]string{filepath.Join(moduleDir, "go.mod"): "module example.com/mod\n\ngo 1.23\n"})
+
+		dirs, ok := resolveClosure(newTarget(t, moduleDir))
+		if !ok {
+			t.Fatal("resolveClosure() ok = false, want true for a module with no vendor dir or replace directives")
+		}
+
+		if want := map[string]bool{filepath.Join(moduleDir, "target"): true}; !reflect.DeepEqual(dirs, want) {
+			t.Errorf("resolveClosure() dirs = %v, want %v", dirs, want)
+		}
+	})
+
+	t.Run("a vendor directory falls back", func(t *testing.T) {
+		t.Parallel()
+
+		moduleDir := t.TempDir()
+		writeFiles(t, map[string]string{
+			filepath.Join(moduleDir, "go.mod"):                "module example.com/mod\n\ngo 1.23\n",
+			filepath.Join(moduleDir, "vendor", "modules.txt"): "",
+		})
+
+		if _, ok := resolveClosure(newTarget(t, moduleDir)); ok {
+			t.Error("resolveClosure() ok = true, want false: a vendor/ directory is present")
+		}
+	})
+
+	t.Run("a local replace directive falls back", func(t *testing.T) {
+		t.Parallel()
+
+		moduleDir := t.TempDir()
+		sibling := t.TempDir()
+		writeFiles(t, map[string]string{
+			filepath.Join(moduleDir, "go.mod"): "module example.com/mod\n\ngo 1.23\n\nreplace example.com/sibling => " +
+				filepath.ToSlash(sibling) + "\n",
+		})
+
+		if _, ok := resolveClosure(newTarget(t, moduleDir)); ok {
+			t.Error("resolveClosure() ok = true, want false: go.mod has a local replace directive")
+		}
+	})
+}
+
+// TestCopyClosure covers the actual copy: go.mod/go.sum land at the new
+// module root, every directory in dirs lands at its module-relative offset
+// preserved, and nothing outside dirs is copied.
+func TestCopyClosure(t *testing.T) {
+	t.Parallel()
+
+	moduleDir := t.TempDir()
+	targetDir := filepath.Join(moduleDir, "target")
+	depDir := filepath.Join(moduleDir, "internal", "dep")
+	irrelevantDir := filepath.Join(moduleDir, "irrelevant")
+
+	writeFiles(t, map[string]string{
+		filepath.Join(moduleDir, "go.mod"):        "module example.com/mod\n\ngo 1.23\n",
+		filepath.Join(moduleDir, "go.sum"):        "",
+		filepath.Join(targetDir, "target.go"):     "package target\n",
+		filepath.Join(depDir, "dep.go"):           "package dep\n",
+		filepath.Join(irrelevantDir, "unused.go"): "package irrelevant\n",
+	})
+
+	dst := t.TempDir()
+
+	newModuleDir, err := copyClosure(dst, moduleDir, map[string]bool{targetDir: true, depDir: true})
+	if err != nil {
+		t.Fatalf("copyClosure() error = %v", err)
+	}
+
+	for _, want := range []string{
+		filepath.Join(newModuleDir, "go.mod"),
+		filepath.Join(newModuleDir, "go.sum"),
+		filepath.Join(newModuleDir, "target", "target.go"),
+		filepath.Join(newModuleDir, "internal", "dep", "dep.go"),
+	} {
+		if _, err := os.Stat(want); err != nil {
+			t.Errorf("copyClosure() did not produce %s: %v", want, err)
+		}
+	}
+
+	if _, err := os.Stat(filepath.Join(newModuleDir, "irrelevant")); err == nil {
+		t.Error("copyClosure() copied a directory outside the closure")
 	}
 }

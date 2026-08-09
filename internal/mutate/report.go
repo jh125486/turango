@@ -95,6 +95,12 @@ func (s *Status) UnmarshalJSON(data []byte) error {
 // never becomes a MutantResult: it is not a real mutant and the engine skips it
 // silently (see [runner.run]).
 type MutantResult struct {
+	// ID is this mutant's stable, content-hashed identifier — see
+	// [mutantID]. Stable across re-runs of unchanged source; not stable
+	// across edits to the file above the mutated line. Reproduce this exact
+	// mutant with -mutatemutant=<ID>.
+	ID string
+
 	// File is the absolute path of the mutated source file. Reporting layers
 	// are expected to relativise it for display; the engine keeps it absolute
 	// so results stay unambiguous across modules.
@@ -110,6 +116,23 @@ type MutantResult struct {
 	// Description is the operator's human-readable summary of the edit, e.g.
 	// "== -> !=".
 	Description string
+
+	// Before and After are the mutated node's printed source text,
+	// immediately before and immediately after the mutation's Apply — the
+	// actual diff Description only summarises. Populated unconditionally
+	// (so they're always in a JSON report), but the console survivor
+	// listing shows Description only; dumping full before/after source
+	// into a scannable table would defeat the table's own point.
+	//
+	// After is empty specifically when the mutated node's own printed text
+	// is identical before and after Apply: the node itself wasn't edited
+	// in place (its containing list's slot was repointed elsewhere, e.g. a
+	// deleted statement), so the only way the removal is visible is by the
+	// node's absence, not by any diff in its own printed form. Before is
+	// never empty for a real mutant — the syntactic no-op check upstream
+	// already filters mutations that changed nothing about the file at
+	// all.
+	Before, After string
 
 	// Status is the verdict.
 	Status Status
@@ -144,6 +167,33 @@ type SuppressionResult struct {
 	Reason string
 }
 
+// EquivalentResult records one mutation Trivial Compiler Equivalence (TCE)
+// found semantically identical to the unmutated package: the mutant's
+// compiled output exactly matched the baseline's, so it was never run
+// against the test suite — there was nothing behavioral for the suite to
+// have a chance of catching.
+//
+// It is not a mutant and never becomes one, the same reasoning
+// [SuppressionResult] is built on: there is no verdict to record, only the
+// fact that nothing was attempted. Unlike a suppression, an equivalent
+// mutation *was* generated and *did* get compiled — TCE is a filter applied
+// after generation, not a directive that stops the walk before it.
+type EquivalentResult struct {
+	// File is the absolute path of the mutated source file, matching
+	// [MutantResult.File].
+	File string
+
+	// Line is the line the mutated node starts on.
+	Line int
+
+	// Operator is the registry name of the mutator that produced the
+	// mutation, e.g. "statement/remover".
+	Operator string
+
+	// Description is the operator's human-readable summary of the edit.
+	Description string
+}
+
 // Result accumulates every mutant a run produced, in walk order: files in
 // package order, nodes in AST order, operators sorted by name. The order is
 // deterministic so two runs over unchanged sources produce identical reports.
@@ -161,16 +211,27 @@ type Result struct {
 	// [Result.SuppressionRatio], so that liberal suppression is visible rather
 	// than quietly inflating the score.
 	Suppressions []SuppressionResult
+
+	// Equivalents holds every mutation Trivial Compiler Equivalence filtered
+	// out, in the same walk order as Mutants. Deliberately outside the
+	// scoring path for the same reason Suppressions is: an equivalent
+	// mutation produced no verdict, so it appears in neither [Result.Counts]
+	// nor [Result.Score].
+	Equivalents []EquivalentResult
 }
 
 // SuppressedCount reports how many nodes were skipped because of a //nomutant
 // directive.
 func (r *Result) SuppressedCount() int { return len(r.Suppressions) }
 
+// EquivalentCount reports how many mutations Trivial Compiler Equivalence
+// filtered out before they reached the test suite.
+func (r *Result) EquivalentCount() int { return len(r.Equivalents) }
+
 // Counts reports how many mutants landed in each status.
 func (r *Result) Counts() (killed, survived, notViable int) {
-	for _, m := range r.Mutants {
-		switch m.Status {
+	for i := range r.Mutants {
+		switch r.Mutants[i].Status {
 		case Killed:
 			killed++
 		case Survived:
@@ -245,10 +306,12 @@ func (r *Result) Relativize(base string) *Result {
 	out := &Result{
 		Mutants:      make([]MutantResult, len(r.Mutants)),
 		Suppressions: make([]SuppressionResult, len(r.Suppressions)),
+		Equivalents:  make([]EquivalentResult, len(r.Equivalents)),
 	}
 
 	copy(out.Mutants, r.Mutants)
 	copy(out.Suppressions, r.Suppressions)
+	copy(out.Equivalents, r.Equivalents)
 
 	for i := range out.Mutants {
 		out.Mutants[i].File = relPath(base, out.Mutants[i].File)
@@ -256,6 +319,10 @@ func (r *Result) Relativize(base string) *Result {
 
 	for i := range out.Suppressions {
 		out.Suppressions[i].File = relPath(base, out.Suppressions[i].File)
+	}
+
+	for i := range out.Equivalents {
+		out.Equivalents[i].File = relPath(base, out.Equivalents[i].File)
 	}
 
 	return out
@@ -302,6 +369,7 @@ func (r *Result) WriteSummary(w io.Writer, base string) {
 	}
 
 	r.writeSuppressions(w)
+	r.writeEquivalents(w)
 	r.writeSurvivors(w, base)
 }
 
@@ -323,30 +391,52 @@ func (r *Result) writeSuppressions(w io.Writer) {
 		suppressed, killed+survived+suppressed, ratio*100)
 }
 
+// writeEquivalents prints the TCE line, only when TCE actually filtered
+// something: a run with zero equivalent mutations found says nothing here,
+// matching how a run with no not-viable mutants doesn't get a dedicated line
+// either — this is a count worth surfacing when non-zero, not a fixed part of
+// the summary's shape.
+//
+// Unlike [Result.writeSuppressions], there is no ratio printed alongside the
+// count: a suppression ratio being high is a legitimate (if worth
+// scrutinizing) human choice, so it's shown next to the score for context. A
+// high equivalent-filtered count driven by a false positive in the
+// compiled-output comparison would be a tool correctness bug, not a
+// scoring-gaming concern, so there is no "trustworthy together" framing to
+// draw attention to here.
+func (r *Result) writeEquivalents(w io.Writer) {
+	if n := r.EquivalentCount(); n > 0 {
+		fmt.Fprintf(w, "equivalent: %d (filtered by TCE before reaching the test suite)\n", n)
+	}
+}
+
 // writeSurvivors lists the mutants nothing in the suite noticed.
 //
 // The columns are padded to the widest entry rather than to a fixed width: the
 // list is what a user reads down, and a ragged left edge on the operator column
 // is what makes it hard to scan.
 func (r *Result) writeSurvivors(w io.Writer, base string) {
-	type row struct{ location, operator, description string }
+	type row struct{ id, location, operator, description string }
 
 	var (
-		rows              []row
-		locWidth, opWidth int
+		rows                       []row
+		idWidth, locWidth, opWidth int
 	)
 
-	for _, m := range r.Mutants {
+	for i := range r.Mutants {
+		m := &r.Mutants[i]
 		if m.Status != Survived {
 			continue
 		}
 
 		next := row{
+			id:          m.ID,
 			location:    fmt.Sprintf("%s:%d", relPath(base, m.File), m.Line),
 			operator:    m.Operator,
 			description: m.Description,
 		}
 
+		idWidth = max(idWidth, len(next.id))
 		locWidth = max(locWidth, len(next.location))
 		opWidth = max(opWidth, len(next.operator))
 
@@ -360,6 +450,6 @@ func (r *Result) writeSurvivors(w io.Writer, base string) {
 	fmt.Fprintf(w, "\nSurviving mutants (%d):\n", len(rows))
 
 	for _, r := range rows {
-		fmt.Fprintf(w, "  %-*s  %-*s  %s\n", locWidth, r.location, opWidth, r.operator, r.description)
+		fmt.Fprintf(w, "  %-*s  %-*s  %-*s  %s\n", idWidth, r.id, locWidth, r.location, opWidth, r.operator, r.description)
 	}
 }

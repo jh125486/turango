@@ -16,7 +16,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          # 1.23 is the main module's own `go` directive (go.mod); the
+          # 1.24 is the main module's own `go` directive (go.mod); the
           # toolchain must also satisfy tools/golangci-lint/go.mod's `go
           # 1.25.0`, which the lint step below invokes via -modfile.
           go-version: '1.25'
@@ -45,11 +45,23 @@ jobs:
       - name: Test (race)
         run: go test -race ./...
 
+      - name: Test (integration)
+        # Integration tests — the ones that shell out to the real Go
+        # toolchain, compiling/testing throwaway module copies — live behind
+        # the "integration" build tag (see internal/mutate/engine_integration*
+        # _test.go) rather than a testing.Short() skip, so the two steps
+        # above never even compile them in. This step is what actually runs
+        # them in CI; -tags=integration also re-includes every fast test
+        # (untagged files always compile), so this is a superset, not a
+        # narrower run.
+        run: go test -tags=integration ./...
+        timeout-minutes: 20
+
       - name: Corpus regression
-        # The corpus package's own TestCorpus skips under -short and this
-        # repo's "Test"/"Test (race)" steps above already run without
-        # -short, so this step technically re-runs work those steps already
-        # did. It stays as its own step anyway: a distinct, clearly-named
+        # The corpus package's own TestCorpus skips under -short and none of
+        # the three steps above pass -short, so this step technically re-runs
+        # work those steps already did. It stays as its own step anyway: a
+        # distinct, clearly-named
         # step keeps the corpus run's pass/fail and wall-clock time
         # independently visible in the CI UI, separate from the rest of the
         # suite, and easy to re-run or tune (e.g. -run) without touching the

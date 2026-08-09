@@ -1,11 +1,15 @@
-package literal
+package literal_test
 
 import (
 	"go/ast"
 	"testing"
+
+	"github.com/jh125486/turango/internal/mutator/literal"
 )
 
 func TestNumberMutate(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		name    string
 		src     string
@@ -19,10 +23,12 @@ func TestNumberMutate(t *testing.T) {
 		{name: "underscore separator", src: "1_000", wantUp: "1001", wantDwn: "999"},
 	}
 
-	var m NumberMutator
+	var m literal.NumberMutator
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
 			fset, file := parseFunc(t, "_ = "+tt.src)
 			lit := findNode[*ast.BasicLit](t, file)
 
@@ -52,10 +58,14 @@ func TestNumberMutate(t *testing.T) {
 // which have their own distinct mutation concerns not handled here, are
 // left alone.
 func TestNumberIgnoresOtherLiterals(t *testing.T) {
-	var m NumberMutator
+	t.Parallel()
+
+	var m literal.NumberMutator
 
 	for _, src := range []string{`"hello"`, "3.14"} {
 		t.Run(src, func(t *testing.T) {
+			t.Parallel()
+
 			_, file := parseFunc(t, "_ = "+src)
 			lit := findNode[*ast.BasicLit](t, file)
 
@@ -71,9 +81,11 @@ func TestNumberIgnoresOtherLiterals(t *testing.T) {
 }
 
 func TestNumberIgnoresOtherNodes(t *testing.T) {
+	t.Parallel()
+
 	_, file := parseFunc(t, "a := 1")
 
-	var m NumberMutator
+	var m literal.NumberMutator
 
 	stmt := findNode[*ast.AssignStmt](t, file)
 

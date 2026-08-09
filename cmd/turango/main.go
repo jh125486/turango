@@ -60,6 +60,8 @@ const (
 	flagTimeout   = "mutatetimeout"
 	flagOutput    = "mutateoutput"
 	flagMin       = "mutatemin"
+	flagMutant    = "mutatemutant"
+	flagTCE       = "mutatetce"
 )
 
 // flagArgsSeparator is go test's own "-args" boundary: everything after it
@@ -69,7 +71,7 @@ const flagArgsSeparator = "-args"
 
 // mutateFlags is the recognised set, in the order they are documented.
 var mutateFlags = []string{
-	flagMutate, flagScope, flagOperators, flagParallel, flagTimeout, flagOutput, flagMin,
+	flagMutate, flagScope, flagOperators, flagParallel, flagTimeout, flagOutput, flagMin, flagMutant, flagTCE,
 }
 
 // reportFile is the name of the JSON report written into -mutateoutput.
@@ -454,6 +456,10 @@ func (c *mutateConfig) set(name, value string) error {
 		return c.setOutput(value)
 	case flagMin:
 		return c.setMin(value)
+	case flagMutant:
+		return c.setMutant(value)
+	case flagTCE:
+		return c.setTCE(value)
 	}
 
 	return nil
@@ -542,12 +548,44 @@ func (c *mutateConfig) setMin(value string) error {
 	return nil
 }
 
+// mutantIDPattern matches the lowercase-hex form every [mutate.MutantResult.ID]
+// is printed in.
+var mutantIDPattern = regexp.MustCompile(`^[0-9a-f]+$`)
+
+// setMutant validates and stores -mutatemutant: replay exactly one mutant by
+// the ID a previous report's MutantResult.ID (or the console survivor
+// listing) printed for it.
+func (c *mutateConfig) setMutant(value string) error {
+	if !mutantIDPattern.MatchString(value) {
+		return fmt.Errorf("turango: -%s=%q: want a mutant ID from a previous report (lowercase hex)", flagMutant, value)
+	}
+
+	c.options.MutantID = value
+
+	return nil
+}
+
+// setTCE validates and stores -mutatetce: whether Trivial Compiler
+// Equivalence filters compiled-identical mutants before they reach the test
+// suite. Off by default (mutate.Options{}'s zero value); -mutatetce=true
+// opts in.
+func (c *mutateConfig) setTCE(value string) error {
+	tce, err := strconv.ParseBool(value)
+	if err != nil {
+		return fmt.Errorf("turango: -%s=%q: want true or false", flagTCE, value)
+	}
+
+	c.options.TCE = tce
+
+	return nil
+}
+
 // splitList parses a comma-separated flag value, dropping empty entries so that
 // a trailing comma is not a third, blank item.
 func splitList(value string) []string {
 	var out []string
 
-	for _, item := range strings.Split(value, ",") {
+	for item := range strings.SplitSeq(value, ",") {
 		if item = strings.TrimSpace(item); item != "" {
 			out = append(out, item)
 		}

@@ -1,6 +1,6 @@
 module github.com/jh125486/turango
 
-go 1.23
+go 1.26
 
 require (
 	golang.org/x/mod v0.23.0

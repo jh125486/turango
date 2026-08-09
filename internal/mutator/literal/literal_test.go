@@ -1,4 +1,4 @@
-package literal
+package literal_test
 
 import (
 	"bytes"
@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/jh125486/turango/internal/mutator"
+	"github.com/jh125486/turango/internal/mutator/literal"
 )
 
 // parseFunc parses body as the body of a function in a throwaway file. The
@@ -91,8 +92,12 @@ func applyRoundTrip(t *testing.T, fset *token.FileSet, target ast.Node, m mutato
 }
 
 func TestRegisteredNames(t *testing.T) {
-	for _, name := range []string{NumberName, BooleanName} {
+	t.Parallel()
+
+	for _, name := range []string{literal.NumberName, literal.BooleanName} {
 		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
 			m, err := mutator.New(name)
 			if err != nil {
 				t.Fatalf("New(%q): %v", name, err)

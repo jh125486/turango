@@ -1,4 +1,4 @@
-package mutate
+package mutate_test
 
 import (
 	"bytes"
@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/jh125486/turango/internal/mutate"
 )
 
 // TestStatusJSON pins the wire form of a status: the names, not the iota. A
@@ -16,12 +18,12 @@ func TestStatusJSON(t *testing.T) {
 	t.Parallel()
 
 	tests := map[string]struct {
-		status Status
+		status mutate.Status
 		want   string
 	}{
-		"killed":     {status: Killed, want: `"killed"`},
-		"survived":   {status: Survived, want: `"survived"`},
-		"not viable": {status: NotViable, want: `"not-viable"`},
+		"killed":     {status: mutate.Killed, want: `"killed"`},
+		"survived":   {status: mutate.Survived, want: `"survived"`},
+		"not viable": {status: mutate.NotViable, want: `"not-viable"`},
 	}
 
 	for name, tt := range tests {
@@ -37,7 +39,7 @@ func TestStatusJSON(t *testing.T) {
 				t.Errorf("Marshal(%v) = %s, want %s", tt.status, data, tt.want)
 			}
 
-			var got Status
+			var got mutate.Status
 			if err := json.Unmarshal(data, &got); err != nil {
 				t.Fatalf("Unmarshal(%s) error = %v", data, err)
 			}
@@ -65,7 +67,7 @@ func TestStatusUnmarshalRejectsUnknown(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
-			var got Status
+			var got mutate.Status
 			if err := json.Unmarshal([]byte(encoded), &got); err == nil {
 				t.Errorf("Unmarshal(%s) = %v, want an error", encoded, got)
 			}
@@ -78,12 +80,13 @@ func TestStatusUnmarshalRejectsUnknown(t *testing.T) {
 func TestResultJSONRoundTrip(t *testing.T) {
 	t.Parallel()
 
-	want := &Result{
-		Mutants: []MutantResult{
-			{File: "a.go", Line: 3, Operator: "operator/binary", Description: "== -> !=", Status: Survived},
-			{File: "b.go", Line: 9, Operator: "control/if", Description: "remove if body", Status: NotViable},
+	want := &mutate.Result{
+		Mutants: []mutate.MutantResult{
+			{File: "a.go", Line: 3, Operator: "operator/binary", Description: "== -> !=", Status: mutate.Survived, Before: "v < lo", After: "v >= lo"},
+			{File: "b.go", Line: 9, Operator: "control/if", Description: "remove if body", Status: mutate.NotViable, Before: "{ x() }", After: "{}"},
 		},
-		Suppressions: []SuppressionResult{{File: "a.go", Line: 12, Reason: "flaky"}},
+		Suppressions: []mutate.SuppressionResult{{File: "a.go", Line: 12, Reason: "flaky"}},
+		Equivalents:  []mutate.EquivalentResult{{File: "c.go", Line: 5, Operator: "statement/remover", Description: "remove statement: dead = 1"}},
 	}
 
 	data, err := json.Marshal(want)
@@ -95,17 +98,55 @@ func TestResultJSONRoundTrip(t *testing.T) {
 		t.Errorf("report = %s, want the status spelled out", data)
 	}
 
-	var got Result
+	var got mutate.Result
 	if err := json.Unmarshal(data, &got); err != nil {
 		t.Fatalf("Unmarshal() error = %v", err)
 	}
 
-	if len(got.Mutants) != len(want.Mutants) || got.Mutants[0].Status != Survived || got.Mutants[1].Status != NotViable {
+	if len(got.Mutants) != len(want.Mutants) || got.Mutants[0].Status != mutate.Survived || got.Mutants[1].Status != mutate.NotViable {
 		t.Errorf("round trip = %+v, want %+v", got.Mutants, want.Mutants)
+	}
+
+	if got.Mutants[0].Before != "v < lo" || got.Mutants[0].After != "v >= lo" {
+		t.Errorf("round trip dropped before/after: %+v", got.Mutants[0])
 	}
 
 	if len(got.Suppressions) != 1 || got.Suppressions[0].Reason != "flaky" {
 		t.Errorf("round trip dropped suppressions: %+v", got.Suppressions)
+	}
+
+	if len(got.Equivalents) != 1 || got.Equivalents[0].Description != "remove statement: dead = 1" {
+		t.Errorf("round trip dropped equivalents: %+v", got.Equivalents)
+	}
+}
+
+// TestResultScore covers Counts and Score together: the per-status tally and
+// the ratio derived from it, including the rule that NotViable mutants must
+// not dilute the score.
+func TestResultScore(t *testing.T) {
+	t.Parallel()
+
+	empty := &mutate.Result{}
+	if _, ok := empty.Score(); ok {
+		t.Error("Score() reported a score for an empty result")
+	}
+
+	r := &mutate.Result{Mutants: []mutate.MutantResult{
+		{Status: mutate.Killed},
+		{Status: mutate.Killed},
+		{Status: mutate.Survived},
+		{Status: mutate.NotViable},
+	}}
+
+	killed, survived, notViable := r.Counts()
+	if killed != 2 || survived != 1 || notViable != 1 {
+		t.Errorf("Counts() = %d, %d, %d; want 2, 1, 1", killed, survived, notViable)
+	}
+
+	// NotViable must not dilute the score.
+	score, ok := r.Score()
+	if !ok || score != 2.0/3.0 {
+		t.Errorf("Score() = %v, %v; want %v, true", score, ok, 2.0/3.0)
 	}
 }
 
@@ -115,35 +156,35 @@ func TestSuppressionRatio(t *testing.T) {
 	t.Parallel()
 
 	tests := map[string]struct {
-		result *Result
+		result *mutate.Result
 		want   float64
 		wantOK bool
 	}{
 		"an empty run has no ratio": {
-			result: &Result{},
+			result: &mutate.Result{},
 		},
 		"nothing suppressed": {
-			result: &Result{Mutants: []MutantResult{{Status: Killed}, {Status: Survived}}},
+			result: &mutate.Result{Mutants: []mutate.MutantResult{{Status: mutate.Killed}, {Status: mutate.Survived}}},
 			wantOK: true,
 		},
 		"one in four": {
-			result: &Result{
-				Mutants:      []MutantResult{{Status: Killed}, {Status: Killed}, {Status: Survived}},
-				Suppressions: []SuppressionResult{{Line: 1}},
+			result: &mutate.Result{
+				Mutants:      []mutate.MutantResult{{Status: mutate.Killed}, {Status: mutate.Killed}, {Status: mutate.Survived}},
+				Suppressions: []mutate.SuppressionResult{{Line: 1}},
 			},
 			want:   0.25,
 			wantOK: true,
 		},
 		"not-viable mutants are outside the ratio": {
-			result: &Result{
-				Mutants:      []MutantResult{{Status: Killed}, {Status: NotViable}, {Status: NotViable}},
-				Suppressions: []SuppressionResult{{Line: 1}},
+			result: &mutate.Result{
+				Mutants:      []mutate.MutantResult{{Status: mutate.Killed}, {Status: mutate.NotViable}, {Status: mutate.NotViable}},
+				Suppressions: []mutate.SuppressionResult{{Line: 1}},
 			},
 			want:   0.5,
 			wantOK: true,
 		},
 		"suppressions with no mutants at all": {
-			result: &Result{Suppressions: []SuppressionResult{{Line: 1}, {Line: 2}}},
+			result: &mutate.Result{Suppressions: []mutate.SuppressionResult{{Line: 1}, {Line: 2}}},
 			want:   1,
 			wantOK: true,
 		},
@@ -161,6 +202,71 @@ func TestSuppressionRatio(t *testing.T) {
 	}
 }
 
+// TestSuppressionsStayOutOfTheScore pins the accounting rule: a suppressed node
+// never became a mutant, so it must not appear in the counts or move the score
+// in either direction.
+func TestSuppressionsStayOutOfTheScore(t *testing.T) {
+	t.Parallel()
+
+	r := &mutate.Result{
+		Mutants: []mutate.MutantResult{
+			{Status: mutate.Killed},
+			{Status: mutate.Survived},
+		},
+		Suppressions: []mutate.SuppressionResult{
+			{File: "a.go", Line: 3},
+			{File: "a.go", Line: 9, Reason: "generated"},
+		},
+	}
+
+	killed, survived, notViable := r.Counts()
+	if killed != 1 || survived != 1 || notViable != 0 {
+		t.Errorf("Counts() = %d, %d, %d; want 1, 1, 0", killed, survived, notViable)
+	}
+
+	score, ok := r.Score()
+	if !ok || score != 0.5 {
+		t.Errorf("Score() = %v, %v; want 0.5, true", score, ok)
+	}
+
+	if got := r.SuppressedCount(); got != 2 {
+		t.Errorf("SuppressedCount() = %d, want 2", got)
+	}
+}
+
+// TestEquivalentsStayOutOfTheScore pins the same accounting rule
+// TestSuppressionsStayOutOfTheScore does, for TCE: a mutation Trivial
+// Compiler Equivalence filtered never became a mutant, so it must not
+// appear in the counts or move the score in either direction.
+func TestEquivalentsStayOutOfTheScore(t *testing.T) {
+	t.Parallel()
+
+	r := &mutate.Result{
+		Mutants: []mutate.MutantResult{
+			{Status: mutate.Killed},
+			{Status: mutate.Survived},
+		},
+		Equivalents: []mutate.EquivalentResult{
+			{File: "a.go", Line: 3, Operator: "statement/remover", Description: "remove statement: dead = 1"},
+			{File: "a.go", Line: 9, Operator: "literal/number", Description: "1 -> 2"},
+		},
+	}
+
+	killed, survived, notViable := r.Counts()
+	if killed != 1 || survived != 1 || notViable != 0 {
+		t.Errorf("Counts() = %d, %d, %d; want 1, 1, 0", killed, survived, notViable)
+	}
+
+	score, ok := r.Score()
+	if !ok || score != 0.5 {
+		t.Errorf("Score() = %v, %v; want 0.5, true", score, ok)
+	}
+
+	if got := r.EquivalentCount(); got != 2 {
+		t.Errorf("EquivalentCount() = %d, want 2", got)
+	}
+}
+
 // TestRelativize covers the paths a published report carries, including the ones
 // that must be left alone.
 func TestRelativize(t *testing.T) {
@@ -170,9 +276,10 @@ func TestRelativize(t *testing.T) {
 	inside := filepath.Join(base, "pkg", "a.go")
 	outside := filepath.Join(string(filepath.Separator), "elsewhere", "b.go")
 
-	original := &Result{
-		Mutants:      []MutantResult{{File: inside}, {File: outside}, {File: "already/relative.go"}},
-		Suppressions: []SuppressionResult{{File: inside, Line: 4}},
+	original := &mutate.Result{
+		Mutants:      []mutate.MutantResult{{File: inside}, {File: outside}, {File: "already/relative.go"}},
+		Suppressions: []mutate.SuppressionResult{{File: inside, Line: 4}},
+		Equivalents:  []mutate.EquivalentResult{{File: inside, Line: 7}},
 	}
 
 	got := original.Relativize(base)
@@ -193,9 +300,13 @@ func TestRelativize(t *testing.T) {
 		t.Errorf("Suppressions[0].File = %q, want the relative path", got.Suppressions[0].File)
 	}
 
+	if got.Equivalents[0].File != filepath.Join("pkg", "a.go") {
+		t.Errorf("Equivalents[0].File = %q, want the relative path", got.Equivalents[0].File)
+	}
+
 	// The engine's own copy must be untouched: it is still being used to run
 	// mutants when a partial report is flushed.
-	if original.Mutants[0].File != inside || original.Suppressions[0].File != inside {
+	if original.Mutants[0].File != inside || original.Suppressions[0].File != inside || original.Equivalents[0].File != inside {
 		t.Errorf("Relativize modified the receiver: %+v", original)
 	}
 
@@ -214,14 +325,15 @@ func TestWriteSummary(t *testing.T) {
 
 	base := filepath.Join(string(filepath.Separator), "src", "mod")
 
-	result := &Result{
-		Mutants: []MutantResult{
-			{File: filepath.Join(base, "a.go"), Line: 7, Operator: "operator/binary", Description: "== -> !=", Status: Killed},
-			{File: filepath.Join(base, "a.go"), Line: 9, Operator: "control/if", Description: "remove if body", Status: Survived},
-			{File: filepath.Join(base, "pkg", "b.go"), Line: 42, Operator: "statement/remover", Description: "remove statement: x++", Status: Survived},
-			{File: filepath.Join(base, "pkg", "b.go"), Line: 50, Operator: "operator/unary", Description: "strip !", Status: NotViable},
+	result := &mutate.Result{
+		Mutants: []mutate.MutantResult{
+			{File: filepath.Join(base, "a.go"), Line: 7, Operator: "operator/binary", Description: "== -> !=", Status: mutate.Killed},
+			{File: filepath.Join(base, "a.go"), Line: 9, Operator: "control/if", Description: "remove if body", Status: mutate.Survived, Before: "{ thing() }", After: "{}"},
+			{File: filepath.Join(base, "pkg", "b.go"), Line: 42, Operator: "statement/remover", Description: "remove statement: x++", Status: mutate.Survived},
+			{File: filepath.Join(base, "pkg", "b.go"), Line: 50, Operator: "operator/unary", Description: "strip !", Status: mutate.NotViable},
 		},
-		Suppressions: []SuppressionResult{{File: filepath.Join(base, "a.go"), Line: 3, Reason: "generated"}},
+		Suppressions: []mutate.SuppressionResult{{File: filepath.Join(base, "a.go"), Line: 3, Reason: "generated"}},
+		Equivalents:  []mutate.EquivalentResult{{File: filepath.Join(base, "a.go"), Line: 5, Operator: "statement/remover", Description: "remove statement: dead = 1"}},
 	}
 
 	var buf bytes.Buffer
@@ -237,6 +349,7 @@ func TestWriteSummary(t *testing.T) {
 		"not-viable: 1",
 		"score:      33.3% (1 killed of 3 viable)",
 		"suppressed: 1 of 4 nodes (25.0%",
+		"equivalent: 1 (filtered by TCE before reaching the test suite)",
 		"Surviving mutants (2):",
 		"a.go:9",
 		filepath.Join("pkg", "b.go") + ":42",
@@ -256,6 +369,14 @@ func TestWriteSummary(t *testing.T) {
 	if strings.Contains(got, base+string(filepath.Separator)) {
 		t.Errorf("summary contains an absolute path:\n%s", got)
 	}
+
+	// 3c's decision: the console table stays Description-only. Before/After
+	// exist for the JSON report (LLM-prompt-paste, proposal drafting), not
+	// for a table whose own doc comment cites "ragged left edge" as the
+	// thing it exists to avoid.
+	if strings.Contains(got, "{ thing() }") {
+		t.Errorf("summary leaked Before text into the console table:\n%s", got)
+	}
 }
 
 // TestWriteSummaryEmpty covers the two degenerate runs: nothing scored, and
@@ -265,7 +386,7 @@ func TestWriteSummaryEmpty(t *testing.T) {
 
 	var buf bytes.Buffer
 
-	(&Result{}).WriteSummary(&buf, "")
+	(&mutate.Result{}).WriteSummary(&buf, "")
 
 	got := buf.String()
 
@@ -277,12 +398,20 @@ func TestWriteSummaryEmpty(t *testing.T) {
 		t.Errorf("summary = %q, want a suppression line", got)
 	}
 
+	// Unlike the suppression line, which always prints (even "suppressed:
+	// 0"), the equivalent line is omitted entirely when TCE found nothing —
+	// a fixed part of the summary's shape would be noise on every run that
+	// doesn't use TCE at all.
+	if strings.Contains(got, "equivalent:") {
+		t.Errorf("summary = %q, want no equivalent line when nothing was filtered", got)
+	}
+
 	if strings.Contains(got, "Surviving mutants") {
 		t.Errorf("summary = %q, want no survivor list when nothing survived", got)
 	}
 
 	buf.Reset()
-	(&Result{Mutants: []MutantResult{{Status: Killed}}}).WriteSummary(&buf, "")
+	(&mutate.Result{Mutants: []mutate.MutantResult{{Status: mutate.Killed}}}).WriteSummary(&buf, "")
 
 	if strings.Contains(buf.String(), "Surviving mutants") {
 		t.Errorf("summary = %q, want no survivor list on a clean run", buf.String())

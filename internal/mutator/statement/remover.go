@@ -96,6 +96,19 @@ func (*Remover) Mutate(node ast.Node) []mutator.Mutation {
 			Description: describe(i, stmt),
 			Apply:       func() { list[i] = blank },
 			Revert:      func() { list[i] = stmt },
+			// Node is the removed statement itself, not node (the
+			// container) — Mutate offers one mutation per removable
+			// statement, and a container can hold many, so reporting the
+			// whole container's before/after text per mutation would be
+			// far more verbose than Description's single-statement
+			// granularity. stmt's own text never changes (Apply replaces
+			// list's slot, not stmt's fields), which is exactly the signal
+			// the engine's before/after capture uses to report an empty
+			// "after": printing the same node before and after Apply and
+			// getting identical text means the node itself wasn't edited
+			// in place, so the only place its removal is visible is by
+			// its absence, not by any diff in its own printed form.
+			Node: stmt,
 		})
 	}
 

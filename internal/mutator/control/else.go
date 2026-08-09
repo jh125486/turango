@@ -58,5 +58,5 @@ func (m *Else) Mutate(node ast.Node) []mutator.Mutation {
 		return nil
 	}
 
-	return []mutator.Mutation{clearStmts(&block.List, "remove else body")}
+	return []mutator.Mutation{clearStmts(&block.List, block, "remove else body")}
 }

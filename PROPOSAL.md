@@ -243,6 +243,21 @@ remains a natural, scoped follow-up, not a blocker for this proposal.
   all, and mutation testing is what makes that fact impossible to miss
   (a coverage report on an untested package is simply absent, not a loud
   0%).
+- **No major language ships this in its official toolchain today.** Every
+  mutation tester surveyed for this proposal — [PIT] (Java), [mutmut]
+  (Python), [cargo-mutants] (Rust), [MutFlow] (Kotlin), [Mull] (C/C++,
+  LLVM-based), Stryker (JavaScript/TypeScript, .NET) — is a third-party
+  tool maintained outside its language's own toolchain, none blessed as an
+  official, in-the-box feature. Landing `-mutate` would make Go the first
+  mainstream language to ship mutation testing as a first-class part of
+  its standard toolchain, the same "first to bring it natively" position
+  `-fuzz` itself held for coverage-guided fuzzing when it landed in 1.18.
+
+[PIT]: https://pitest.org/
+[mutmut]: https://pypi.org/project/mutmut/
+[cargo-mutants]: https://github.com/sourcefrog/cargo-mutants
+[MutFlow]: https://github.com/anschnapp/mutflow
+[Mull]: https://arxiv.org/pdf/1908.01540
 
 ## Compatibility
 

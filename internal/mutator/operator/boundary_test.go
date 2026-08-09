@@ -1,4 +1,4 @@
-package operator
+package operator_test
 
 import (
 	"go/ast"
@@ -6,6 +6,8 @@ import (
 )
 
 func TestBoundaryMutate(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		name string
 		src  string // the expression, assigned to _ in the snippet
@@ -18,10 +20,12 @@ func TestBoundaryMutate(t *testing.T) {
 		{name: "geq to gtr", src: "a >= b", want: "a > b", desc: ">= -> >"},
 	}
 
-	var m boundary
+	m := newMutator(t, "operator/boundary")
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
 			fset, file := parseFunc(t, "_ = "+tt.src)
 			expr := findNode[*ast.BinaryExpr](t, file)
 
@@ -55,10 +59,14 @@ func TestBoundaryMutate(t *testing.T) {
 // etc.) — the two operators must partition the relational tokens, not
 // overlap.
 func TestBoundaryIgnoresNegationOperators(t *testing.T) {
-	var m boundary
+	t.Parallel()
+
+	m := newMutator(t, "operator/boundary")
 
 	for _, src := range []string{"a == b", "a != b", "a && b", "a || b", "a + b"} {
 		t.Run(src, func(t *testing.T) {
+			t.Parallel()
+
 			_, file := parseFunc(t, "_ = "+src)
 			expr := findNode[*ast.BinaryExpr](t, file)
 
@@ -74,9 +82,11 @@ func TestBoundaryIgnoresNegationOperators(t *testing.T) {
 }
 
 func TestBoundaryIgnoresOtherNodes(t *testing.T) {
+	t.Parallel()
+
 	_, file := parseFunc(t, "a += 1")
 
-	var m boundary
+	m := newMutator(t, "operator/boundary")
 
 	stmt := findNode[*ast.AssignStmt](t, file)
 

@@ -1,4 +1,4 @@
-package statement
+package statement_test
 
 import (
 	"bytes"
@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/jh125486/turango/internal/mutator"
+	"github.com/jh125486/turango/internal/mutator/statement"
 )
 
 // mixedSrc holds every removable statement kind alongside statements the
@@ -177,10 +178,15 @@ func descriptions(mutations []mutator.Mutation) []string {
 	return got
 }
 
-func TestRemoverIsRegistered(t *testing.T) {
-	m, err := mutator.New(RemoverName)
+// TestRegistered covers the operator's registration under RemoverName: that
+// mutator.New resolves it and that the resolved instance reports the same
+// name back.
+func TestRegistered(t *testing.T) {
+	t.Parallel()
+
+	m, err := mutator.New(statement.RemoverName)
 	if err != nil {
-		t.Fatalf("New(%q) error = %v", RemoverName, err)
+		t.Fatalf("New(%q) error = %v", statement.RemoverName, err)
 	}
 
 	if m.Name() != "statement/remover" {
@@ -188,9 +194,16 @@ func TestRemoverIsRegistered(t *testing.T) {
 	}
 }
 
-// TestApplies covers the pre-filter: containers holding a removable statement
-// match, everything else does not.
+// TestApplies covers Remover.Applies: the table exercises the statement-kind
+// and assignment-token combinations the pre-filter must tell apart (folded in
+// from what was a standalone token table, since every token maps directly to
+// an Applies outcome through a one-statement block), and a "rejects
+// non-containers" subtest covers the node kinds Applies must ignore,
+// including the statement kinds the operator removes (those are only ever
+// reached through their container).
 func TestApplies(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		name string
 		src  string
@@ -221,14 +234,66 @@ func TestApplies(t *testing.T) {
 			src:  "package p\n\nfunc f(x int) {\n\tx = 1\n}\n",
 			want: true,
 		},
+		{
+			name: "block with a lone add-assign",
+			src:  "package p\n\nfunc f(x int) {\n\tx += 1\n}\n",
+			want: true,
+		},
+		{
+			name: "block with a lone sub-assign",
+			src:  "package p\n\nfunc f(x int) {\n\tx -= 1\n}\n",
+			want: true,
+		},
+		{
+			name: "block with a lone mul-assign",
+			src:  "package p\n\nfunc f(x int) {\n\tx *= 1\n}\n",
+			want: true,
+		},
+		{
+			name: "block with a lone quo-assign",
+			src:  "package p\n\nfunc f(x int) {\n\tx /= 1\n}\n",
+			want: true,
+		},
+		{
+			name: "block with a lone rem-assign",
+			src:  "package p\n\nfunc f(x int) {\n\tx %= 1\n}\n",
+			want: true,
+		},
+		{
+			name: "block with a lone and-assign",
+			src:  "package p\n\nfunc f(x int) {\n\tx &= 1\n}\n",
+			want: true,
+		},
+		{
+			name: "block with a lone or-assign",
+			src:  "package p\n\nfunc f(x int) {\n\tx |= 1\n}\n",
+			want: true,
+		},
+		{
+			name: "block with a lone xor-assign",
+			src:  "package p\n\nfunc f(x int) {\n\tx ^= 1\n}\n",
+			want: true,
+		},
+		{
+			name: "block with a lone shl-assign",
+			src:  "package p\n\nfunc f(x int) {\n\tx <<= 1\n}\n",
+			want: true,
+		},
+		{
+			name: "block with a lone shr-assign",
+			src:  "package p\n\nfunc f(x int) {\n\tx >>= 1\n}\n",
+			want: true,
+		},
 	}
+
+	m := &statement.Remover{}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
 			_, file := parseSrc(t, tt.src)
 			block := funcBody(t, file)
-
-			m := &Remover{}
 
 			if got := m.Applies(block); got != tt.want {
 				t.Errorf("Applies() = %v, want %v", got, tt.want)
@@ -241,45 +306,50 @@ func TestApplies(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("rejects non-containers", func(t *testing.T) {
+		t.Parallel()
+
+		_, file := parseSrc(t, mixedSrc)
+		block := funcBody(t, file)
+
+		nodes := map[string]ast.Node{
+			"ident":       ast.NewIdent("x"),
+			"file":        file,
+			"func decl":   file.Decls[0],
+			"inc dec":     block.List[1],
+			"expr stmt":   block.List[2],
+			"assign stmt": block.List[3],
+			"if stmt":     block.List[6],
+			"return stmt": block.List[7],
+		}
+
+		for name, node := range nodes {
+			t.Run(name, func(t *testing.T) {
+				t.Parallel()
+
+				if m.Applies(node) {
+					t.Errorf("Applies(%T) = true, want false", node)
+				}
+				if got := m.Mutate(node); got != nil {
+					t.Errorf("Mutate(%T) = %v, want nil", node, descriptions(got))
+				}
+			})
+		}
+	})
 }
 
-// TestAppliesRejectsNonContainers guards the hot path: the operator must ignore
-// every node that is not a block or a case clause, including the statement
-// kinds it removes (those are only ever reached through their container).
-func TestAppliesRejectsNonContainers(t *testing.T) {
-	_, file := parseSrc(t, mixedSrc)
-	block := funcBody(t, file)
+// TestMutate covers Remover.Mutate: the table pins the exact set of mutations
+// produced for a block and a case clause — one per removable statement, in
+// source order, and none for a short variable declaration, an if statement, a
+// return, or a nested block's own statements — and further subtests cover
+// properties that do not fit that table: that Mutate itself leaves the AST
+// untouched, that each returned mutation's Apply/Revert round-trips the
+// source, that a mutation can be cycled more than once, and that a long
+// statement's description gets truncated.
+func TestMutate(t *testing.T) {
+	t.Parallel()
 
-	nodes := map[string]ast.Node{
-		"ident":       ast.NewIdent("x"),
-		"file":        file,
-		"func decl":   file.Decls[0],
-		"inc dec":     block.List[1],
-		"expr stmt":   block.List[2],
-		"assign stmt": block.List[3],
-		"if stmt":     block.List[6],
-		"return stmt": block.List[7],
-	}
-
-	m := &Remover{}
-
-	for name, node := range nodes {
-		t.Run(name, func(t *testing.T) {
-			if m.Applies(node) {
-				t.Errorf("Applies(%T) = true, want false", node)
-			}
-			if got := m.Mutate(node); got != nil {
-				t.Errorf("Mutate(%T) = %v, want nil", node, descriptions(got))
-			}
-		})
-	}
-}
-
-// TestMutateDescriptions pins the exact set of mutations produced for a block:
-// one per removable statement, in source order, and none for the short variable
-// declaration, the if statement, the return, or the if body's own statement
-// (which belongs to the nested block, not this one).
-func TestMutateDescriptions(t *testing.T) {
 	tests := []struct {
 		name   string
 		src    string
@@ -339,10 +409,12 @@ func TestMutateDescriptions(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
 			_, file := parseSrc(t, tt.src)
 			node := tt.clause(t, file)
 
-			m := &Remover{}
+			m := &statement.Remover{}
 
 			if !m.Applies(node) {
 				t.Fatalf("Applies(%T) = false, want true", node)
@@ -354,165 +426,145 @@ func TestMutateDescriptions(t *testing.T) {
 			}
 		})
 	}
-}
 
-// TestMutateDoesNotTouchTheAST locks in the contract that only Apply edits the
-// tree.
-func TestMutateDoesNotTouchTheAST(t *testing.T) {
-	fset, file := parseSrc(t, mixedSrc)
-	block := funcBody(t, file)
+	t.Run("does not touch the AST", func(t *testing.T) {
+		t.Parallel()
 
-	before := append([]ast.Stmt(nil), block.List...)
+		fset, file := parseSrc(t, mixedSrc)
+		block := funcBody(t, file)
 
-	if mutations := (&Remover{}).Mutate(block); len(mutations) == 0 {
-		t.Fatal("Mutate() returned no mutations")
-	}
+		before := append([]ast.Stmt(nil), block.List...)
 
-	if !reflect.DeepEqual(block.List, before) {
-		t.Error("Mutate() modified the statement list")
-	}
-
-	if got := render(t, fset, file); got != mixedSrc {
-		t.Errorf("Mutate() changed the printed source:\n%s", got)
-	}
-}
-
-// TestApplyRevertRoundTrip applies each mutation independently, compares the
-// printed mutant against the source with exactly that line removed, then reverts
-// and confirms the source is restored byte for byte.
-func TestApplyRevertRoundTrip(t *testing.T) {
-	tests := []struct {
-		name   string
-		src    string
-		node   func(*testing.T, *ast.File) ast.Node
-		blanks []string
-	}{
-		{
-			name: "block",
-			src:  mixedSrc,
-			node: func(t *testing.T, file *ast.File) ast.Node {
-				return funcBody(t, file)
-			},
-			blanks: []string{"x++", "foo()", "x = 2", "x += 3", "y--"},
-		},
-		{
-			name: "case clause",
-			src:  switchSrc,
-			node: func(t *testing.T, file *ast.File) ast.Node {
-				return caseClause(t, file, 0)
-			},
-			blanks: []string{"foo()", "x++"},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			fset, file := parseSrc(t, tt.src)
-
-			mutations := (&Remover{}).Mutate(tt.node(t, file))
-			if len(mutations) != len(tt.blanks) {
-				t.Fatalf("Mutate() returned %d mutations, want %d", len(mutations), len(tt.blanks))
-			}
-
-			for i, m := range mutations {
-				t.Run(tt.blanks[i], func(t *testing.T) {
-					want := blankLine(t, tt.src, tt.blanks[i])
-
-					m.Apply()
-
-					if got := render(t, fset, file); got != want {
-						t.Errorf("after Apply, source =\n%q\nwant\n%q", got, want)
-					}
-
-					m.Revert()
-
-					if got := render(t, fset, file); got != tt.src {
-						t.Errorf("after Revert, source =\n%q\nwant\n%q", got, tt.src)
-					}
-				})
-			}
-		})
-	}
-}
-
-// TestApplyRevertIsRepeatable confirms a mutation can be cycled more than once,
-// since the engine reuses one AST for a whole walk.
-func TestApplyRevertIsRepeatable(t *testing.T) {
-	fset, file := parseSrc(t, mixedSrc)
-
-	mutations := (&Remover{}).Mutate(funcBody(t, file))
-	want := blankLine(t, mixedSrc, "foo()")
-
-	for range 3 {
-		mutations[1].Apply()
-
-		if got := render(t, fset, file); got != want {
-			t.Fatalf("after Apply, source =\n%q\nwant\n%q", got, want)
+		if mutations := (&statement.Remover{}).Mutate(block); len(mutations) == 0 {
+			t.Fatal("Mutate() returned no mutations")
 		}
 
-		mutations[1].Revert()
+		if !reflect.DeepEqual(block.List, before) {
+			t.Error("Mutate() modified the statement list")
+		}
 
 		if got := render(t, fset, file); got != mixedSrc {
-			t.Fatalf("after Revert, source =\n%q\nwant\n%q", got, mixedSrc)
+			t.Errorf("Mutate() changed the printed source:\n%s", got)
 		}
-	}
-}
+	})
 
-// TestRemovableAssignmentTokens checks the token filter directly: every
-// assignment operator is removable except :=.
-func TestRemovableAssignmentTokens(t *testing.T) {
-	tests := []struct {
-		tok  token.Token
-		want bool
-	}{
-		{token.ASSIGN, true},
-		{token.ADD_ASSIGN, true},
-		{token.SUB_ASSIGN, true},
-		{token.MUL_ASSIGN, true},
-		{token.QUO_ASSIGN, true},
-		{token.REM_ASSIGN, true},
-		{token.AND_ASSIGN, true},
-		{token.OR_ASSIGN, true},
-		{token.XOR_ASSIGN, true},
-		{token.SHL_ASSIGN, true},
-		{token.SHR_ASSIGN, true},
-		{token.DEFINE, false},
-	}
+	// "apply revert round trip" applies each mutation independently, compares
+	// the printed mutant against the source with exactly that line removed,
+	// then reverts and confirms the source is restored byte for byte. The two
+	// shapes (block, case clause) each parse their own file and so run in
+	// parallel; the per-mutation subtests within a shape do not, since they
+	// apply and revert in sequence against that one shared AST — running them
+	// concurrently would let one goroutine's render() observe another's
+	// half-applied mutation.
+	t.Run("apply revert round trip", func(t *testing.T) {
+		t.Parallel()
 
-	for _, tt := range tests {
-		t.Run(tt.tok.String(), func(t *testing.T) {
-			stmt := &ast.AssignStmt{
-				Lhs: []ast.Expr{ast.NewIdent("x")},
-				Tok: tt.tok,
-				Rhs: []ast.Expr{ast.NewIdent("y")},
+		tests := []struct {
+			name   string
+			src    string
+			node   func(*testing.T, *ast.File) ast.Node
+			blanks []string
+		}{
+			{
+				name: "block",
+				src:  mixedSrc,
+				node: func(t *testing.T, file *ast.File) ast.Node {
+					return funcBody(t, file)
+				},
+				blanks: []string{"x++", "foo()", "x = 2", "x += 3", "y--"},
+			},
+			{
+				name: "case clause",
+				src:  switchSrc,
+				node: func(t *testing.T, file *ast.File) ast.Node {
+					return caseClause(t, file, 0)
+				},
+				blanks: []string{"foo()", "x++"},
+			},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				t.Parallel()
+
+				fset, file := parseSrc(t, tt.src)
+
+				mutations := (&statement.Remover{}).Mutate(tt.node(t, file))
+				if len(mutations) != len(tt.blanks) {
+					t.Fatalf("Mutate() returned %d mutations, want %d", len(mutations), len(tt.blanks))
+				}
+
+				for i, m := range mutations {
+					// Not t.Parallel(): each iteration applies and reverts
+					// against the file shared with every other iteration.
+					t.Run(tt.blanks[i], func(t *testing.T) {
+						want := blankLine(t, tt.src, tt.blanks[i])
+
+						m.Apply()
+
+						if got := render(t, fset, file); got != want {
+							t.Errorf("after Apply, source =\n%q\nwant\n%q", got, want)
+						}
+
+						m.Revert()
+
+						if got := render(t, fset, file); got != tt.src {
+							t.Errorf("after Revert, source =\n%q\nwant\n%q", got, tt.src)
+						}
+					})
+				}
+			})
+		}
+	})
+
+	// "apply revert is repeatable" confirms a mutation can be cycled more than
+	// once, since the engine reuses one AST for a whole walk.
+	t.Run("apply revert is repeatable", func(t *testing.T) {
+		t.Parallel()
+
+		fset, file := parseSrc(t, mixedSrc)
+
+		mutations := (&statement.Remover{}).Mutate(funcBody(t, file))
+		want := blankLine(t, mixedSrc, "foo()")
+
+		for range 3 {
+			mutations[1].Apply()
+
+			if got := render(t, fset, file); got != want {
+				t.Fatalf("after Apply, source =\n%q\nwant\n%q", got, want)
 			}
 
-			if got := removable(stmt); got != tt.want {
-				t.Errorf("removable(%s) = %v, want %v", tt.tok, got, tt.want)
+			mutations[1].Revert()
+
+			if got := render(t, fset, file); got != mixedSrc {
+				t.Fatalf("after Revert, source =\n%q\nwant\n%q", got, mixedSrc)
 			}
-		})
-	}
-}
+		}
+	})
 
-// TestDescribeTruncatesLongStatements keeps a pathological line from swamping a
-// report row.
-func TestDescribeTruncatesLongStatements(t *testing.T) {
-	src := "package p\n\nfunc f() {\n\tfoo(\"" + strings.Repeat("a", 200) + "\")\n}\n"
+	// "truncates long statements" keeps a pathological line from swamping a
+	// report row.
+	t.Run("truncates long statements", func(t *testing.T) {
+		t.Parallel()
 
-	_, file := parseSrc(t, src)
+		src := "package p\n\nfunc f() {\n\tfoo(\"" + strings.Repeat("a", 200) + "\")\n}\n"
 
-	mutations := (&Remover{}).Mutate(funcBody(t, file))
-	if len(mutations) != 1 {
-		t.Fatalf("Mutate() returned %d mutations, want 1", len(mutations))
-	}
+		_, file := parseSrc(t, src)
 
-	got := mutations[0].Description
+		mutations := (&statement.Remover{}).Mutate(funcBody(t, file))
+		if len(mutations) != 1 {
+			t.Fatalf("Mutate() returned %d mutations, want 1", len(mutations))
+		}
 
-	if !strings.HasSuffix(got, "...") {
-		t.Errorf("Description = %q, want a truncated value ending in %q", got, "...")
-	}
+		got := mutations[0].Description
 
-	if want := len("remove statement: ") + descriptionLimit + len("..."); len(got) != want {
-		t.Errorf("len(Description) = %d, want %d", len(got), want)
-	}
+		if !strings.HasSuffix(got, "...") {
+			t.Errorf("Description = %q, want a truncated value ending in %q", got, "...")
+		}
+
+		const descriptionLimit = 60
+		if want := len("remove statement: ") + descriptionLimit + len("..."); len(got) != want {
+			t.Errorf("len(Description) = %d, want %d", len(got), want)
+		}
+	})
 }

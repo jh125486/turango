@@ -1,3 +1,7 @@
+// Whitebox: impact.go exports no identifiers — impactMap, merge, covering,
+// parseTestList and matchProfileFile are all unexported — so testing them
+// requires direct package access; there is nothing left for a blackbox file
+// to exercise.
 package mutate
 
 import (

@@ -1,4 +1,4 @@
-package operator
+package operator_test
 
 import (
 	"go/ast"
@@ -6,6 +6,8 @@ import (
 )
 
 func TestBinaryMutate(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		name string
 		src  string // the expression, assigned to _ in the snippet
@@ -35,10 +37,12 @@ func TestBinaryMutate(t *testing.T) {
 		{name: "leq to gtr", src: "a <= b", want: "a > b", desc: "<= -> >"},
 	}
 
-	var m binary
+	m := newMutator(t, "operator/binary")
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
 			fset, file := parseFunc(t, "_ = "+tt.src)
 			expr := findNode[*ast.BinaryExpr](t, file)
 
@@ -70,9 +74,11 @@ func TestBinaryMutate(t *testing.T) {
 // TestBinaryMutatesEachOperandIndependently checks that a nested expression
 // yields one mutation per binary node rather than one for the whole tree.
 func TestBinaryMutatesEachOperandIndependently(t *testing.T) {
+	t.Parallel()
+
 	fset, file := parseFunc(t, "_ = a+b == c")
 
-	var m binary
+	m := newMutator(t, "operator/binary")
 
 	exprs := findNodes[*ast.BinaryExpr](file)
 	if len(exprs) != 2 {
@@ -95,9 +101,11 @@ func TestBinaryMutatesEachOperandIndependently(t *testing.T) {
 }
 
 func TestBinaryIgnoresOtherNodes(t *testing.T) {
+	t.Parallel()
+
 	_, file := parseFunc(t, "a += 1")
 
-	var m binary
+	m := newMutator(t, "operator/binary")
 
 	stmt := findNode[*ast.AssignStmt](t, file)
 

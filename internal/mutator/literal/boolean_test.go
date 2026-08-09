@@ -1,8 +1,10 @@
-package literal
+package literal_test
 
 import (
 	"go/ast"
 	"testing"
+
+	"github.com/jh125486/turango/internal/mutator/literal"
 )
 
 // findBoolIdent returns the *ast.Ident named want (there are several other
@@ -24,6 +26,8 @@ func findBoolIdent(t *testing.T, file *ast.File, want string) *ast.Ident {
 }
 
 func TestBooleanMutate(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		name string
 		src  string
@@ -34,10 +38,12 @@ func TestBooleanMutate(t *testing.T) {
 		{name: "false to true", src: "false", want: "true", desc: "false -> true"},
 	}
 
-	var m BooleanMutator
+	var m literal.BooleanMutator
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
 			fset, file := parseFunc(t, "_ = "+tt.src)
 			ident := findBoolIdent(t, file, tt.src)
 
@@ -67,9 +73,11 @@ func TestBooleanMutate(t *testing.T) {
 }
 
 func TestBooleanIgnoresOtherIdents(t *testing.T) {
+	t.Parallel()
+
 	_, file := parseFunc(t, "x := 1")
 
-	var m BooleanMutator
+	var m literal.BooleanMutator
 
 	// findNode wants exactly one *ast.Ident; "x := 1" has two (x, and the
 	// blank identifier is not present here, so just x). Use findNodes and
@@ -91,9 +99,11 @@ func TestBooleanIgnoresOtherIdents(t *testing.T) {
 }
 
 func TestBooleanIgnoresOtherNodes(t *testing.T) {
+	t.Parallel()
+
 	_, file := parseFunc(t, "a := 1")
 
-	var m BooleanMutator
+	var m literal.BooleanMutator
 
 	stmt := findNode[*ast.AssignStmt](t, file)
 

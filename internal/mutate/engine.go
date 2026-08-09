@@ -3,6 +3,8 @@ package mutate
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"go/ast"
@@ -14,7 +16,6 @@ import (
 	"runtime"
 	"sort"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -159,6 +160,27 @@ type Options struct {
 	// explicitly to skip the baseline entirely, which is what phase 5's
 	// -mutatetimeout flag does.
 	TestTimeout time.Duration
+
+	// MutantID replays exactly one mutant by its [MutantResult.ID] instead of
+	// running every mutation the selected operators offer. Empty means "every
+	// mutant," the ordinary run.
+	//
+	// The walk still visits every file and node — that part is a cheap AST
+	// walk regardless — but a mutation whose computed ID does not match this
+	// one is never handed to the runner, so the resulting [Result] holds at
+	// most one [MutantResult].
+	MutantID string
+
+	// TCE enables Trivial Compiler Equivalence: a mutant whose compiled
+	// output exactly matches a per-package baseline (see [planPackage]) is
+	// filtered before it reaches the test suite, and reported under
+	// [Result.Equivalents] instead of [Result.Mutants]. Off by default —
+	// the zero value matches every other Options field's "safe default"
+	// philosophy, and unlike a narrower scope (which can only under-report
+	// kills, never mis-report one), a false positive in the compiled-output
+	// comparison would silently discard a real mutant. See ROADMAP.md gap
+	// 2 for the validated design and its spike.
+	TCE bool
 }
 
 // baselineRuns is how many times the unmutated suite is timed before a run.
@@ -238,10 +260,10 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 		return &Result{}, err
 	}
 
-	sink := &collector{result: &Result{}}
+	sink := newCollector()
 	runErr := execute(ctx, run, jobs, opts.parallel(), sink)
 
-	return sink.sorted(), runErr
+	return sink.close(), runErr
 }
 
 // execute drives the file workers, bounded at parallel files in flight.
@@ -253,7 +275,9 @@ func execute(ctx context.Context, run *runner, jobs []fileJob, parallel int, sin
 	group, groupCtx := errgroup.WithContext(ctx)
 	group.SetLimit(parallel)
 
-	for _, job := range jobs {
+	for i := range jobs {
+		job := &jobs[i]
+
 		group.Go(func() error {
 			return mutateFile(groupCtx, run, job, sink)
 		})
@@ -262,39 +286,124 @@ func execute(ctx context.Context, run *runner, jobs []fileJob, parallel int, sin
 	return group.Wait()
 }
 
-// collector serialises the file workers' appends into one Result.
+// collector serialises the file workers' appends into one Result via a
+// single consumer goroutine draining three channels, one per result kind,
+// rather than a mutex-guarded shared slice.
+//
+// Channels, not a mutex, specifically because of testing/synctest: its
+// bubble's "durably blocked" detection — the thing that lets a test
+// deterministically drive concurrent code without real wall-clock waits —
+// covers channel send/receive, select, sync.Cond.Wait, sync.WaitGroup.Wait
+// and time.Sleep (see `go doc testing/synctest`). sync.Mutex.Lock is not on
+// that list: a goroutine blocked acquiring a mutex is invisible to a
+// synctest bubble. This was a correctness-neutral change when made (the
+// mutex was already race-safe, verified under -race) — see ROADMAP.md gap 7
+// — made purely so a future test of -mutateparallel's scheduling behavior
+// has something to drive deterministically.
 //
 // Results are accumulated unordered and sorted once at the end rather than
 // being slotted into a pre-sized per-file position: how many mutants a file
 // yields is only known once its walk is finished.
 type collector struct {
-	mu     sync.Mutex
-	result *Result
+	mutants      chan MutantResult
+	suppressions chan SuppressionResult
+	equivalents  chan EquivalentResult
+
+	// done carries the final, sorted Result from consume to close, once
+	// every channel above has been closed and drained.
+	done chan *Result
 }
 
-// mutant records one mutant's verdict.
-func (c *collector) mutant(res MutantResult) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+// newCollector starts the consumer goroutine and returns a collector ready
+// to receive results. The caller must call close exactly once, after every
+// producer goroutine that might call mutant/suppression/equivalent has
+// finished.
+func newCollector() *collector {
+	c := &collector{
+		mutants:      make(chan MutantResult),
+		suppressions: make(chan SuppressionResult),
+		equivalents:  make(chan EquivalentResult),
+		done:         make(chan *Result),
+	}
 
-	c.result.Mutants = append(c.result.Mutants, res)
+	go c.consume()
+
+	return c
 }
+
+// mutant records one mutant's verdict. Blocks until the consumer goroutine
+// receives it — the same effective backpressure a mutex's critical section
+// provided, just expressed as a channel send.
+func (c *collector) mutant(res MutantResult) { c.mutants <- res }
 
 // suppression records one //nomutant hit.
-func (c *collector) suppression(res SuppressionResult) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+func (c *collector) suppression(res SuppressionResult) { c.suppressions <- res }
 
-	c.result.Suppressions = append(c.result.Suppressions, res)
+// equivalent records one mutation Trivial Compiler Equivalence filtered out.
+func (c *collector) equivalent(res EquivalentResult) { c.equivalents <- res }
+
+// consume drains all three channels until every one is closed, accumulating
+// into one Result, then sorts it and publishes it on done. It is the sole
+// owner of the Result being built — nothing else touches it — so no locking
+// is needed here either.
+func (c *collector) consume() {
+	result := &Result{}
+
+	mutants, suppressions, equivalents := c.mutants, c.suppressions, c.equivalents
+
+	for mutants != nil || suppressions != nil || equivalents != nil {
+		select {
+		case m, ok := <-mutants:
+			if !ok {
+				mutants = nil // a nil channel blocks forever in select, removing this case
+
+				continue
+			}
+
+			result.Mutants = append(result.Mutants, m)
+		case s, ok := <-suppressions:
+			if !ok {
+				suppressions = nil
+
+				continue
+			}
+
+			result.Suppressions = append(result.Suppressions, s)
+		case e, ok := <-equivalents:
+			if !ok {
+				equivalents = nil
+
+				continue
+			}
+
+			result.Equivalents = append(result.Equivalents, e)
+		}
+	}
+
+	sortResult(result)
+	c.done <- result
 }
 
-// sorted restores the deterministic report order and returns the Result.
-func (c *collector) sorted() *Result {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+// close signals that no more results will be sent, and blocks until the
+// consumer goroutine has finished sorting, returning the final Result. It
+// must be called exactly once, after every producer goroutine has already
+// returned — calling it earlier would race the consumer's close-detection
+// against a producer still mid-send.
+func (c *collector) close() *Result {
+	close(c.mutants)
+	close(c.suppressions)
+	close(c.equivalents)
 
-	sort.SliceStable(c.result.Mutants, func(i, j int) bool {
-		a, b := c.result.Mutants[i], c.result.Mutants[j]
+	return <-c.done
+}
+
+// sortResult restores the deterministic report order documented on [Result]
+// itself: file, then line, then operator, then description (suppressions
+// have no operator/description to break a tie on, so file/line is as far as
+// their ordering goes).
+func sortResult(result *Result) {
+	sort.SliceStable(result.Mutants, func(i, j int) bool {
+		a, b := result.Mutants[i], result.Mutants[j]
 
 		switch {
 		case a.File != b.File:
@@ -308,8 +417,8 @@ func (c *collector) sorted() *Result {
 		}
 	})
 
-	sort.SliceStable(c.result.Suppressions, func(i, j int) bool {
-		a, b := c.result.Suppressions[i], c.result.Suppressions[j]
+	sort.SliceStable(result.Suppressions, func(i, j int) bool {
+		a, b := result.Suppressions[i], result.Suppressions[j]
 
 		if a.File != b.File {
 			return a.File < b.File
@@ -318,7 +427,20 @@ func (c *collector) sorted() *Result {
 		return a.Line < b.Line
 	})
 
-	return c.result
+	sort.SliceStable(result.Equivalents, func(i, j int) bool {
+		a, b := result.Equivalents[i], result.Equivalents[j]
+
+		switch {
+		case a.File != b.File:
+			return a.File < b.File
+		case a.Line != b.Line:
+			return a.Line < b.Line
+		case a.Operator != b.Operator:
+			return a.Operator < b.Operator
+		default:
+			return a.Description < b.Description
+		}
+	})
 }
 
 // suiteTimer runs the unmutated test suite once and reports how long it took.
@@ -562,6 +684,18 @@ type fileJob struct {
 	// account for here, so this is just the one run-wide compiled regexp.
 	funcPattern *regexp.Regexp
 
+	// mutantID is [Options.MutantID], identical for every job in a run. Empty
+	// means every mutant runs; see [visitNode].
+	mutantID string
+
+	// tceBaseline is the package's normalized -S disassembly, compiled once
+	// from the unmutated sources when [Options.TCE] is set — the same
+	// once-per-package precompute shape ScopeImpact's coverage map already
+	// uses. Nil means TCE is inactive for this job, either because the
+	// option is unset or because the baseline compile failed and the
+	// package was fail-soft demoted to running without it.
+	tceBaseline []byte
+
 	// typedFset and typedSyntax are the FileSet and already-parsed,
 	// already-type-checked syntax tree for path, set only when mutators
 	// above was bound against type information. mutateFile uses these
@@ -609,6 +743,70 @@ func plan(ctx context.Context, goBin string, opts Options, pkgs []*packages.Pack
 	return jobs, nil
 }
 
+// planScope resolves the scope and, under [ScopeImpact], the coverage map
+// this package's jobs use — a per-package precompute done once before any of
+// the package's mutants run.
+//
+// A package whose coverage map fails to build is demoted to [ScopePackage]
+// rather than failing the run: impact scope is an optimisation over package
+// scope, and every way of building the map can fail on a package that is
+// nonetheless perfectly mutable (an unparseable `go test -list` output, a
+// coverage profile a future toolchain writes differently, a test that only
+// passes when run alongside its siblings). Demoting this one package costs
+// time and nothing else, whereas failing the run would throw away every
+// other package's work. The only error this returns is ctx's own
+// cancellation.
+func planScope(ctx context.Context, goBin string, want Scope, pkg *packages.Package, files []string) (Scope, *impactMap, error) {
+	if want != ScopeImpact {
+		return want, nil, nil
+	}
+
+	if err := ctx.Err(); err != nil {
+		return want, nil, err
+	}
+
+	cover, err := buildImpact(ctx, goBin, pkg.Module.Dir, filepath.Dir(files[0]), pkg.GoFiles)
+	if err != nil {
+		if ctx.Err() != nil {
+			return want, nil, ctx.Err()
+		}
+
+		return ScopePackage, nil, nil
+	}
+
+	return want, cover, nil
+}
+
+// planTCEBaseline computes the package's once-per-package TCE baseline (see
+// [Options.TCE]), or returns nil if TCE is off or the baseline compile
+// itself fails.
+//
+// It builds directly against moduleDir rather than a workspace copy: nothing
+// is mutated yet, so there is nothing to isolate (the same reasoning
+// goTestSuite's baseline-timing run already documents). Fail soft, per
+// package — the same shape as [planPackage]'s ScopeImpact demotion: a
+// package whose baseline won't compile for TCE purposes (a toolchain quirk,
+// an already-broken package) just runs without TCE, rather than failing the
+// whole run. The only error this returns is ctx's own cancellation.
+func planTCEBaseline(ctx context.Context, goBin string, opts Options, moduleDir, firstFile string) ([]byte, error) {
+	if !opts.TCE {
+		return nil, nil
+	}
+
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	pattern, err := packagePattern(moduleDir, filepath.Dir(firstFile))
+	if err != nil {
+		return nil, nil
+	}
+
+	baseline, _ := compileDisassembly(ctx, goBin, moduleDir, pattern)
+
+	return baseline, nil
+}
+
 // planPackage builds pkg's file jobs, or nil if pkg has nothing mutable (no
 // module info, or no non-test .go files). See [plan] for the parameters.
 func planPackage(ctx context.Context, goBin string, opts Options, pkg *packages.Package, mutators []mutator.Mutator, typedPkgs map[string]*packages.Package, funcPattern *regexp.Regexp) ([]fileJob, error) {
@@ -633,31 +831,14 @@ func planPackage(ctx context.Context, goBin string, opts Options, pkg *packages.
 		return nil, nil
 	}
 
-	scope, cover := opts.Scope, (*impactMap)(nil)
+	scope, cover, err := planScope(ctx, goBin, opts.Scope, pkg, files)
+	if err != nil {
+		return nil, err
+	}
 
-	if scope == ScopeImpact {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-
-		var err error
-
-		cover, err = buildImpact(ctx, goBin, pkg.Module.Dir, filepath.Dir(files[0]), pkg.GoFiles)
-		if err != nil {
-			if ctx.Err() != nil {
-				return nil, ctx.Err()
-			}
-
-			// Fail soft, per package. Impact scope is an optimisation over
-			// package scope, and every way of building the map can fail on
-			// a package that is nonetheless perfectly mutable: an
-			// unparseable `go test -list` output, a coverage profile a
-			// future toolchain writes differently, a test that only passes
-			// when run alongside its siblings. Demoting this one package to
-			// package scope costs time and nothing else, whereas failing
-			// the run would throw away every other package's work.
-			scope, cover = ScopePackage, nil
-		}
+	tceBaseline, err := planTCEBaseline(ctx, goBin, opts, pkg.Module.Dir, files[0])
+	if err != nil {
+		return nil, err
 	}
 
 	// Per-package, not run-wide, only when a selected operator implements
@@ -693,6 +874,8 @@ func planPackage(ctx context.Context, goBin string, opts Options, pkg *packages.
 			cover:       cover,
 			mutators:    pkgMutators,
 			funcPattern: funcPattern,
+			mutantID:    opts.MutantID,
+			tceBaseline: tceBaseline,
 		}
 
 		if typedPkg != nil {
@@ -759,7 +942,7 @@ func syntaxFor(typedPkg *packages.Package, path string) *ast.File {
 // The FileSet is per file rather than per run: positions only ever have to be
 // consistent within the file currently being printed, and a fresh set keeps
 // memory flat over a large module.
-func mutateFile(ctx context.Context, run *runner, job fileJob, sink *collector) error {
+func mutateFile(ctx context.Context, run *runner, job *fileJob, sink *collector) error {
 	// Checked before parsing, not just inside the walk: with a bounded worker
 	// pool most jobs start after cancellation rather than before it, and
 	// parsing a file whose mutants will never run is pure waste.
@@ -812,13 +995,24 @@ func mutateFile(ctx context.Context, run *runner, job fileJob, sink *collector) 
 	}
 
 	spec := mutant{
-		fset:      fset,
-		file:      file,
-		path:      path,
-		baseline:  baseline.Bytes(),
-		moduleDir: job.moduleDir,
-		pkgDir:    filepath.Dir(path),
-		scope:     job.scope,
+		fset:        fset,
+		file:        file,
+		path:        path,
+		baseline:    baseline.Bytes(),
+		moduleDir:   job.moduleDir,
+		pkgDir:      filepath.Dir(path),
+		scope:       job.scope,
+		tceBaseline: job.tceBaseline,
+	}
+
+	// Computed once per file rather than per node/mutation: it depends only on
+	// path and moduleDir, both fixed for the whole walk. Falls back to the
+	// absolute path if it cannot be made relative (different volume, say) —
+	// still stable and unique, just less portable across machines than the
+	// relative form.
+	relPath, err := filepath.Rel(job.moduleDir, path)
+	if err != nil {
+		relPath = path
 	}
 
 	var walkErr error
@@ -834,7 +1028,7 @@ func mutateFile(ctx context.Context, run *runner, job fileJob, sink *collector) 
 			return false
 		}
 
-		visit, err := visitNode(ctx, run, job, suppressed, sink, &spec, node)
+		visit, err := visitNode(ctx, run, job, relPath, suppressed, sink, &spec, node)
 		if err != nil {
 			walkErr = err
 
@@ -847,6 +1041,26 @@ func mutateFile(ctx context.Context, run *runner, job fileJob, sink *collector) 
 	return walkErr
 }
 
+// mutantID computes a mutation's stable, content-hashed identifier: the tuple
+// of the mutated file's path relative to its module root, the mutated node's
+// line and column, the operator's registry name, and the mutation's index
+// within that node's Mutate() slice (needed because one node/operator pair
+// can offer more than one mutation — expression/remove returns two, one per
+// operand — and those need distinct IDs despite sharing every other
+// coordinate).
+//
+// Stable across re-runs of unchanged source, matching -fuzz's corpus-hash
+// precedent — but not across edits to the file above the mutated line, since
+// what's hashed is a position in a specific AST, not self-contained bytes the
+// way -fuzz's input hashing is. Truncated to 12 hex characters, the length of
+// a git short SHA: enough to be practically collision-free within one run,
+// short enough to read in a report or paste into a comment.
+func mutantID(relPath string, line, col int, operator string, index int) string {
+	sum := sha256.Sum256(fmt.Appendf(nil, "%s\x00%d\x00%d\x00%s\x00%d", relPath, line, col, operator, index))
+
+	return hex.EncodeToString(sum[:])[:12]
+}
+
 // visitNode handles one node of mutateFile's walk: function-pattern
 // filtering, //nomutant suppression, and running every mutation every
 // applicable operator in job.mutators offers for node. It reports whether
@@ -855,8 +1069,9 @@ func mutateFile(ctx context.Context, run *runner, job fileJob, sink *collector) 
 // spec is the walk's shared mutant template — mutateFile's per-file fields
 // (fset, file, path, baseline, moduleDir, pkgDir, scope) are already set; this
 // function only fills in the per-node/per-mutation fields before handing a
-// copy to run.run.
-func visitNode(ctx context.Context, run *runner, job fileJob, suppressed suppressions, sink *collector, spec *mutant, node ast.Node) (bool, error) {
+// copy to run.run. relPath is path relative to its module root, computed once
+// per file by the caller — see [mutantID].
+func visitNode(ctx context.Context, run *runner, job *fileJob, relPath string, suppressed suppressions, sink *collector, spec *mutant, node ast.Node) (bool, error) {
 	// Returning false here skips this function's body entirely, the same
 	// cascade mechanism suppression uses below — a function whose name does
 	// not match FuncPattern (and everything nested inside it) is simply
@@ -892,27 +1107,49 @@ func visitNode(ctx context.Context, run *runner, job fileJob, suppressed suppres
 			continue
 		}
 
+		pos := spec.fset.Position(node.Pos())
+
 		spec.operator = m.Name()
-		spec.line = spec.fset.Position(node.Pos()).Line
+		spec.line = pos.Line
+		// The before/after fallback for any [mutator.Mutation] that leaves
+		// Node nil — see runner.go's renderNode.
+		spec.node = node
 		// Looked up per node rather than per mutant: every mutation of a node
 		// shares its line, and the map is only consulted at all under
 		// ScopeImpact (covering reports nil for a nil map).
 		spec.covering = job.cover.covering(spec.path, spec.line)
 
-		for _, mutation := range m.Mutate(node) {
+		for i, mutation := range m.Mutate(node) {
 			if err := ctx.Err(); err != nil {
 				return false, err
 			}
 
 			spec.mutation = mutation
+			spec.id = mutantID(relPath, pos.Line, pos.Column, spec.operator, i)
 
-			res, ok, err := run.run(ctx, *spec)
+			// job.mutantID replays exactly one mutant (see [Options.MutantID]):
+			// the walk still reaches every node and computes every ID — that
+			// part is cheap — but only a matching mutation is ever handed to
+			// the runner.
+			if job.mutantID != "" && spec.id != job.mutantID {
+				continue
+			}
+
+			res, ok, equivalent, err := run.run(ctx, *spec)
 			if err != nil {
 				return false, err
 			}
 
-			if ok {
+			switch {
+			case ok:
 				sink.mutant(res)
+			case equivalent:
+				sink.equivalent(EquivalentResult{
+					File:        res.File,
+					Line:        res.Line,
+					Operator:    res.Operator,
+					Description: res.Description,
+				})
 			}
 		}
 	}

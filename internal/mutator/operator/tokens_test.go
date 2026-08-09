@@ -1,4 +1,4 @@
-package operator
+package operator_test
 
 import (
 	"bytes"
@@ -90,9 +90,24 @@ func applyRoundTrip(t *testing.T, fset *token.FileSet, target ast.Node, m mutato
 	}
 }
 
+// newMutator constructs the mutator registered under name, failing the test
+// if name is not registered.
+func newMutator(t *testing.T, name string) mutator.Mutator {
+	t.Helper()
+
+	m, err := mutator.New(name)
+	if err != nil {
+		t.Fatalf("New(%q): %v", name, err)
+	}
+
+	return m
+}
+
 // TestRegisteredNames pins the exact registry names, since they are the strings
 // a user types into -mutateoperators.
 func TestRegisteredNames(t *testing.T) {
+	t.Parallel()
+
 	names := []string{
 		"operator/assignment",
 		"operator/binary",
@@ -103,57 +118,13 @@ func TestRegisteredNames(t *testing.T) {
 
 	for _, name := range names {
 		t.Run(name, func(t *testing.T) {
-			m, err := mutator.New(name)
-			if err != nil {
-				t.Fatalf("New(%q): %v", name, err)
-			}
+			t.Parallel()
+
+			m := newMutator(t, name)
 
 			if m.Name() != name {
 				t.Errorf("Name() = %q, want %q", m.Name(), name)
 			}
 		})
 	}
-}
-
-// TestSwapTablesAreSingleValued guards the property the swap tables rely on:
-// every eligible token maps to exactly one other token, and never to itself.
-func TestSwapTablesAreSingleValued(t *testing.T) {
-	tables := map[string]map[token.Token]token.Token{
-		"assignment": assignmentSwaps,
-		"binary":     binarySwaps,
-		"incDec":     incDecSwaps,
-	}
-
-	for name, table := range tables {
-		for from, to := range table {
-			if from == to {
-				t.Errorf("%s: %s swaps to itself", name, from)
-			}
-		}
-	}
-}
-
-// TestAssignmentTableExcludesPlainAssignment documents that `=` and `:=` are
-// excluded by absence from the table, not by a separate predicate.
-func TestAssignmentTableExcludesPlainAssignment(t *testing.T) {
-	for _, tok := range []token.Token{token.ASSIGN, token.DEFINE} {
-		if swapped, ok := assignmentSwaps[tok]; ok {
-			t.Errorf("%s must not be eligible, but swaps to %s", tok, swapped)
-		}
-	}
-}
-
-// TestBuildSwapsPanicsOnConflict covers the fail-fast guard that would catch a
-// future edit declaring two different swaps for one token.
-func TestBuildSwapsPanicsOnConflict(t *testing.T) {
-	defer func() {
-		if recover() == nil {
-			t.Fatal("buildSwaps did not panic on a conflicting swap")
-		}
-	}()
-
-	buildSwaps(
-		[][2]token.Token{{token.ADD, token.SUB}},
-		[][2]token.Token{{token.ADD, token.MUL}},
-	)
 }

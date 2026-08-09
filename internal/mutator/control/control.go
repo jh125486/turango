@@ -30,12 +30,20 @@ import (
 // verbatim by Revert — the statements themselves are never copied or rebuilt,
 // so the reverted AST is the exact one the engine started with and can be
 // reused for the rest of the walk.
-func clearStmts(list *[]ast.Stmt, description string) mutator.Mutation {
+//
+// node is the container the list belongs to — an *ast.BlockStmt for If/Else,
+// an *ast.CaseClause for Case — reported as the mutation's [mutator.Mutation.Node].
+// It is coarser than "just the body" (an *ast.CaseClause's printed form
+// includes its "case x:" header, since Go's AST has no standalone node for a
+// case body), an honest limitation rather than a synthesized node not
+// actually in the tree.
+func clearStmts(list *[]ast.Stmt, node ast.Node, description string) mutator.Mutation {
 	original := *list
 
 	return mutator.Mutation{
 		Description: description,
 		Apply:       func() { *list = nil },
 		Revert:      func() { *list = original },
+		Node:        node,
 	}
 }

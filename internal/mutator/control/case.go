@@ -48,5 +48,5 @@ func (m *Case) Mutate(node ast.Node) []mutator.Mutation {
 		return nil
 	}
 
-	return []mutator.Mutation{clearStmts(&clause.Body, "remove case body")}
+	return []mutator.Mutation{clearStmts(&clause.Body, clause, "remove case body")}
 }

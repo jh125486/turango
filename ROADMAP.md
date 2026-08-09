@@ -6,28 +6,52 @@ strconv/base64/crypto case studies); gaps 4-6 surfaced later, during the
 corpus-harness and dogfooding work. In priority order, since the first two
 are the load-bearing evidence for the eventual stdlib pitch:
 
-1. An identifier/constant-swap mutation operator — the mutation shape behind
-   the strconv `ParseUint` bug (#21278), which none of the current 11
-   operators can produce.
-2. Trivial Compiler Equivalence (TCE) — filtering equivalent mutants by
-   compiled-output comparison, flagged in `PROPOSAL.md`'s "Costs and risks"
-   section as only partially solved today (turango filters *syntactic*
-   no-ops; TCE filters *semantic* no-ops that print as different source).
-3. Before/after source snippets on `MutantResult`, so a report is usable
-   without hand-deriving the diff from `Description` and a line number.
-4. Deterministic mutant IDs — a `-fuzz`-style content hash per mutant, so a
-   specific mutant can be referenced in a comment, a regression test, or
-   replayed directly via a new CLI flag.
-5. Dependency-closure workspace copy — `copyModule` copies the whole module
-   per mutant today, not just the target package's actual build/test
-   closure; cost scales with module size, not target-package size, and this
-   is not hypothetical (see the section for how it surfaced directly while
-   dogfooding turango's own corpus harness).
+1. **Done.** An identifier/constant-swap mutation operator (v1: const-for-const
+   only, see the "honest limitation" note below — does not yet reproduce the
+   strconv `ParseUint` bug's exact local-var-to-const shape, a flagged v2
+   follow-on) — `internal/mutator/identifier/constswap.go`.
+2. **Done.** Trivial Compiler Equivalence (TCE) — filtering equivalent
+   mutants by normalized `-S` disassembly comparison (the spike found raw
+   archive comparison, the original plan, unreliable — see below),
+   opt-in via `-mutatetce=true` (`Options.TCE`) — `internal/mutate/runner.go`'s
+   `compileDisassembly`/`isTCEEquivalent`, `Result.Equivalents`.
+3. **Done.** Before/after source snippets on `MutantResult` (`.Before`/
+   `.After`), so a JSON report is usable without hand-deriving the diff
+   from `Description` and a line number — console output unchanged (3c).
+   `mutator.Mutation.Node` is the mechanism; most operators leave it nil
+   (the walk's own node is already precise enough), `control/{if,else,case}`
+   and `statement/remover` are the ones that set it explicitly.
+4. **Done.** Deterministic mutant IDs — a `-fuzz`-style content hash per
+   mutant, so a specific mutant can be referenced in a comment, a
+   regression test, or replayed directly via `-mutatemutant=<id>`.
+5. **Components built and tested; not wired in.** Dependency-closure
+   workspace copy — `copyModule` copies the whole module per mutant today,
+   not just the target package's actual build/test closure. The design
+   question the original sketch left open ("how does this interact with
+   `-mutatescope=full`?") turned out to have a hard answer, not a
+   preference: it doesn't, and must not — see the section below for why.
+   `closureDirs`/`resolveClosure`/`copyClosure`/`copyDirFiles` exist in
+   `internal/mutate/runner.go`, unit-tested, but nothing calls them yet.
+   Activating them (having `runner.run` call `copyClosure` instead of
+   `copyModule` under `ScopePackage`/`ScopeImpact`) is deliberately left as
+   its own step — a wrong decision on the `ScopeFull`/narrower-scope
+   boundary would silently misclassify a mutant's verdict, not just cost
+   performance, and that line is worth a human looking at before it goes
+   live.
 6. Git-worktree-based execution, strictly opt-in — a cheaper *mechanism* for
    the same copy step gap 5 addresses the *scope* of, only for users already
    inside a git repo; lower priority than gap 5 because it only benefits git
    users, whereas gap 5 benefits everyone the same way `-fuzz` does (no git
    dependency at all).
+7. **Done.** Channel-based collector, replacing the mutex-guarded one — not a
+   correctness fix (the mutex is race-safe, verified under `-race`), but a
+   testability one: `testing/synctest`'s "durably blocked" detection covers
+   channel send/recv, `select`, `sync.Cond.Wait`, `sync.WaitGroup.Wait`, and
+   `time.Sleep` — `sync.Mutex.Lock` is explicitly not on that list (`go doc
+   testing/synctest`), so a goroutine blocked acquiring the collector's
+   mutex is invisible to a synctest bubble. Lowest priority of the seven:
+   nothing in the collector is timing-dependent today, so there is nothing
+   to synctest-test yet — this is a door to leave open, not a bug to fix.
 
 Each section below states the problem, the design decisions and their
 rationale, the exact files and functions touched, a build order, and how to
@@ -334,6 +358,31 @@ the same way the other operators were validated.
 
 ## 2. TCE (Trivial Compiler Equivalence)
 
+**Status: done**, with two decisions made during implementation worth
+recording since they revise this section's plan:
+
+- **2a's design changed** from raw archive comparison to normalized `-S`
+  disassembly comparison — see the spike result below 2b; the original
+  archive-comparison plan is superseded and kept in place (struck through in
+  spirit, not literally) only so the "what we tried and why it didn't work"
+  reasoning survives.
+- **Default-off, not default-on.** Section 2c's open question leaned toward
+  shipping TCE opt-out (on by default, `-mutatetce=false` to disable). The
+  actual implementation ships opt-in instead (`Options.TCE` zero value is
+  `false`; `-mutatetce=true` to enable): every other `Options` field's zero
+  value is already the safe default in this codebase (`ScopeFull` catches
+  the most kills, `Parallel: 0` means serial, not "guess a concurrency
+  level"), and the risk direction here is asymmetric in a way scope isn't —
+  a narrower scope can only *under*-report kills, never mis-report one,
+  while a false positive in TCE's compiled-output comparison would silently
+  discard a real mutant. That's exactly the class of risk the project's own
+  "ship the simple default, add a flag only once proven necessary" instinct
+  (cited in the original open question, re: why `Scope` and not
+  `TestTimeout` got a flag first) argues for defaulting *off* until the
+  design has more real-world runs behind it, not defaulting on with an
+  escape hatch. Flipping the default is a one-line change once that
+  confidence exists.
+
 ### Problem
 
 `runner.run` (runner.go lines 96–178) already filters one class of no-op
@@ -394,12 +443,23 @@ mutated, so there is nothing to isolate"*).
 
 ### Design decisions
 
-**2a. Compare compiled package archives, not linked binaries.** `go build -o
-pkg.a <pattern>` on a non-main package writes the compiler's `.a` archive
-directly — no linker involved. This is cheaper than `go test`'s own build
-path (which also compiles test files and links a test binary) and matches
-the granularity the TCE literature itself operates at: comparing the
-compiled unit, not a whole linked executable.
+**2a. Compare normalized `-S` disassembly, not raw archive bytes.**
+Superseded by the spike below: the original plan ("compare compiled package
+archives") produces false "different" results for genuinely equivalent
+mutants, because `.a` archives embed source-line-position export data that
+shifts whenever the source's line count changes — unrelated to codegen.
+The validated design instead: `go build -trimpath -gcflags="-S
+-buildid=<const>" -o /dev/null <pattern>` (no `all=` prefix — that would
+also dump every dependency's assembly, confirmed painfully in the spike: a
+one-package build of `internal/mutator/literal` produced a 1.6M-line dump
+including the entire stdlib closure) captures the target package's own
+assembly listing on stderr. Normalize by stripping the trailing
+`(file.go:N)` position comment from each line (a single regexp,
+`\([^)]*\.go:\d+\)`), then compare the normalized text. This is *more*
+expensive than a linked binary comparison would suggest (`-S` disassembly
+text, not raw bytes) but still cheaper than `go test`'s build path (no test
+files, no link), and it's the granularity that actually distinguishes
+"no code difference" from "line count changed."
 
 **2b. Reproducibility is the real risk, and it needs two specific flags, not
 one.** Go does not guarantee byte-identical output across two builds of the
@@ -462,6 +522,50 @@ disassembled/normalized form rather than raw bytes), trading "trivial byte
 compare" for "textual diff," at some extra cost and complexity. Not the
 preferred path; stated here so a spike failure has a documented next step
 rather than stalling the whole gap.
+
+**Spike result (run, not hypothetical): 2a's raw-archive design fails; the
+fallback is required, and it works.** Two builds:
+
+1. Identical source, two different temp-dir copies, `-trimpath
+   -gcflags=all=-buildid=x`, `go build -o out.a`: the resulting `.a` files
+   were byte-identical (confirmed via `cmp` and SHA-256) — the trimpath/
+   fixed-buildid mechanics themselves are sound, path/buildid noise is not
+   the problem.
+2. A genuine dead-store-elimination case (`total = 999` immediately
+   overwritten by `total = 0` before any read, then the dead line deleted)
+   — the textbook equivalent mutant this whole gap exists to filter — was
+   built both ways and the two `.a` files **differed**, `cmp` reporting a
+   mismatch 57 bytes in. That offset is the `ar` archive's member-size
+   field for the `__.PKGDEF` member (604 vs 578 bytes): Go's export data
+   encodes source line positions for the package's declarations, and
+   deleting one line shifts every position after it — a difference with
+   nothing to do with the generated machine code. **Raw archive comparison
+   produces a false "different" for a textbook equivalent mutant purely
+   from unrelated line-shift noise, for any mutation that changes the
+   source's line count** (which is most of them) — this isn't a corner
+   case, it would make 2a's design detect almost nothing in practice.
+3. The same two builds compared instead via `go tool compile -S` (assembly
+   listing) and normalized by stripping the trailing `(file.go:N)` position
+   comment from each line: **every opcode, register, and address was
+   byte-identical** — the compiler genuinely eliminates the dead store, and
+   the fallback comparison correctly says so.
+4. Sanity check against a false positive in the other direction: the same
+   fixture with a real behavioral change (`total = 0` → `total = 1`)
+   produced a real, position-independent diff (`MOVD ZR, R3` vs `MOVD $1,
+   R3`, and the differing instruction bytes) even after the same
+   line-number normalization — confirming the method isn't just
+   "always equal."
+
+**Decision: adopt the fallback (`go tool compile -S`, normalized) as the
+actual design for 2a**, not raw archive comparison. Section 2a above
+("Compare compiled package archives, not linked binaries") is superseded by
+this result and should be rewritten before implementation proceeds — the
+granularity that actually works is a normalized disassembly diff, not a
+byte-for-byte archive compare. 2b's trimpath/fixed-buildid mechanics are
+still correct and still needed (validated in step 1 above); only the
+comparison target changes. The spike's throwaway fixtures are not
+committed (per the build order's own instruction) — reproducible from the
+description above if re-verification is ever needed.
 
 **2c. Reporting: exclude, don't add a fourth `Status`.** Two shapes
 considered:
@@ -594,6 +698,29 @@ worth deciding after the spike, not before.
 ---
 
 ## 3. Before/after source snippet on `MutantResult`
+
+**Status: done**, with one correction to the plan found during
+implementation: the "Files/functions touched" section below says all 11 (now
+13) operator files need a `Mutation.Node` addition. That turned out to be
+wrong — only operators whose `Apply` *replaces a pointer* (repointing a
+container's field or list slot at a different node) need it, because
+printing the *container* already reflects the change for every operator
+whose `Apply` edits a field *in place* (a token, a literal's `Value`, an
+`Ident`'s `Name`) on the exact node the walk already handed `Mutate`. That
+covers `expression/remove`, `identifier/constswap`, `literal/{boolean,
+number}`, and every `operator/*` token-swap operator, including `unary`
+(its `Apply` repoints a slot, but that slot is a *field of the container*,
+so printing the container — the nil-fallback — still shows the diff
+correctly). Only `control/{if,else,case}` (narrower than the nil-fallback:
+excludes the condition, matching "remove if body"'s own scope) and
+`statement/remover` (one container can hold many statements; the
+nil-fallback would print the whole block for every single-statement
+mutation) actually needed `Node` set. A second wrinkle the plan didn't
+anticipate: for `statement/remover`, printing the same `Node` after `Apply`
+naturally shows *unchanged* text, since `Apply` repoints the list's slot
+rather than editing `stmt` itself — `MutantResult.After` resolves this by
+reporting empty when the pre/post render is identical, rather than a stale
+duplicate of `Before`.
 
 ### Problem
 
@@ -743,6 +870,11 @@ of scope here.
 ---
 
 ## 4. Deterministic mutant IDs
+
+**Status: done.** SHA-256-hashed, 12-hex-char IDs (`internal/mutate/engine.go`'s
+`mutantID`), a `MutantResult.ID` field, and the `-mutatemutant=<id>` replay
+flag are all implemented and tested, matching this section's design and
+build order below.
 
 ### Problem
 
@@ -900,18 +1032,50 @@ walk needs to also parse those directives (in the same files already
 being read for the import graph) and include their referenced paths —
 easy to miss if this is built by only reasoning about the import graph.
 
-### Open questions, not resolved here
+### Open questions — resolved
 
-- Does this replace `copyModule` outright, or become a second strategy
-  selected automatically when the target module is large enough to make
-  the difference worth the added complexity (a whole-module copy has
-  fewer moving parts and is easier to reason about correctness-wise)?
-- How does dependency-closure scoping interact with `-mutatescope=full`,
-  which by design reruns the *whole module's* test suite per mutant — if
-  the workspace itself doesn't contain the whole module, does `full`
-  scope need its own broader closure (every package, not just the target
-  package's dependencies), effectively falling back toward a full-module
-  copy for that scope specifically?
+Both open questions turned out to be the same question, and it has a hard
+answer, not a design preference:
+
+**Dependency-closure copying is only correct under `ScopePackage` and
+`ScopeImpact`. It is provably wrong under `ScopeFull`, and must never apply
+there.**
+
+The "dependency graph" the sketch above describes is the *forward* import
+closure — every package the target package imports. That is exactly the
+right set to *build and test the target package on its own*, which is all
+`ScopePackage`/`ScopeImpact` ever ask `go test` to do. But `ScopeFull`'s
+entire reason to exist (see its own doc comment: *"the only scope that
+cannot miss a kill: a package's behaviour is frequently only asserted on by
+its callers' tests, and those live in other packages"*) depends on the
+*reverse* closure — every package that (transitively) imports the target —
+which the forward closure says nothing about at all. A workspace built from
+only the forward closure, tested under `ScopeFull`'s `go test ./...`, would
+silently find and run only the target package's own tests (the only tests
+physically present in that workspace), indistinguishable from
+`ScopePackage` in outcome but still labeled `full` — a silent, dangerous
+correctness regression on the *default* scope, not a performance tradeoff.
+
+Computing the reverse closure instead (every package that could ever call
+into the target) is not a viable alternative: for most real modules that
+closure approaches the whole module anyway (anything more than a couple of
+layers deep in a typical import graph), so it buys little over today's
+whole-module copy while adding all of the same complexity the sketch above
+already carries (embed directives, replace rewriting, vendor) *twice*, once
+per direction.
+
+**Resolution: this becomes a second strategy, gated by scope, not a
+replacement for `copyModule`.** Under `ScopePackage`/`ScopeImpact`, use the
+forward-closure copy the design sketch describes. Under `ScopeFull`,
+`copyModule` keeps doing exactly what it does today — full module copy —
+unconditionally, no closure computation attempted at all. This is a strictly
+additive change to `runner.go`: a new function alongside `copyModule`, and
+one branch in `run.run` (or `plan()`, if the closure is worth precomputing
+once per package the way `buildImpact`/`planTCEBaseline` already are) keyed
+on `m.scope`. No existing `ScopeFull` code path changes at all, which also
+means this gap carries zero risk to the default scope by construction — a
+bug in the new closure logic can only ever affect `ScopePackage`/
+`ScopeImpact` runs, never the default.
 
 ---
 
@@ -953,6 +1117,68 @@ step), not the actual bottleneck observed while building the corpus
 which a worktree does nothing for. Not designed in detail here; parked as
 a named idea for whoever picks up the corpus/CI cost problem next, not
 committed to a specific flag shape or build order yet.
+
+---
+
+## 7. Channel-based collector
+
+**Status: done.** `collector` now sends `MutantResult`/`SuppressionResult`/
+`EquivalentResult` on three unbuffered channels to a single consumer
+goroutine started by `newCollector`, rather than mutex-guarding a shared
+slice; `close()` closes all three and blocks for the consumer's final,
+sorted `Result`. Verified under `-race` (unit tests and the real
+multi-worker end-to-end tests), and no other package referenced the old
+`collector{result: ...}`/`.sorted()` shape, so this was a self-contained
+`internal/mutate/engine.go` change plus updates to the whitebox tests that
+constructed a `collector` directly.
+
+### Problem
+
+`internal/mutate/engine.go`'s `collector` serialises every file worker's
+results into one `*Result` via a `sync.Mutex` guarding two slice appends
+(`collector.mutant`, `collector.suppression`). This is correct and
+race-safe — `-race` passes clean, and the critical section is a single
+O(1) append, so there is no performance case for changing it. The reason
+to change it is testability, not correctness: `testing/synctest`'s bubble
+only tracks a specific, documented list of "durably blocking" operations —
+`go doc testing/synctest` names exactly five: a blocking channel
+send/receive on a bubble-created channel, a `select` where every case is
+such a channel, `sync.Cond.Wait`, `sync.WaitGroup.Wait` (when `Add` was
+called inside the bubble), and `time.Sleep`. `sync.Mutex.Lock` is not on
+that list. A goroutine blocked acquiring `collector.mu` is therefore
+invisible to a synctest bubble: it cannot let the bubble's fake clock
+advance, and if it were ever the sole reason a bubble isn't "all
+durably blocked," `synctest.Wait()` would hang rather than correctly
+model the wait.
+
+### Design decision
+
+Replace the mutex-guarded `collector` with a channel-fed single-consumer
+design: each file worker sends `MutantResult`/`SuppressionResult` values on
+a channel instead of calling `collector.mutant`/`collector.suppression`
+directly; one consumer goroutine (started by `Run`, alongside the
+`errgroup` worker pool) drains the channel and appends to the `Result`,
+closing over the same sort-at-the-end logic `collector.sorted` has today.
+This makes the whole pipeline synctest-visible: a test could drive the
+worker pool with `synctest.Test`, control scheduling deterministically, and
+assert on ordering/timing behavior (e.g. `-mutateparallel`'s bounded
+concurrency) without real wall-clock waits or flaky timing assertions.
+
+### Why this is low priority
+
+Nothing in the collector is timing-dependent today — there is no sleep, no
+fake clock, no scheduling behavior worth a synctest test yet. This is a
+door to leave open for whenever that changes (e.g. if `-mutateparallel`'s
+bounded-concurrency behavior ever needs a deterministic test), not a bug
+being fixed. Race-safety, the property that matters today, is already
+verified by `-race`, which channels would not improve on.
+
+### Files/functions touched
+
+- `internal/mutate/engine.go`: `collector` (replaced by a channel + single
+  consumer goroutine), `Run` (starts the consumer, closes the channel after
+  `execute`'s `errgroup.Wait()` returns), `execute`/`mutateFile`/`visitNode`
+  (send on the channel instead of calling `sink.mutant`/`sink.suppression`).
 
 ---
 

@@ -52,6 +52,18 @@ type Mutation struct {
 
 	// Revert undoes the mutation, restoring the original AST.
 	Revert func()
+
+	// Node is the specific AST node this mutation edits, used only for
+	// reporting the mutated source text before and after Apply (see
+	// [MutantResult.Before]/[MutantResult.After] in package mutate). Most
+	// operators mutate exactly the node their Applies/Mutate were called
+	// on and can leave this nil — the engine falls back to that node — but
+	// an operator called on a *container* that edits one specific element
+	// of it (statement/remover is called on the block holding the
+	// statement, not the statement itself) should set Node to the actual
+	// element, so the reported snippet matches Description's granularity
+	// rather than rendering the whole container.
+	Node ast.Node
 }
 
 // Mutator produces mutations for the AST nodes it recognises.

@@ -1,7 +1,12 @@
+// Whitebox: suppress.go exports no identifiers — suppressions,
+// scanSuppressions, parseDirective and anchored are all unexported — so
+// testing them, and testing the mutateFile cascade that consults them,
+// requires direct package access. Blackbox coverage of the same cascade
+// behaviour through the exported Run lives in engine_test.go's
+// TestRunSuppressesCompoundStatement.
 package mutate
 
 import (
-	"context"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -387,6 +392,10 @@ func f(i int) {
 // literal/number would match) and a return, neither of which any operator
 // touches, so a directive on the loop must leave the walk with nothing at all
 // to do.
+//
+// Duplicated in engine_test.go's identical fixture for
+// TestRunSuppressesCompoundStatement, a blackbox test that only calls the
+// exported Run and so cannot share this whitebox copy.
 const cascadeSrc = `package guard
 
 // Total sums the positive values in vs.
@@ -408,6 +417,9 @@ const suppressedLine = 7
 // cascadeModule writes a one-package module holding cascadeSrc, with the
 // directive line substituted in, and returns the module root and the source
 // file's path.
+//
+// writeFiles is defined in runner_internal_test.go; both files compile as
+// part of the same whitebox package mutate, so it needs no local copy here.
 func cascadeModule(t *testing.T, directiveLine string) (root, file string) {
 	t.Helper()
 
@@ -458,12 +470,13 @@ func TestMutateFileCascade(t *testing.T) {
 
 		root, path := cascadeModule(t, "// nomutant: hand-verified")
 
-		sink := &collector{result: &Result{}}
-		result := sink.result
+		sink := newCollector()
 
-		if err := mutateFile(context.Background(), run, fileJob{moduleDir: root, path: path, mutators: mutator.All()}, sink); err != nil {
+		if err := mutateFile(t.Context(), run, &fileJob{moduleDir: root, path: path, mutators: mutator.All()}, sink); err != nil {
 			t.Fatalf("mutateFile() error = %v, want the walk to stop at the suppressed loop", err)
 		}
+
+		result := sink.close()
 
 		if len(result.Mutants) != 0 {
 			t.Errorf("mutateFile() produced %d mutants inside a suppressed statement", len(result.Mutants))
@@ -484,87 +497,16 @@ func TestMutateFileCascade(t *testing.T) {
 
 		root, path := cascadeModule(t, "")
 
-		sink := &collector{result: &Result{}}
-		result := sink.result
+		sink := newCollector()
 
-		if err := mutateFile(context.Background(), run, fileJob{moduleDir: root, path: path, mutators: mutator.All()}, sink); err == nil {
+		if err := mutateFile(t.Context(), run, &fileJob{moduleDir: root, path: path, mutators: mutator.All()}, sink); err == nil {
 			t.Fatal("mutateFile() error = nil: the fixture produced no mutants even unsuppressed")
 		}
+
+		result := sink.close()
 
 		if len(result.Suppressions) != 0 {
 			t.Errorf("Suppressions = %+v, want none for a file with no directives", result.Suppressions)
 		}
 	})
-}
-
-// TestRunSuppressesCompoundStatement is the end-to-end half: a full Run over a
-// real module whose only mutable code is inside a //nomutant loop must report
-// no mutants, one suppression, and no score at all — there is nothing to score.
-func TestRunSuppressesCompoundStatement(t *testing.T) {
-	if testing.Short() {
-		t.Skip("resolves a real toolchain and loads a real module")
-	}
-
-	t.Parallel()
-
-	root, path := cascadeModule(t, "// nomutant: hand-verified")
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-
-	// An explicit timeout skips the three baseline suite runs: no mutant is
-	// expected to run, so timing one would only slow the test down.
-	result, err := Run(ctx, Options{
-		Packages:    []string{"./..."},
-		Dir:         root,
-		TestTimeout: time.Minute,
-	})
-	if err != nil {
-		t.Fatalf("Run() error = %v", err)
-	}
-
-	if len(result.Mutants) != 0 {
-		t.Errorf("Run() produced %d mutants, want none: every mutable node is suppressed", len(result.Mutants))
-	}
-
-	want := []SuppressionResult{{File: path, Line: suppressedLine, Reason: "hand-verified"}}
-	if !reflect.DeepEqual(result.Suppressions, want) {
-		t.Errorf("Suppressions = %+v, want %+v", result.Suppressions, want)
-	}
-
-	if _, ok := result.Score(); ok {
-		t.Error("Score() reported a score for a run with no mutants")
-	}
-}
-
-// TestSuppressionsStayOutOfTheScore pins the accounting rule: a suppressed node
-// never became a mutant, so it must not appear in the counts or move the score
-// in either direction.
-func TestSuppressionsStayOutOfTheScore(t *testing.T) {
-	t.Parallel()
-
-	r := &Result{
-		Mutants: []MutantResult{
-			{Status: Killed},
-			{Status: Survived},
-		},
-		Suppressions: []SuppressionResult{
-			{File: "a.go", Line: 3},
-			{File: "a.go", Line: 9, Reason: "generated"},
-		},
-	}
-
-	killed, survived, notViable := r.Counts()
-	if killed != 1 || survived != 1 || notViable != 0 {
-		t.Errorf("Counts() = %d, %d, %d; want 1, 1, 0", killed, survived, notViable)
-	}
-
-	score, ok := r.Score()
-	if !ok || score != 0.5 {
-		t.Errorf("Score() = %v, %v; want 0.5, true", score, ok)
-	}
-
-	if got := r.SuppressedCount(); got != 2 {
-		t.Errorf("SuppressedCount() = %d, want 2", got)
-	}
 }

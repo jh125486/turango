@@ -1,4 +1,4 @@
-.PHONY: help test tidy lint update-lint fmt vet check build clean install
+.PHONY: help test test-integration tidy lint update-lint fmt vet check build clean install
 .DEFAULT_GOAL := help
 
 BINARY_NAME := turango
@@ -10,10 +10,16 @@ help:
 	@echo "Available targets:"
 	@sed -n 's/^##//p' $(MAKEFILE_LIST) | column -t -s ':' | sed -e 's/^/ /'
 
-## test: Run all tests
+## test: Run the fast unit test suite (no real toolchain subprocesses)
 test:
 	@echo "Running tests..."
 	@go test ./...
+
+## test-integration: Run the full suite, including tests that shell out to the
+## real Go toolchain (compiling/testing throwaway module copies; slow)
+test-integration:
+	@echo "Running tests, including integration tests..."
+	@go test -tags=integration ./...
 
 tidy:
 	@echo "Tidying Go modules..."

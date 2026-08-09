@@ -1,6 +1,10 @@
-package example
+package example_test
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/jh125486/turango/example"
+)
 
 func TestSum(t *testing.T) {
 	t.Parallel()
@@ -19,7 +23,7 @@ func TestSum(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
-			if got := Sum(tt.values); got != tt.want {
+			if got := example.Sum(tt.values); got != tt.want {
 				t.Errorf("Sum(%v) = %d, want %d", tt.values, got, tt.want)
 			}
 		})
@@ -42,7 +46,7 @@ func TestMean(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
-			if got := Mean(tt.values); got != tt.want {
+			if got := example.Mean(tt.values); got != tt.want {
 				t.Errorf("Mean(%v) = %d, want %d", tt.values, got, tt.want)
 			}
 		})
@@ -67,7 +71,7 @@ func TestCountAbove(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
-			if got := CountAbove(tt.values, tt.threshold); got != tt.want {
+			if got := example.CountAbove(tt.values, tt.threshold); got != tt.want {
 				t.Errorf("CountAbove(%v, %d) = %d, want %d", tt.values, tt.threshold, got, tt.want)
 			}
 		})
@@ -92,7 +96,7 @@ func TestBounds(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
-			low, high, ok := Bounds(tt.values)
+			low, high, ok := example.Bounds(tt.values)
 			if low != tt.wantLow || high != tt.wantHigh || ok != tt.wantOK {
 				t.Errorf("Bounds(%v) = %d, %d, %v; want %d, %d, %v",
 					tt.values, low, high, ok, tt.wantLow, tt.wantHigh, tt.wantOK)
@@ -118,7 +122,7 @@ func TestTrend(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
-			if got := Trend(tt.values); got != tt.want {
+			if got := example.Trend(tt.values); got != tt.want {
 				t.Errorf("Trend(%v) = %q, want %q", tt.values, got, tt.want)
 			}
 		})

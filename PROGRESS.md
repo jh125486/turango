@@ -118,12 +118,122 @@ specifically because it benefits every user by default, the same way
 stay strictly opt-in for the same reason. Neither is built; both are design
 sketches in ROADMAP.md.
 
+## Extra: golangci-lint tooling + all 43 findings fixed (committed, `fb8ee24`)
+
+`tools/golangci-lint/` is a separate `go.mod` (dependabot-trackable,
+mirrors the `jh125486/pdf2qti` pattern), invoked via `go tool -modfile=`;
+`Makefile` gained a `lint` target, CI runs it. Every one of the first
+run's 43 findings was either fixed for real (errorlint, goconst, a
+gocritic `exitAfterDefer` bug in `main()`/`os.Exit` where `defer stop()`
+was silently skipped, 2 `nilnil` returns turned into `(value, ok, err)`,
+4 real `gocyclo` extractions) or justified-suppressed with a `//nolint`
+reason (gosec subprocess-exec findings on code whose whole job is
+shelling out to `go test`, a couple of test-fixture false positives).
+`example/stats.go` gained named `Trend*` constants as part of the
+goconst fix, which gave `identifier/constswap` new material — the
+corpus/example golden counts and `example/README.md`'s captured output
+were regenerated against the real binary, not hand-edited.
+
+## Extra: mutant IDs, TCE, before/after snippets, channel collector,
+## test-convention cleanup, dependency-closure components (committed, `40d0883`)
+
+A single long session closed most of `ROADMAP.md`'s remaining gaps:
+
+- **Gap 4, deterministic mutant IDs — done.** SHA-256 hash of (file path
+  relative to module root, line, column, operator name, mutation index),
+  truncated to 12 hex chars. `MutantResult.ID`, `-mutatemutant=<id>`
+  replay flag (`Options.MutantID`) — the walk still visits every node,
+  but only a matching mutation is ever handed to the runner.
+- **Gap 2, TCE — done, but not as designed.** The spike (build the same
+  package twice, from two different temp-dir copies, `-trimpath` + a
+  fixed `-buildid`) found the original plan's raw-archive-byte
+  comparison unreliable: Go's export data encodes source line positions,
+  which shift whenever a mutation changes the line count, so a textbook
+  equivalent mutant (dead-store elimination) compared as "different"
+  purely from that noise. The shipped design compares normalized `go
+  build -gcflags=-S` disassembly instead (line-position comments
+  stripped) — validated against both a real dead-store-elimination case
+  (correctly equal) and a real behavior change (correctly different).
+  `-mutatetce=true` (`Options.TCE`), off by default — the risk direction
+  here is asymmetric (a false positive silently discards a real mutant,
+  unlike a narrower scope which can only under-report), so this stays
+  opt-in until it has real-world runs behind it. `Result.Equivalents`,
+  `EquivalentResult`, a `writeEquivalents` console line (only printed
+  when non-zero).
+- **Gap 3, before/after snippets — done, plan partly wrong.** The
+  original plan said all 13 operators need a `Mutation.Node` addition;
+  actually implementing it found only `control/{if,else,case}` and
+  `statement/remover` do — every operator whose `Apply` edits a field in
+  place on the node it was already called with needs no change, since
+  printing that same node before/after already reflects the edit.
+  `statement/remover` needed a second correction mid-implementation too:
+  its `Apply` repoints a list slot rather than editing the removed
+  statement's own fields, so printing the same node twice would show
+  identical (stale) text — `MutantResult.After` resolves this by
+  reporting empty when the before/after render is identical, not a
+  duplicate of `Before`. `MutantResult.Before`/`.After`, populated in
+  the JSON report; the console survivor table is unchanged (3c).
+- **Gap 7, channel-based collector — done.** `collector` now sends on
+  three channels to a single consumer goroutine instead of guarding a
+  shared slice with a mutex. Not a correctness fix (the mutex was
+  already race-safe) — a testability one: `testing/synctest`'s
+  durably-blocked detection covers channel ops, not `sync.Mutex.Lock`,
+  so this is what would let a future test drive `-mutateparallel`'s
+  scheduling deterministically. Verified under `-race` with real
+  concurrent file workers.
+- **Gap 5, dependency-closure workspace copy — real design bug found,
+  components built and unit-tested, deliberately NOT wired in.** The
+  original design sketch's open question ("how does this interact with
+  `-mutatescope=full`?") turned out to have a hard answer: it doesn't,
+  and must not — a forward import closure can never capture the
+  *reverse* closure `ScopeFull`'s cross-package kill detection depends
+  on, so applying this under the default scope would silently
+  misclassify mutants, not just cost performance. `closureDirs`,
+  `resolveClosure`, `copyClosure`, `copyDirFiles`,
+  `hasEmbedDirective` exist in `internal/mutate/runner.go`, scoped to
+  only ever apply under `ScopePackage`/`ScopeImpact`, with automatic
+  fallback to the existing full-module copy on any uncertainty (a
+  `//go:embed` directive anywhere in the closure, a `vendor/` directory,
+  any local `replace` directive). Unit-tested with hand-built
+  `*packages.Package` graphs (no real toolchain needed for most of it).
+  **Nothing calls these yet** — wiring `runner.run` to use `copyClosure`
+  under the narrower scopes is left as its own, separately-reviewable
+  step, on purpose: this is a correctness-sensitive activation, not a
+  performance toggle, and deserved a human look before going live in an
+  unattended session.
+- **Gap 6, git worktrees — untouched.** Lower priority than gap 5, was
+  sequenced after it; not started.
+- **go-test-conventions cleanup.** Every `_test.go` file in the repo was
+  audited (by 13 parallel subagents, one per package) against this
+  project's 9 testing rules — table-driven, `t.Parallel()` throughout,
+  blackbox-unless-justified (whitebox files renamed to
+  `*_internal_test.go`), one test function per exported symbol,
+  `t.Context()` over `context.Background()`, `testing/synctest` for
+  timing. `go.mod` bumped `go 1.23` → `go 1.26` to allow `t.Context()`
+  (1.24+) and `testing/synctest` (1.25+).
+- **Integration test tagging.** The tests that shell out to the real Go
+  toolchain (compiling/testing throwaway module copies) now live behind
+  a `//go:build integration` tag instead of a `testing.Short()` skip —
+  `go test ./...` never compiles them in at all. New `make
+  test-integration` target, a dedicated CI step.
+
+Verified throughout: `go build`/`go vet`/`gofmt` clean, `golangci-lint`
+(with and without `-tags=integration`) reports 0 issues, full suite
+(including `-race` on the concurrency-sensitive tests) passes in both
+modes.
+
+**`turango.png` was found modified (58KB → 1.5MB) with no corresponding
+intentional edit this session** — excluded from `40d0883`, still needs
+the user's review before it's committed either way.
+
 ## State as of last check (verified directly against the repo, not trusted from old notes)
 
 - `go build ./...`, `go vet ./...`, `go test ./...` (non-`-short`, includes real integration tests), `gofmt -l .` all clean on real turango source (frozen `corpus/stdlib-*` fixture source is deliberately left un-gofmt'd — it's historical stdlib code, not ours to reformat).
-- Operator count: **13**, across 6 packages (`control`, `expression`, `literal`, `operator`, `statement`, `identifier`).
+- Operator count: **13**, across 6 packages (`control`, `expression`, `literal`, `operator`, `statement`, `identifier`) — unchanged this session (the mutant-ID/TCE/before-after work touched the engine and reporting, not the operator set).
 - Git history:
   ```
+  40d0883 Add mutant IDs, TCE, before/after snippets, channel collector, test-convention cleanup
+  fb8ee24 Add golangci-lint tooling and fix everything it found
   576d91d Add mutation corpus + regression harness (paused: aes/base64 incomplete)
   5fbf380 Add turango.png mascot; correct -mutate docs; add ROADMAP gaps 5/6
   3d93ab6 Add identifier/constant-swap operator; redesign -mutate as a function-name regexp
@@ -150,11 +260,15 @@ sketches in ROADMAP.md.
 - Kill-detection default scope is FULL suite per mutant (not package-scoped) — package and impact (coverage-map-based) are opt-in via -mutatescope.
 - Per-mutant timeout is baseline-derived (3x real suite run, averaged, x NumCPU), not a fixed constant — added per user's specific request mid-build to avoid runaway mutants (e.g. i++ -> i-- infinite loops) wasting time up to go test's own 10-min default. Timeout hits classify as Killed.
 - -mutateparallel parallelizes at the FILE level (not per-mutation) since one file's AST is shared/mutated in-place across its own mutants — safe boundary is per-file, not per-mutant.
+- Mutant IDs hash (relative path, line, column, operator, mutation index) — not a counter — so IDs survive re-runs of unchanged source but are honestly not stable across upstream edits; this trade-off is documented, not hidden.
+- TCE ships opt-in (default off), not opt-out, despite the ROADMAP's original lean toward opt-out — the risk is asymmetric (a false positive silently discards a real mutant; a narrow scope can only under-report kills), so the safer default won out. Revisit once there's real-world run history.
+- Dependency-closure copying (gap 5) is gated to ScopePackage/ScopeImpact only, never ScopeFull — a forward import closure structurally cannot support ScopeFull's cross-package kill detection, which needs the reverse closure. This is load-bearing, not a style choice — don't let anyone wire it in for ScopeFull "as an optimization."
 
 ## If resuming after a break
 
-1. Everything through the identifier/constant-swap operator, the `-mutate` redesign, and the corpus harness is committed (see git log above). **Nothing is mid-flight or uncommitted** — working tree was clean as of the last check.
-2. **The one real open thread**: `corpus/stdlib-crypto-aes/` and `corpus/stdlib-encoding-base64/` need their `golden.json` files captured (module source is already committed, just needs running against a build of the current binary and the real numbers written in per the schema every other `corpus/*/golden.json` already follows). Do this on a faster/less-loaded machine, and run each fixture's `turango test` invocation *alone*, foreground, without a `timeout N` wrapper that can kill it mid-run — that specific pattern produced bad data repeatedly last session. Sanity-check: full-scope must never report fewer mutants than package-scope for the same fixture.
-3. ROADMAP.md has 6 gaps now, in priority order: (1) identifier-swap v2 (local-var-to-const, closes the real strconv shape), (2) TCE, (3) before/after snippets, (4) deterministic mutant IDs, (5) dependency-closure workspace copy, (6) git-worktree execution (opt-in only, lower priority than 5). None of 2-6 are built.
-4. Ask the user before committing anything new — this doc records what's already committed, not a standing permission to keep committing.
-5. If asked "does X exist / is X implemented," verify against the actual current source (`grep`/`Read`) before answering — this session had several rounds of the user correctly catching an assumption stated from memory instead of verified code. Don't repeat that.
+1. **Check `git status` first.** `turango.png`'s modification is still excluded and unresolved — don't assume the working tree is clean just because this doc says so.
+2. **The corpus aes/base64 thread is still open, untouched this session**: `corpus/stdlib-crypto-aes/` and `corpus/stdlib-encoding-base64/` still need their `golden.json` files captured. Do this on a faster/less-loaded machine, and run each fixture's `turango test` invocation *alone*, foreground, without a `timeout N` wrapper that can kill it mid-run. Sanity-check: full-scope must never report fewer mutants than package-scope for the same fixture.
+3. ROADMAP.md's 7 gaps, current state: (1) identifier-swap **done** (v1 only — v2, local-var-to-const, closes the real strconv shape, still open); (2) TCE **done** (opt-in, `-mutatetce=true`); (3) before/after snippets **done**; (4) deterministic mutant IDs **done**; (5) dependency-closure workspace copy — **components built and tested, deliberately not wired into `runner.run`** (a correctness-sensitive activation decision left for direct review, not a TODO forgotten); (6) git-worktree execution — **untouched**; (7) channel-based collector **done**.
+4. **Gap 5's wiring is the highest-value next step** if the user wants to keep going: `runner.run` needs to call `copyClosure` instead of `copyModule` when `m.scope != ScopeFull` and a per-package `resolveClosure` call (probably precomputed once in `planPackage`, the same shape `planTCEBaseline`/`buildImpact` already use) succeeded. The design and the reason it's scope-gated are fully written up in ROADMAP.md gap 5 — read that before touching `runner.run`, not just this summary.
+5. Ask the user before committing anything new — this doc records what's already committed (or, right now, staged-pending-signing), not a standing permission to keep committing.
+6. If asked "does X exist / is X implemented," verify against the actual current source (`grep`/`Read`) before answering — this project has repeatedly caught assumptions stated from memory instead of verified code. Don't repeat that.

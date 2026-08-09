@@ -67,9 +67,10 @@ func newResolver() resolver {
 	}
 
 	return resolver{
-		goroot:   os.Getenv("GOROOT"),
-		path:     os.Getenv("PATH"),
-		self:     self,
+		goroot: os.Getenv("GOROOT"),
+		path:   os.Getenv("PATH"),
+		self:   self,
+		//nolint:staticcheck // deliberate last-resort fallback, see the package doc comment above: runtime.GOROOT() is the toolchain turango was *built* with, used only when GOROOT and PATH both fail; "go env GOROOT" needs a "go" binary already found, which is circular here.
 		fallback: runtime.GOROOT(),
 		binName:  goBinaryName,
 	}

@@ -47,5 +47,5 @@ func (m *If) Mutate(node ast.Node) []mutator.Mutation {
 		return nil
 	}
 
-	return []mutator.Mutation{clearStmts(&stmt.Body.List, "remove if body")}
+	return []mutator.Mutation{clearStmts(&stmt.Body.List, stmt.Body, "remove if body")}
 }

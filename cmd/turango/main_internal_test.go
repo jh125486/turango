@@ -1,8 +1,10 @@
+// Whitebox (package main, not main_test): package main has no exported API to
+// import and exercise from outside — run, parseMutateFlags, checkAlias, gate
+// and friends are all unexported, so there is no blackbox path to them at all.
 package main
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -35,6 +37,10 @@ func TestParseMutateFlagsRecognition(t *testing.T) {
 		{"before -args still counts", []string{"-mutate=.", "-args", "-x"}, true},
 		{"not a prefix match on another flag", []string{"-run=Test-mutate=x"}, false},
 		{"plain test flags pass through", []string{"-v", "-race", "-run=TestX", "./..."}, false},
+		{
+			"stuff after -args is ignored even if it would otherwise error",
+			[]string{"-mutate=.", "-args", "-v", "whatever", "-mutatescope"}, true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -101,6 +107,7 @@ func TestParseMutateFlagsValues(t *testing.T) {
 			"-mutatetimeout=90s",
 			"-mutateoutput=/tmp/reports",
 			"-mutatemin=0.75",
+			"-mutatemutant=a1b2c3d4e5f6",
 			"./internal/...",
 		})
 		if err != nil {
@@ -124,6 +131,21 @@ func TestParseMutateFlagsValues(t *testing.T) {
 			t.Errorf("output = %q", cfg.output)
 		case !cfg.hasMin || cfg.min != 0.75:
 			t.Errorf("min = %v, %v; want 0.75, true", cfg.min, cfg.hasMin)
+		case cfg.options.MutantID != "a1b2c3d4e5f6":
+			t.Errorf("MutantID = %q, want %q", cfg.options.MutantID, "a1b2c3d4e5f6")
+		}
+	})
+
+	t.Run("mutatemutant defaults to empty", func(t *testing.T) {
+		t.Parallel()
+
+		cfg, _, err := parseMutateFlags([]string{"-mutate=."})
+		if err != nil {
+			t.Fatalf("parseMutateFlags() error = %v", err)
+		}
+
+		if cfg.options.MutantID != "" {
+			t.Errorf("MutantID = %q, want empty", cfg.options.MutantID)
 		}
 	})
 
@@ -220,6 +242,9 @@ func TestParseMutateFlagsErrors(t *testing.T) {
 		"negative duration":     {args: []string{"-mutate=.", "-mutatetimeout=-5s"}, want: "positive duration"},
 		"empty output":          {args: []string{"-mutate=.", "-mutateoutput="}, want: "requires a directory"},
 		"non-numeric min":       {args: []string{"-mutate=.", "-mutatemin=high"}, want: "mutatemin"},
+		"empty mutant id":       {args: []string{"-mutate=.", "-mutatemutant="}, want: "mutatemutant"},
+		"uppercase mutant id":   {args: []string{"-mutate=.", "-mutatemutant=A1B2C3"}, want: "mutatemutant"},
+		"non-hex mutant id":     {args: []string{"-mutate=.", "-mutatemutant=not-hex!"}, want: "mutatemutant"},
 		"leftover go test flag": {args: []string{"-mutate=.", "-v"}, want: "unsupported flag"},
 		"leftover before the flag": {
 			args: []string{"-count=1", "-mutate=."}, want: "unsupported flag",
@@ -242,21 +267,6 @@ func TestParseMutateFlagsErrors(t *testing.T) {
 	}
 }
 
-// TestParseMutateFlagsIgnoresArgsTail pins the -args boundary: nothing past it
-// is turango's to parse, including a leftover that would otherwise be rejected.
-func TestParseMutateFlagsIgnoresArgsTail(t *testing.T) {
-	t.Parallel()
-
-	_, found, err := parseMutateFlags([]string{"-mutate=.", "-args", "-v", "whatever", "-mutatescope"})
-	if err != nil {
-		t.Fatalf("parseMutateFlags() error = %v", err)
-	}
-
-	if !found {
-		t.Fatal("parseMutateFlags() found = false, want a mutation request")
-	}
-}
-
 // TestRunRejectsBadFlags checks that a flag error is reported as a usage error
 // rather than being forwarded to the real go command, which would report it as
 // its own unknown flag and send the user to the wrong manual.
@@ -265,7 +275,7 @@ func TestRunRejectsBadFlags(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 
-	code := run(context.Background(), []string{"turango", "test", "-mutate=.", "-v"}, &stdout, &stderr)
+	code := run(t.Context(), []string{"turango", "test", "-mutate=.", "-v"}, &stdout, &stderr)
 	if code != exitUsage {
 		t.Errorf("exit code = %d, want %d", code, exitUsage)
 	}
@@ -491,7 +501,7 @@ func TestRunRefusesAliasWithoutOptIn(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 
-	code := run(context.Background(), []string{"/usr/local/bin/go", "version"}, &stdout, &stderr)
+	code := run(t.Context(), []string{"/usr/local/bin/go", "version"}, &stdout, &stderr)
 	if code == 0 {
 		t.Error("exit code = 0, want non-zero when aliased without opt-in")
 	}

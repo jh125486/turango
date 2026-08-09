@@ -1,4 +1,4 @@
-package operator
+package operator_test
 
 import (
 	"go/ast"
@@ -6,6 +6,8 @@ import (
 )
 
 func TestAssignmentMutate(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		name string
 		src  string
@@ -30,10 +32,12 @@ func TestAssignmentMutate(t *testing.T) {
 		{name: "multi assign excluded", src: "a, b = b, a"},
 	}
 
-	var m assignment
+	m := newMutator(t, "operator/assignment")
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
 			fset, file := parseFunc(t, tt.src)
 			stmt := findNode[*ast.AssignStmt](t, file)
 
@@ -73,9 +77,11 @@ func TestAssignmentMutate(t *testing.T) {
 }
 
 func TestAssignmentIgnoresOtherNodes(t *testing.T) {
+	t.Parallel()
+
 	_, file := parseFunc(t, "a := b + c")
 
-	var m assignment
+	m := newMutator(t, "operator/assignment")
 
 	for _, expr := range findNodes[*ast.BinaryExpr](file) {
 		if m.Applies(expr) {

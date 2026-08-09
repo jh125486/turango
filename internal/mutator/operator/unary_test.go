@@ -1,4 +1,4 @@
-package operator
+package operator_test
 
 import (
 	"go/ast"
@@ -10,6 +10,8 @@ import (
 // right-hand side. In each case the mutation is offered while visiting the
 // container, not the unary expression itself.
 func TestUnaryStripsInEachTriggerPosition(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		name   string
 		src    string
@@ -64,10 +66,12 @@ func TestUnaryStripsInEachTriggerPosition(t *testing.T) {
 		},
 	}
 
-	var m unary
+	m := newMutator(t, "operator/unary")
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
 			fset, file := parseFunc(t, tt.src)
 			target := tt.target(t, file)
 
@@ -100,6 +104,8 @@ func TestUnaryStripsInEachTriggerPosition(t *testing.T) {
 // unary expressions offers two separately applicable mutations, not one
 // combined edit.
 func TestUnaryStripsEachSlotIndependently(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		name   string
 		src    string
@@ -124,10 +130,12 @@ func TestUnaryStripsEachSlotIndependently(t *testing.T) {
 		},
 	}
 
-	var m unary
+	m := newMutator(t, "operator/unary")
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
 			fset, file := parseFunc(t, tt.src)
 			target := tt.target(t, file)
 
@@ -147,12 +155,14 @@ func TestUnaryStripsEachSlotIndependently(t *testing.T) {
 // restores the exact prior node, not an equivalent rebuilt one, so an AST can
 // be reused across a whole walk.
 func TestUnaryRevertRestoresTheOriginalPointer(t *testing.T) {
+	t.Parallel()
+
 	_, file := parseFunc(t, "if !ok {\n\t}")
 
 	stmt := findNode[*ast.IfStmt](t, file)
 	original := stmt.Cond
 
-	var m unary
+	m := newMutator(t, "operator/unary")
 
 	mutations := m.Mutate(stmt)
 	if len(mutations) != 1 {
@@ -177,6 +187,8 @@ func TestUnaryRevertRestoresTheOriginalPointer(t *testing.T) {
 // value, a composite literal element — is left alone, and the unary expression
 // itself is never the matched node.
 func TestUnaryDoesNotApplyOutsideTriggerPositions(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		name string
 		src  string
@@ -186,10 +198,12 @@ func TestUnaryDoesNotApplyOutsideTriggerPositions(t *testing.T) {
 		{name: "composite literal element", src: "_ = []bool{!a}"},
 	}
 
-	var m unary
+	m := newMutator(t, "operator/unary")
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
 			_, file := parseFunc(t, tt.src)
 
 			// The unary expression itself must never match: this operator
