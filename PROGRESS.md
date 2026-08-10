@@ -104,7 +104,7 @@ no golden file, so the harness runs clean today at 17/17 — finishing these
 two is explicitly deferred to a faster machine, per direct instruction, not
 forgotten.
 
-## Extra: ROADMAP gaps 5 and 6 (dependency-closure copy, git worktrees)
+## Extra: ROADMAP gap 6 done (`-mutateworkspace=worktree`); gap 5 reviewed, real bug found, still not wired in
 
 Found while dogfooding the corpus harness above: `runner.go`'s `copyModule`
 copies the *entire module* per mutant, not just the target package's
@@ -112,11 +112,52 @@ build/test closure — stopped being hypothetical the moment `example/`
 started sharing a repo root with 17 new corpus fixture directories, which
 directly slowed down `example`/`example-legacy`'s runs for no reason
 related to them. Gap 5 (dependency-closure copy via `go/packages`' import
-graph) is the fix, prioritized *above* gap 6 (git-worktree-based execution)
+graph) is prioritized *above* gap 6 (git-worktree-based execution)
 specifically because it benefits every user by default, the same way
 `-fuzz` has zero git dependency — worktrees only help git users and must
-stay strictly opt-in for the same reason. Neither is built; both are design
-sketches in ROADMAP.md.
+stay strictly opt-in for the same reason.
+
+**Gap 6 is now built**: `-mutateworkspace=worktree` (`Options.Workspace`),
+strictly opt-in, zero value unchanged from today's `copyModule` behavior.
+`copyWorktree` in `runner.go` uses `git worktree add --detach`, falling
+back to `copyModule` automatically whenever the target isn't inside a
+*clean* git working tree (checked across the whole repo, not just the
+mutated module — `git worktree add` checks out `HEAD`, never the on-disk
+working copy) or isn't a git repo at all (every `corpus/*/module/` fixture,
+by design). One real macOS-specific bug found and fixed during
+implementation: computing the worktree's module-relative path with
+`filepath.Rel(repoRoot, moduleDir)` silently produced a *wrong* path — and
+in the worst case, one that pointed back at the original module's files
+instead of the new worktree's copy, with no error — because `/var/...`
+under `t.TempDir()` is a symlink to `/private/var/...` that `git
+rev-parse --show-toplevel` always resolves through but an arbitrary
+`moduleDir` argument isn't guaranteed to already be resolved the same way.
+Fixed by asking git for the prefix directly (`git rev-parse
+--show-prefix`) instead of computing it lexically. Caught only because the
+new tests assert on the *content* of the checked-out files and that
+`cleanup()` actually removes the worktree, not just on a boolean `ok`.
+Verified end to end: `TestRunWorkspaceWorktreeMatchesCopy` (integration)
+proves a git-committed fixture classifies identically under
+`WorkspaceCopy` and `WorkspaceWorktree`.
+
+**Gap 5 (dependency-closure copy) is still deliberately unwired**, but got
+an independent review this session (spawned as a fable-model subagent,
+reviewing only the already-built-but-inert code, not the session that
+wrote it) that found a real, load-bearing bug before any activation: `closureDirs`/`resolveClosure`
+only walk `pkg.Imports`, which is production-code-only — a blackbox
+`_test.go` file (`package foo_test`) is a *separate* `*packages.Package`
+whose imports never merge in. Since this project's own test-convention
+cleanup (below) made blackbox-by-default the norm across the repo, wiring
+gap 5 in as-is would very likely misclassify real mutants as `NotViable`
+in exactly the packages this project itself just finished converting to
+that convention — the existing unit tests don't catch it because every
+test fixture hand-builds a `*packages.Package` with the needed imports
+already present. A second, currently-dormant bug (an in-module `replace`
+target outside the forward closure isn't detected as a fallback trigger)
+was also found. Full writeup and the concrete fix needed before wiring is
+in ROADMAP.md gap 5's new "Independent review before activation" section —
+read that before touching `runner.run`/`planPackage` for gap 5, not just
+this summary.
 
 ## Extra: golangci-lint tooling + all 43 findings fixed (committed, `fb8ee24`)
 
@@ -264,11 +305,115 @@ the user's review before it's committed either way.
 - TCE ships opt-in (default off), not opt-out, despite the ROADMAP's original lean toward opt-out — the risk is asymmetric (a false positive silently discards a real mutant; a narrow scope can only under-report kills), so the safer default won out. Revisit once there's real-world run history.
 - Dependency-closure copying (gap 5) is gated to ScopePackage/ScopeImpact only, never ScopeFull — a forward import closure structurally cannot support ScopeFull's cross-package kill detection, which needs the reverse closure. This is load-bearing, not a style choice — don't let anyone wire it in for ScopeFull "as an optimization."
 
+## Post-reboot verification (2026-08-10, this session)
+
+Fable subagent `a8a3728d82642a0ff` (gap 5 bugfixes) confirmed **dead** —
+`SendMessage` returned "No transcript found," reboot killed it. Its diff
+was already on disk though, so verified manually instead of trusting its
+self-report: `go build ./...`, `go vet ./...`, `gofmt -l .` (clean except
+frozen `corpus/stdlib-*` fixtures, which is expected/intentional),
+`golangci-lint run` both with and without `-tags=integration` (0 issues
+each), `go test ./...`, `go test -tags=integration
+./internal/mutate/...` — **all clean, exit 0**. Manually read the full
+`runner.go` diff: it does fix both bugs the earlier fable review found —
+`resolveClosure` now takes `...*packages.Package` and merges variants
+(`mergeVariants`) so a blackbox `_test.go` package's imports are no longer
+invisible to the closure walk, and `inModuleReplaceTargets` now catches an
+in-module `replace` target that falls outside the computed closure as a
+fallback trigger. Gap 6 (`-mutateworkspace=worktree`) also verified intact
+in the same diff. **All 11 modified files are now believed good and ready
+to commit** — not yet committed, per standing instruction (see item 7
+below); ask before committing.
+
+`turango.png`'s unexplained modification (58KB → 1.5MB, flagged in commit
+`40d0883`'s note) is still unresolved and still excluded from any commit.
+
+## Gap 5 activation, ROADMAP gaps 8/9 added, PROPOSAL.md scope note (2026-08-10, same session, later)
+
+The 11 files above were reviewed, verified, and **committed** (`dfe1ce2`)
+before this section's work started — `turango.png`'s own separate
+modification turned out to already be committed independently in `d9ba7e1`
+("added logo"), confirmed intentional by the user, nothing left pending on
+it.
+
+With gap 5's components already fixed and verified inert, this session
+did the activation step ROADMAP.md gap 5 had deliberately deferred:
+`engine.loadClosures` (new, mirrors `loadTyped`'s zero-cost-unless-needed
+shape, gated on scope != `ScopeFull`) and `engine.planClosure` (new,
+per-package, resolves via `resolveClosure`) feed `fileJob.closure` →
+`mutant.closureDirs` → `runner.workspaceFor`, which now tries
+`copyClosure` first when non-nil, ahead of the existing worktree/copyModule
+fallback chain (see `workspaceFor`'s rewritten doc comment for the
+three-way precedence and why a worktree can never substitute for a
+closure copy — it always checks out the whole repo at HEAD). One new unit
+test (`TestWorkspaceForPrefersClosureOverWorktree`) proves that precedence
+directly; the existing `TestRunWithImpactScope` integration test (already
+running under real `ScopeImpact`) now exercises the new path end-to-end
+against a real module with no changes needed to the test itself. Full
+re-verification after wiring: `go build`, `go vet`, `gofmt -l .`,
+`golangci-lint` (both modes), `go test ./...`, `go test -tags=integration
+./internal/mutate/...` — all clean. ROADMAP.md gap 5 updated to **Done**
+throughout (summary list + detailed section).
+
+Also this session: **ROADMAP.md gap 8** added (benchmark mutation-testing
+overhead vs. KLOC/test-KLOC, using Go's own `testing.B`/`go test -bench`/
+`benchstat` pipeline rather than a bespoke script — not started, design
+only) and **gap 9** added (a five-part comment-cleanup plan: staleness
+audit, dead-code/marker sweep, format consistency, and citation rigor are
+all safe to do without further sign-off; a verbosity trim is explicitly
+flagged as needing the user's own go-ahead first, since it would reverse
+this project's established, repeatedly-reaffirmed long-rationale-comment
+style — not started as a whole, but 9a/9c/9e's *audit* work was done
+inline this session, see next paragraph).
+
+**9a/9c/9e done inline, not deferred**: grepped for `TODO`/`FIXME`/`XXX`
+across the repo (excluding frozen `corpus/stdlib-*`) — none found. Checked
+`internal/mutate/*.go` and `internal/mutator/**/*.go` for stale
+"not wired in"/"not built" style status claims — none remain (the one real
+instance, `closureDirs`' now-false "NOT WIRED INTO THE ENGINE YET," was
+fixed as part of the gap 5 activation work above, before gap 9 was even
+proposed). Spot-checked every `[Xxx]`-bracket godoc cross-reference this
+session's own new comments introduced — all resolve to real symbols,
+consistent with the codebase's existing (non-standard but consistent)
+`[engine.Xxx]`/`[runner.Xxx]` pseudo-qualified style. **Found and fixed a
+real citation error while auditing 9e**: ROADMAP.md gap 2 attributed TCE to
+"Kintis/Papadakis/Malevris et al." — verified via web search that this is
+wrong; the actual ICSE'15 TCE paper's authors are Papadakis, Jia, Harman &
+Le Traon (Kintis co-authored a different, related paper on second-order
+mutation for equivalent-mutant isolation). Fixed with a real DOI link
+(`https://doi.org/10.1109/ICSE.2015.103`), matching the citation rigor
+`PROPOSAL.md`'s existing `[Mull]` reference already sets.
+
+**PROPOSAL.md scope note added** (user's explicit request): a new "Costs
+and risks" bullet plus an Abstract-level pointer, stating plainly that
+turango is a reference implementation with only mild, conservative cost
+controls (scope narrowing, baseline timeout, worker parallelism, opt-in
+TCE/closure-copy) and does not attempt techniques the mutation-testing
+literature treats as standard at scale (mutant subsumption/selective
+mutation, higher-order mutation, ML-guided prioritization, diff-scoped
+incremental testing) — the proposal's claim is that the *mechanism*
+belongs in the toolchain, not that this is the fastest possible
+implementation of it.
+
+**Not yet committed** as of this section: `PROPOSAL.md`, `ROADMAP.md`,
+`internal/mutate/engine.go`, `internal/mutate/runner.go`,
+`internal/mutate/runner_internal_test.go` — ask before committing, per
+standing instruction.
+
 ## If resuming after a break
 
-1. **Check `git status` first.** `turango.png`'s modification is still excluded and unresolved — don't assume the working tree is clean just because this doc says so.
-2. **The corpus aes/base64 thread is still open, untouched this session**: `corpus/stdlib-crypto-aes/` and `corpus/stdlib-encoding-base64/` still need their `golden.json` files captured. Do this on a faster/less-loaded machine, and run each fixture's `turango test` invocation *alone*, foreground, without a `timeout N` wrapper that can kill it mid-run. Sanity-check: full-scope must never report fewer mutants than package-scope for the same fixture.
-3. ROADMAP.md's 7 gaps, current state: (1) identifier-swap **done** (v1 only — v2, local-var-to-const, closes the real strconv shape, still open); (2) TCE **done** (opt-in, `-mutatetce=true`); (3) before/after snippets **done**; (4) deterministic mutant IDs **done**; (5) dependency-closure workspace copy — **components built and tested, deliberately not wired into `runner.run`** (a correctness-sensitive activation decision left for direct review, not a TODO forgotten); (6) git-worktree execution — **untouched**; (7) channel-based collector **done**.
-4. **Gap 5's wiring is the highest-value next step** if the user wants to keep going: `runner.run` needs to call `copyClosure` instead of `copyModule` when `m.scope != ScopeFull` and a per-package `resolveClosure` call (probably precomputed once in `planPackage`, the same shape `planTCEBaseline`/`buildImpact` already use) succeeded. The design and the reason it's scope-gated are fully written up in ROADMAP.md gap 5 — read that before touching `runner.run`, not just this summary.
-5. Ask the user before committing anything new — this doc records what's already committed (or, right now, staged-pending-signing), not a standing permission to keep committing.
-6. If asked "does X exist / is X implemented," verify against the actual current source (`grep`/`Read`) before answering — this project has repeatedly caught assumptions stated from memory instead of verified code. Don't repeat that.
+**Paused 2026-08-10 for a laptop reboot, mid-task — read this section fully before doing anything.**
+
+1. **Check `git status` first.** As of the pause: 11 files modified, uncommitted (gap 6's work — see #3). `turango.png`'s modification is still excluded and unresolved. Don't assume the working tree is clean just because this doc says so.
+2. **Check on the fable subagent (gap 5 fixes) first — it may have finished, stalled, or need a nudge.** It was asked (via `SendMessage` to agent id `a8a3728d82642a0ff`, no name set) to fix two real bugs an earlier fable review found in `internal/mutate/runner.go`'s unwired gap-5 code: (1) `closureDirs`/`resolveClosure` only walk `pkg.Imports`, blind to blackbox `_test.go` imports (the load-bearing bug — this repo's own tests are blackbox-by-default); (2) an in-module `replace` target outside the computed closure isn't caught as a fallback trigger. It was told explicitly NOT to wire `copyClosure`/`resolveClosure` into `runner.run`/`planPackage` — that stays a separate decision. Its last two status updates both said "waiting on the corpus regression suite" (`TestCorpus`, the slow real end-to-end suite) — but a direct process check at the time found *no* `go test`/`turango-bin` process actually running and an empty output file being `tail -f`'d since hours earlier: it looks stalled, likely hit the same background-job-killing issue described in #5 below, not genuinely still working. It DID leave real, substantial diffs on disk already (`internal/mutate/runner.go` +368/-35, `internal/mutate/runner_internal_test.go` +436, `ROADMAP.md` +130 as of the pause) — read those diffs and verify them yourself (`go build`, `go vet`, `gofmt -l .`, the golangci-lint invocation below, `go test ./...`, `go test -tags=integration ./internal/mutate/...`) rather than trusting its self-report or re-running its same stalled approach. If it's still alive, `SendMessage` to the same agent id will resume it with context; if not, finish verifying/cleaning up its diff yourself.
+3. **Gap 6 (`-mutateworkspace=worktree`) is done** — implemented, tested, lint-clean, documented in README.md and ROADMAP.md, verified against the full `go test ./...` suite. Uncommitted, staged-ready. One real macOS-specific bug was found and fixed during implementation: computing a worktree's module-relative path via `filepath.Rel(repoRoot, moduleDir)` is unsafe because `t.TempDir()`'s `/var/...` is a symlink to `/private/var/...` that `git rev-parse --show-toplevel` resolves through but an arbitrary `moduleDir` argument isn't guaranteed to be pre-resolved the same way — fixed by asking git for the prefix directly (`git rev-parse --show-prefix`) instead of computing it lexically. See `copyWorktree`'s doc comment in `runner.go`.
+4. **The corpus aes/base64 golden.json capture is still open, and has a newly-diagnosed root cause**: every attempt to run a fixture's full mutation sweep in this environment's backgrounded Bash gets killed after roughly a minute — confirmed even running one job alone, with no other concurrency, so it isn't resource contention or a timeout this session set. Root cause undiagnosed (looks like an environment-level ceiling on backgrounded Bash job wall-clock time). **This needs to run in the user's own foreground terminal**, outside Claude Code's background job mechanism entirely — see the exact commands in the conversation, or just re-derive them from `README.md`'s flag docs (`-mutatescope=package -mutatetimeout=30s -mutateoutput=<dir>` against each fixture's `module/` dir). Sanity-check once captured: full-scope must never report fewer mutants than package-scope for the same fixture.
+5. **New sub-thread this session, NOT finished — corpus provenance via git submodule** (user's idea, in response to the aes/base64 struggle): pin the exact upstream `golang/go` commit(s) each stdlib-sourced corpus fixture (`stdlib-strconv-parseuint`, `stdlib-x509-pkix`, `stdlib-crypto-aes`, `stdlib-encoding-base64`) was actually cut from, via real git submodules, so provenance is verifiable rather than just asserted. Findings so far (each one required real commit-level archaeology — release-tag bisection alone was not enough, and burned a lot of tool calls; a shallow `--filter=blob:none` sparse-checkout clone of `golang/go` was made at `/tmp/goclone` for this, scoped to `src/crypto/x509/pkix src/encoding/base64 src/crypto/aes src/strconv` — gone after the reboot, re-clone if resuming this thread):
+   - `stdlib-strconv-parseuint`: **resolved, exact match.** Byte-for-byte identical to commit `1d81251599fd1b8f9da888e10c1054c96d1e1fb1` — the parent of `fc6b74ce39748efc360afea4164c92a710ad6e77`, the commit that fixed golang/go#21278 (the exact historical `ParseUint` overflow bug this fixture exists to reproduce). Verified via direct byte diff against that commit's `src/strconv/atoi.go`. Safe to submodule-pin with zero risk to the existing golden.json.
+   - `stdlib-x509-pkix`: **resolved, base + documented edits.** Base commit `a0da9c00ae` ("crypto: add available godoc link", landed in `go1.22.0`) — confirmed by finding it's the *only* commit touching `pkix.go` between `go1.21.0` and `go1.22.0`, and the diff against it stays constant (56 lines) all the way through `go1.26.0`, meaning nothing upstream changed after that point. The remaining 56-line diff is not upstream drift — it's real, deliberate local edits on top: a `strings.Builder` refactor of `RDNSequence.String()`, a genuine behavioral tweak (skip hex-encoding for string-typed attribute values before falling through to normal escaping — a real semantic change, not just style), and an added doc comment on `AttributeTypeAndValue`. Safe to submodule-pin the base commit; the fixture's actual `.go` file stays as-is (the local edits are the fixture, not drift to eliminate).
+   - `stdlib-encoding-base64`: **resolved, negative result — no real commit to pin.** Checked back to `go1.14` (2020); at every version checked, upstream is *longer* than the fixture (~130 lines longer even at the oldest point checked), and the whole decode loop (the SIMD-style fast paths, mid-stream newline handling, padding validation) is restructured, not trimmed. This is a hand-written/heavily-adapted fixture inspired by base64, not a freeze of any real commit — going back further than `go1.14` is very unlikely to converge and would just be guessing. Do not keep bisecting this one.
+   - `stdlib-crypto-aes`: **not started.** The plan (per direct user instruction) was to spot-check `aes.go` plus 2-3 other files the same way pkix/base64 were checked, and stop early if the same "no clean pin, hand-adapted" pattern shows up (same era of code, and base64's result makes that the likely outcome) — full-tree bisection across all 61 files is not warranted unless the spot-check disagrees between files. Pick this up fresh; nothing was found or ruled out yet.
+   - Given the mixed results, the two submodules originally planned ("current" and "historical") may not both be worth adding — `strconv-parseuint` alone justifies a "historical" submodule pinned to `1d81251599fd1b8f9da888e10c1054c96d1e1fb1`; whether a "current" submodule is worth adding for `x509-pkix`'s single base commit (and possibly `aes`, TBD) is a judgment call once `aes`'s spot-check lands — don't assume the two-submodule plan is still the right shape without re-checking with the user, since `base64` turned out to not need one at all.
+6. ROADMAP.md's 7 gaps, current state: (1) identifier-swap **done** (v1 only — v2, local-var-to-const, closes the real strconv shape, still open); (2) TCE **done** (opt-in, `-mutatetce=true`); (3) before/after snippets **done**; (4) deterministic mutant IDs **done**; (5) dependency-closure workspace copy — **components built and tested; an independent (fable) review found two real bugs; a second fable pass was fixing them as of the pause, see #2 above — status unconfirmed until verified**; (6) git-worktree execution — **done** (`-mutateworkspace=worktree`, see #3); (7) channel-based collector **done**.
+7. Ask the user before committing anything new — this doc records what's already committed, not a standing permission to keep committing. Also: never retry a blocked `git commit` unattended/in a loop when it's failing on a physical-presence signing requirement (1Password Touch ID/fingerprint) — attempt once, report, stop; that was explicit user feedback earlier this session after a long unattended retry loop.
+8. If asked "does X exist / is X implemented," verify against the actual current source (`grep`/`Read`) before answering — this project has repeatedly caught assumptions stated from memory instead of verified code. Don't repeat that.

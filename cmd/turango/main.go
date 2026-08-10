@@ -62,6 +62,7 @@ const (
 	flagMin       = "mutatemin"
 	flagMutant    = "mutatemutant"
 	flagTCE       = "mutatetce"
+	flagWorkspace = "mutateworkspace"
 )
 
 // flagArgsSeparator is go test's own "-args" boundary: everything after it
@@ -72,6 +73,7 @@ const flagArgsSeparator = "-args"
 // mutateFlags is the recognised set, in the order they are documented.
 var mutateFlags = []string{
 	flagMutate, flagScope, flagOperators, flagParallel, flagTimeout, flagOutput, flagMin, flagMutant, flagTCE,
+	flagWorkspace,
 }
 
 // reportFile is the name of the JSON report written into -mutateoutput.
@@ -460,6 +462,8 @@ func (c *mutateConfig) set(name, value string) error {
 		return c.setMutant(value)
 	case flagTCE:
 		return c.setTCE(value)
+	case flagWorkspace:
+		return c.setWorkspace(value)
 	}
 
 	return nil
@@ -576,6 +580,26 @@ func (c *mutateConfig) setTCE(value string) error {
 	}
 
 	c.options.TCE = tce
+
+	return nil
+}
+
+// setWorkspace validates and stores -mutateworkspace: whether a mutant's
+// throwaway execution copy is built by filesystem copy (the default) or
+// `git worktree add`. See ROADMAP.md gap 6 — worktree mode is strictly
+// opt-in and falls back to the copy strategy on its own whenever the
+// target isn't inside a clean git working tree, so requesting it is always
+// safe.
+func (c *mutateConfig) setWorkspace(value string) error {
+	workspace, err := mutate.ParseWorkspace(value)
+	if err != nil {
+		// Not re-wrapped with the flag name and value: ParseWorkspace's
+		// message already names both the value it rejected and the ones it
+		// accepts.
+		return fmt.Errorf("turango: %w", err)
+	}
+
+	c.options.Workspace = workspace
 
 	return nil
 }

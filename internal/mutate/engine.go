@@ -35,6 +35,13 @@ import (
 	_ "github.com/jh125486/turango/internal/mutator/statement"
 )
 
+// unknownSpelling is the fallback String() spelling for a Scope, Workspace
+// or Status value outside its defined range — reachable only via an
+// explicit invalid conversion (e.g. Scope(99)), never through ParseScope/
+// ParseWorkspace or the classifier, both of which only ever produce a
+// defined value.
+const unknownSpelling = "unknown"
+
 // Scope selects which tests are run to decide whether a mutant was caught.
 //
 // The three modes trade run time against confidence, and they can disagree: a
@@ -73,7 +80,7 @@ func (s Scope) String() string {
 	case ScopeImpact:
 		return "impact"
 	default:
-		return "unknown"
+		return unknownSpelling
 	}
 }
 
@@ -92,6 +99,51 @@ func ParseScope(s string) (Scope, error) {
 		return ScopeImpact, nil
 	default:
 		return ScopeFull, fmt.Errorf("mutate: unknown scope %q (want full, package or impact)", s)
+	}
+}
+
+// Workspace selects how a mutant's throwaway execution copy of the module is
+// built. See runner.go's copyModule/copyWorktree for the two strategies.
+type Workspace int
+
+const (
+	// WorkspaceCopy recursively copies the module into a fresh temp directory
+	// per mutant. It has no dependency on git and works against any module,
+	// git-tracked or not — the default, and the only strategy available
+	// before ROADMAP.md gap 6.
+	WorkspaceCopy Workspace = iota
+
+	// WorkspaceWorktree uses `git worktree add` instead of a filesystem copy.
+	// Strictly opt-in and never a hard requirement: it is only ever attempted
+	// when the target module is inside a clean git working tree (see
+	// runner.go's gitWorktreeClean), falling back to [WorkspaceCopy]
+	// automatically otherwise — so requesting it is always safe, even
+	// against a directory (a corpus fixture's own module/, say) that turns
+	// out not to be a clean git checkout, or not a git repo at all.
+	WorkspaceWorktree
+)
+
+// String reports the workspace's -mutateworkspace spelling.
+func (w Workspace) String() string {
+	switch w {
+	case WorkspaceCopy:
+		return "copy"
+	case WorkspaceWorktree:
+		return "worktree"
+	default:
+		return unknownSpelling
+	}
+}
+
+// ParseWorkspace converts a -mutateworkspace flag value to a [Workspace].
+func ParseWorkspace(s string) (Workspace, error) {
+	switch s {
+	case "copy":
+		return WorkspaceCopy, nil
+	case "worktree":
+		return WorkspaceWorktree, nil
+	default:
+		return WorkspaceCopy, fmt.Errorf("mutate: unknown workspace %q (want copy or worktree)", s)
 	}
 }
 
@@ -181,6 +233,11 @@ type Options struct {
 	// comparison would silently discard a real mutant. See ROADMAP.md gap
 	// 2 for the validated design and its spike.
 	TCE bool
+
+	// Workspace selects how each mutant's throwaway execution copy is built.
+	// The zero value is [WorkspaceCopy] — today's existing filesystem-copy
+	// behaviour, unchanged. See ROADMAP.md gap 6.
+	Workspace Workspace
 }
 
 // baselineRuns is how many times the unmutated suite is timed before a run.
@@ -248,14 +305,31 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 		}
 	}
 
+	// Dependency-closure resolution (ROADMAP.md gap 5) is only ever
+	// attempted when the run's own requested scope is not [ScopeFull]: a
+	// forward import closure is provably the wrong thing to test under
+	// ScopeFull (it cannot see the reverse closure ScopeFull's cross-package
+	// kill detection depends on — see closureDirs' doc comment), so a
+	// ScopeFull run pays nothing extra here, the same zero-cost-by-default
+	// shape needsTypes already gives typed operators. A failure loading
+	// test-aware packages is deliberately non-fatal: this is a pure
+	// optimisation over the always-correct copyModule fallback, so a
+	// load error here just means no package gets a narrower workspace this
+	// run, not a failed run.
+	var closurePkgs map[string][]*packages.Package
+
+	if opts.Scope != ScopeFull {
+		closurePkgs, _ = loadClosures(ctx, opts)
+	}
+
 	timeout, err := resolveTimeout(ctx, opts, goTestSuite(goBin, opts.Dir, opts.patterns()))
 	if err != nil {
 		return nil, err
 	}
 
-	run := &runner{goBin: goBin, testTimeout: timeout}
+	run := &runner{goBin: goBin, testTimeout: timeout, workspace: opts.Workspace}
 
-	jobs, err := plan(ctx, goBin, opts, pkgs, mutators, typedPkgs, funcPattern)
+	jobs, err := plan(ctx, goBin, opts, pkgs, mutators, typedPkgs, closurePkgs, funcPattern)
 	if err != nil {
 		return &Result{}, err
 	}
@@ -653,6 +727,61 @@ func loadTyped(ctx context.Context, opts Options) (map[string]*packages.Package,
 	return byPath, nil
 }
 
+// loadClosures re-resolves opts.patterns() with import-graph and test-variant
+// information, for [resolveClosure] to consult (ROADMAP.md gap 5). It is
+// only ever called when the run's requested scope is not [ScopeFull] — see
+// [Run]'s own gating.
+//
+// Tests: true is load-bearing, not incidental: without it, a black-box
+// "pkg_test" external test package's own imports are invisible to
+// [resolveClosure], which is exactly the bug an earlier review of this
+// mechanism found before it was ever wired in (see ROADMAP.md gap 5's
+// "Independent review before activation" section) — this project's own
+// test-convention cleanup made black-box tests the repo-wide default, so
+// getting this wrong here would misclassify mutants in the packages this
+// project itself just finished converting to that convention.
+//
+// The result is keyed by absolute package directory, not PkgPath: a
+// Tests:true load returns up to three *packages.Package entries per
+// directory (the production package, an internal "pkg [pkg.test]" variant,
+// and an external "pkg_test [pkg.test]" variant), each with its own
+// synthesized PkgPath, but all three sharing the one directory
+// [planPackage] already knows how to compute — the natural join key between
+// this result and the plain, Tests:false pkgs [Run] already loaded via
+// [load].
+func loadClosures(ctx context.Context, opts Options) (map[string][]*packages.Package, error) {
+	cfg := &packages.Config{
+		Context: ctx,
+		Mode: packages.NeedName | packages.NeedFiles | packages.NeedCompiledGoFiles |
+			packages.NeedModule | packages.NeedImports | packages.NeedDeps,
+		Dir:   opts.Dir,
+		Tests: true,
+	}
+
+	pkgs, err := packages.Load(cfg, opts.patterns()...)
+	if err != nil {
+		return nil, fmt.Errorf("mutate: loading test-aware packages: %w", err)
+	}
+
+	byDir := make(map[string][]*packages.Package, len(pkgs))
+
+	for _, pkg := range pkgs {
+		files := pkg.GoFiles
+		if len(files) == 0 {
+			files = pkg.CompiledGoFiles
+		}
+
+		if len(files) == 0 {
+			continue // a synthetic or otherwise fileless package: nothing resolveClosure could anchor a directory on
+		}
+
+		dir := filepath.Dir(files[0])
+		byDir[dir] = append(byDir[dir], pkg)
+	}
+
+	return byDir, nil
+}
+
 // fileJob is one file's share of a run: everything a worker needs to mutate it
 // without consulting any state shared with the other workers.
 type fileJob struct {
@@ -696,6 +825,13 @@ type fileJob struct {
 	// package was fail-soft demoted to running without it.
 	tceBaseline []byte
 
+	// closure is the package's pre-resolved dependency closure (ROADMAP.md
+	// gap 5), non-nil only when scope above is not [ScopeFull] and
+	// [resolveClosure] resolved it safely for this package. Threaded
+	// through to every [mutant] the package's mutateFile walk produces —
+	// see [runner.workspaceFor].
+	closure map[string]bool
+
 	// typedFset and typedSyntax are the FileSet and already-parsed,
 	// already-type-checked syntax tree for path, set only when mutators
 	// above was bound against type information. mutateFile uses these
@@ -728,11 +864,15 @@ type fileJob struct {
 //
 // funcPattern is the compiled [Options.FuncPattern], set identically on every
 // job — see [fileJob.funcPattern].
-func plan(ctx context.Context, goBin string, opts Options, pkgs []*packages.Package, mutators []mutator.Mutator, typedPkgs map[string]*packages.Package, funcPattern *regexp.Regexp) ([]fileJob, error) {
+//
+// closurePkgs is non-nil only when [Run] determined the run's scope is not
+// [ScopeFull]; it is used, per package, to resolve [fileJob.closure] via
+// [resolveClosure] (ROADMAP.md gap 5).
+func plan(ctx context.Context, goBin string, opts Options, pkgs []*packages.Package, mutators []mutator.Mutator, typedPkgs map[string]*packages.Package, closurePkgs map[string][]*packages.Package, funcPattern *regexp.Regexp) ([]fileJob, error) {
 	var jobs []fileJob
 
 	for _, pkg := range pkgs {
-		pkgJobs, err := planPackage(ctx, goBin, opts, pkg, mutators, typedPkgs, funcPattern)
+		pkgJobs, err := planPackage(ctx, goBin, opts, pkg, mutators, typedPkgs, closurePkgs, funcPattern)
 		if err != nil {
 			return nil, err
 		}
@@ -741,6 +881,34 @@ func plan(ctx context.Context, goBin string, opts Options, pkgs []*packages.Pack
 	}
 
 	return jobs, nil
+}
+
+// planClosure resolves this package's dependency closure (ROADMAP.md gap
+// 5), or nil if any precondition doesn't hold — scope is [ScopeFull] (where
+// a forward closure is provably wrong, not just unresolved — see
+// closureDirs' doc comment), closurePkgs wasn't loaded this run, no variant
+// was found for dir (a package [load] resolved but [loadClosures] somehow
+// didn't, e.g. a load error affecting only the Tests:true call), or
+// [resolveClosure] itself declined (a vendor/ directory, an embed
+// directive, an unsafe replace target). Every one of these is the identical
+// "fall back to copyModule/copyWorktree" outcome from [runner.workspaceFor]'s
+// point of view — nil is the only signal it needs.
+func planClosure(scope Scope, closurePkgs map[string][]*packages.Package, dir string) map[string]bool {
+	if scope == ScopeFull || closurePkgs == nil {
+		return nil
+	}
+
+	variants, ok := closurePkgs[dir]
+	if !ok {
+		return nil
+	}
+
+	dirs, ok := resolveClosure(variants...)
+	if !ok {
+		return nil
+	}
+
+	return dirs
 }
 
 // planScope resolves the scope and, under [ScopeImpact], the coverage map
@@ -809,7 +977,7 @@ func planTCEBaseline(ctx context.Context, goBin string, opts Options, moduleDir,
 
 // planPackage builds pkg's file jobs, or nil if pkg has nothing mutable (no
 // module info, or no non-test .go files). See [plan] for the parameters.
-func planPackage(ctx context.Context, goBin string, opts Options, pkg *packages.Package, mutators []mutator.Mutator, typedPkgs map[string]*packages.Package, funcPattern *regexp.Regexp) ([]fileJob, error) {
+func planPackage(ctx context.Context, goBin string, opts Options, pkg *packages.Package, mutators []mutator.Mutator, typedPkgs map[string]*packages.Package, closurePkgs map[string][]*packages.Package, funcPattern *regexp.Regexp) ([]fileJob, error) {
 	if pkg.Module == nil || pkg.Module.Dir == "" {
 		return nil, nil
 	}
@@ -840,6 +1008,8 @@ func planPackage(ctx context.Context, goBin string, opts Options, pkg *packages.
 	if err != nil {
 		return nil, err
 	}
+
+	closure := planClosure(scope, closurePkgs, filepath.Dir(files[0]))
 
 	// Per-package, not run-wide, only when a selected operator implements
 	// mutator.TypedMutator: most jobs keep pkgMutators == mutators (the
@@ -876,6 +1046,7 @@ func planPackage(ctx context.Context, goBin string, opts Options, pkg *packages.
 			funcPattern: funcPattern,
 			mutantID:    opts.MutantID,
 			tceBaseline: tceBaseline,
+			closure:     closure,
 		}
 
 		if typedPkg != nil {
@@ -1003,6 +1174,7 @@ func mutateFile(ctx context.Context, run *runner, job *fileJob, sink *collector)
 		pkgDir:      filepath.Dir(path),
 		scope:       job.scope,
 		tceBaseline: job.tceBaseline,
+		closureDirs: job.closure,
 	}
 
 	// Computed once per file rather than per node/mutation: it depends only on

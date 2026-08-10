@@ -151,6 +151,29 @@ func TestParseScope(t *testing.T) {
 	}
 }
 
+func TestParseWorkspace(t *testing.T) {
+	t.Parallel()
+
+	for _, workspace := range []mutate.Workspace{mutate.WorkspaceCopy, mutate.WorkspaceWorktree} {
+		got, err := mutate.ParseWorkspace(workspace.String())
+		if err != nil {
+			t.Fatalf("ParseWorkspace(%q) error = %v", workspace, err)
+		}
+
+		if got != workspace {
+			t.Errorf("ParseWorkspace(%q) = %v, want %v", workspace.String(), got, workspace)
+		}
+	}
+
+	if _, err := mutate.ParseWorkspace("Worktree"); err == nil {
+		t.Error("ParseWorkspace(\"Worktree\") error = nil, want an error: the spellings are lower case")
+	}
+
+	if _, err := mutate.ParseWorkspace(""); err == nil {
+		t.Error("ParseWorkspace(\"\") error = nil, want an error")
+	}
+}
+
 // TestRunRejectsUnknownPackages checks that a bad pattern is an error rather
 // than an empty, apparently-successful run.
 func TestRunRejectsUnknownPackages(t *testing.T) {

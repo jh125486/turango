@@ -76,6 +76,16 @@ type mutant struct {
 	// because the baseline compile itself failed and the package was
 	// fail-soft demoted to running without TCE.
 	tceBaseline []byte
+
+	// closureDirs is the mutated package's forward dependency closure (see
+	// [resolveClosure]), computed once per package in [engine.planPackage]
+	// — non-nil only when scope is not [ScopeFull] and the closure was
+	// resolved safely. Nil means "use the whole-module copy" ([copyModule]
+	// or [copyWorktree]), either because scope is ScopeFull (where a
+	// forward closure is provably wrong — see ROADMAP.md gap 5) or because
+	// resolveClosure declined (a vendor/ directory, an embed directive, an
+	// unsafe replace target) and the caller must fall back.
+	closureDirs map[string]bool
 }
 
 // runner executes mutants one at a time, each in its own throwaway copy of the
@@ -88,6 +98,10 @@ type runner struct {
 
 	// testTimeout bounds a single mutant's test run.
 	testTimeout time.Duration
+
+	// workspace selects how each mutant's throwaway execution copy is
+	// built — see [workspaceFor].
+	workspace Workspace
 }
 
 // timeoutGrace is how long a mutant's process is allowed to overrun its
@@ -185,10 +199,12 @@ func (r *runner) run(ctx context.Context, m mutant) (result MutantResult, ok, eq
 
 	defer func() { _ = os.RemoveAll(tmp) }()
 
-	moduleDir, err := copyModule(tmp, m.moduleDir)
+	moduleDir, cleanup, err := r.workspaceFor(ctx, tmp, m.moduleDir, m.closureDirs)
 	if err != nil {
 		return MutantResult{}, false, false, err
 	}
+
+	defer cleanup()
 
 	rel, err := filepath.Rel(m.moduleDir, m.path)
 	if err != nil {
@@ -635,11 +651,170 @@ func copyModule(dst, moduleDir string) (string, error) {
 	return newModuleDir, nil
 }
 
+// workspaceFor builds one mutant's throwaway execution copy, choosing among
+// three strategies, and returns a cleanup func the caller must always call
+// once done with the workspace (in addition to, not instead of, the
+// caller's own tmp directory cleanup — see [copyWorktree]'s doc comment for
+// why both are needed).
+//
+// Precedence, and why: dirs — this mutant's package's pre-resolved
+// dependency closure (see [resolveClosure]) — wins first when non-nil.
+// A worktree always checks out the *whole* repository at HEAD, so it is not
+// a narrower alternative to a closure copy the way it is to [copyModule]; a
+// non-nil dirs already implies scope is not [ScopeFull] (see
+// [engine.planPackage]), and gap 5's own resolution is that a forward
+// closure is only ever correct under a narrower scope in the first place.
+// r.workspace's git-worktree option is only ever consulted when dirs is nil
+// — i.e. under [ScopeFull], or whenever the closure could not be safely
+// resolved for this package — and even then only actually used when
+// [copyWorktree] reports it created one; every other case, including
+// r.workspace being the zero value [WorkspaceCopy], falls back to
+// [copyModule] transparently. The caller never has to know which strategy
+// ran.
+func (r *runner) workspaceFor(ctx context.Context, tmp, moduleDir string, dirs map[string]bool) (root string, cleanup func(), err error) {
+	if dirs != nil {
+		root, err = copyClosure(tmp, moduleDir, dirs)
+
+		return root, func() {}, err
+	}
+
+	if r.workspace == WorkspaceWorktree {
+		if wtRoot, wtCleanup, ok := copyWorktree(ctx, tmp, moduleDir); ok {
+			return wtRoot, wtCleanup, nil
+		}
+	}
+
+	root, err = copyModule(tmp, moduleDir)
+
+	return root, func() {}, err
+}
+
+// copyWorktree builds a mutant's workspace with `git worktree add` instead
+// of a filesystem copy: a worktree shares the repository's object store
+// rather than duplicating files, and a sibling local replace-target module
+// already resolves via its real relative path with no rewriting needed,
+// since a worktree is the same repository checked out twice.
+//
+// ok reports whether a worktree was actually created; false means the
+// caller must fall back to [copyModule] — moduleDir is not inside a usable
+// git working tree (not a git repo at all, e.g. any corpus fixture under
+// corpus/*/module/, which is deliberately a plain directory per ROADMAP.md
+// gap 6's own "must never become a hard git dependency" note; or one with
+// uncommitted changes, see [gitWorktreeClean]).
+//
+// `git worktree add` checks out HEAD — the last *commit* — into wt, so the
+// returned root is only a faithful copy of moduleDir's current on-disk
+// content when the working tree is clean; that precondition is
+// [gitWorktreeClean]'s job, not this function's.
+//
+// The returned cleanup removes the worktree via `git worktree remove`, not
+// a plain filesystem delete: a worktree is registered in the parent
+// repository's .git/worktrees/ administrative area, and deleting only the
+// checkout directory would leave that entry dangling — harmless once, but
+// this runs per mutant, so an accumulating leak across a real run is not
+// hypothetical. A cleanup failure is silently ignored, the same as
+// copyModule's own os.RemoveAll(tmp) defer already does for its temp
+// directory; the caller's tmp-directory cleanup runs afterward regardless
+// and mops up whatever a failed `git worktree remove` left behind.
+func copyWorktree(ctx context.Context, dst, moduleDir string) (root string, cleanup func(), ok bool) {
+	repoRoot, gitOK := gitRepoRoot(ctx, moduleDir)
+	if !gitOK || !gitWorktreeClean(ctx, repoRoot) {
+		return "", nil, false
+	}
+
+	// moduleDir's path *within* the repository is asked of git directly
+	// (`--show-prefix`) rather than computed with filepath.Rel(repoRoot,
+	// moduleDir): on macOS, t.TempDir()-style paths under /var/... are
+	// themselves a symlink to /private/var/..., which `git
+	// rev-parse --show-toplevel` always resolves through, but a moduleDir
+	// handed to this function is not guaranteed to be pre-resolved the same
+	// way — comparing the two lexically with filepath.Rel silently produces
+	// a wrong relative path in that case, one that (by the coincidence of
+	// how many directory levels the mismatch costs) can even land back on
+	// moduleDir's own original files instead of the new worktree's copy.
+	// Asking git — which resolves both sides consistently, from the same
+	// -C moduleDir invocation — sidesteps the mismatch entirely.
+	rel, prefixOK := gitPrefix(ctx, moduleDir)
+	if !prefixOK {
+		return "", nil, false
+	}
+
+	wt := filepath.Join(dst, "wt")
+
+	//nolint:gosec // repoRoot/wt are turango-controlled paths, not user input.
+	if err := exec.CommandContext(ctx, "git", "-C", repoRoot, "worktree", "add", "--detach", "--quiet", wt, "HEAD").Run(); err != nil {
+		return "", nil, false
+	}
+
+	cleanup = func() {
+		//nolint:gosec // same as above.
+		_ = exec.CommandContext(context.WithoutCancel(ctx), "git", "-C", repoRoot, "worktree", "remove", "--force", wt).Run()
+	}
+
+	return filepath.Join(wt, filepath.FromSlash(rel)), cleanup, true
+}
+
+// gitRepoRoot resolves the git repository containing dir, or ok==false if
+// dir is not inside a git working tree at all.
+func gitRepoRoot(ctx context.Context, dir string) (root string, ok bool) {
+	//nolint:gosec // dir is turango-controlled (a resolved module directory), not user input.
+	out, err := exec.CommandContext(ctx, "git", "-C", dir, "rev-parse", "--show-toplevel").Output()
+	if err != nil {
+		return "", false
+	}
+
+	return strings.TrimSpace(string(out)), true
+}
+
+// gitPrefix reports dir's path relative to its repository's root, computed
+// by git itself (`--show-prefix`) rather than string-compared against
+// [gitRepoRoot]'s result — see [copyWorktree]'s doc comment for why that
+// comparison is unsafe. Empty string means dir is the repository root
+// itself, matching git's own convention for this flag.
+func gitPrefix(ctx context.Context, dir string) (rel string, ok bool) {
+	//nolint:gosec // dir is turango-controlled (a resolved module directory), not user input.
+	out, err := exec.CommandContext(ctx, "git", "-C", dir, "rev-parse", "--show-prefix").Output()
+	if err != nil {
+		return "", false
+	}
+
+	return strings.TrimSuffix(strings.TrimSpace(string(out)), "/"), true
+}
+
+// gitWorktreeClean reports whether repoRoot's working tree has no
+// uncommitted changes anywhere in it, not just under the mutated module.
+//
+// `git worktree add` checks out HEAD, never the on-disk working copy; if
+// repoRoot had any uncommitted edit — anywhere, not necessarily inside the
+// mutated module itself — a worktree-based mutant would silently run
+// against different source than [copyModule] would have copied. This
+// checks the whole repository rather than just the module directory
+// because an uncommitted edit outside the module but inside the same
+// module's build graph (a sibling package the mutated one imports) has the
+// identical exposure.
+func gitWorktreeClean(ctx context.Context, repoRoot string) bool {
+	//nolint:gosec // repoRoot is turango-controlled, not user input.
+	out, err := exec.CommandContext(ctx, "git", "-C", repoRoot, "status", "--porcelain").Output()
+
+	return err == nil && len(bytes.TrimSpace(out)) == 0
+}
+
 // closureDirs returns the set of same-module package directories pkg needs
 // to build and test *on its own*: pkg's own directory, plus every
 // same-module package it (transitively) imports. Standard-library and
 // other-module imports are excluded entirely — they resolve from the build
 // cache like any other build, no copying needed.
+//
+// closureDirs walks exactly the one *packages.Package it is given — it does
+// not know about, and cannot discover on its own, sibling variants of the
+// same target directory (a "[pkg.test]" test-augmented variant, or a
+// black-box "pkg_test" external test package). A caller that hands it only
+// the production variant gets a closure describing what the production code
+// needs, not what `go test` needs. [resolveClosure] is the entry point that
+// takes on assembling those variants into one root (see [mergeVariants])
+// before calling here — callers wanting a test-complete closure must go
+// through resolveClosure, not call closureDirs directly with a bare
+// production package.
 //
 // ok is false whenever the closure cannot be safely computed, or safely
 // copied narrower than the whole module — a package outside pkg's own
@@ -655,13 +830,10 @@ func copyModule(dst, moduleDir string) (string, error) {
 // ok==false is the existing full-module copyModule — never a
 // partially-resolved closure.
 //
-// NOT WIRED INTO THE ENGINE YET. See ROADMAP.md gap 5: activating this (having
-// [runner.run] call [copyClosure] instead of [copyModule] under
-// ScopePackage/ScopeImpact) is deliberately left as a separate, reviewable
-// step from landing the mechanism itself, given the correctness stakes of
-// getting the ScopeFull/narrower-scope boundary right — a wrong decision
-// here would silently misclassify a mutant's verdict, not just cost
-// performance.
+// Wired into the engine via [engine.planPackage]/[runner.workspaceFor],
+// gated to [ScopePackage]/[ScopeImpact] only — see ROADMAP.md gap 5 for why
+// applying this under [ScopeFull] would be provably wrong, not just a
+// missed optimisation.
 func closureDirs(pkg *packages.Package) (dirs map[string]bool, ok bool) {
 	if pkg.Module == nil || pkg.Module.Dir == "" {
 		return nil, false
@@ -743,28 +915,114 @@ func hasEmbedDirective(files []string) bool {
 	return false
 }
 
-// resolveClosure is [closureDirs] plus the two other reasons a narrower copy
+// resolveClosure is [closureDirs] plus three other reasons a narrower copy
 // isn't attempted for v1: a `vendor/` directory (vendored dependencies'
-// actual files may not live where the import graph says they do) or any
-// local `replace` directive (re-scoping replace-target copying to a partial
-// closure, and rewriting it, is real complexity this v1 does not take on —
-// see ROADMAP.md gap 5's design sketch). Either one means "fall back to
-// copyModule," the same as an unsafe [closureDirs] result.
-func resolveClosure(pkg *packages.Package) (dirs map[string]bool, ok bool) {
-	if pkg.Module == nil || pkg.Module.Dir == "" {
+// actual files may not live where the import graph says they do), any local
+// `replace` directive whose target lies outside the module (re-scoping
+// replace-target copying to a partial closure, and rewriting it, is real
+// complexity this v1 does not take on — see ROADMAP.md gap 5's design
+// sketch), or an in-module local `replace` whose target directory falls
+// outside the computed closure (see the loop below). Any of the three means
+// "fall back to copyModule," the same as an unsafe [closureDirs] result.
+//
+// pkgs is every go/packages variant of the target package relevant to
+// `go test`: the production package, and — when loaded with Tests:true —
+// its internal test-augmented variant ("pkg [pkg.test]") and any black-box
+// external test package ("pkg_test [pkg.test]"). Passing only the
+// production variant silently drops any same-module import that appears
+// solely in a _test.go file, including this project's own convention of a
+// separate "_test" package for black-box tests (see engine_test.go,
+// report_test.go): that package is a distinct *packages.Package with its
+// own Imports map, invisible to a walk that only ever sees the production
+// variant. A future caller wiring this in MUST pass all variants it loaded
+// for the target directory, not just the one matching the production
+// PkgPath — see [mergeVariants].
+func resolveClosure(pkgs ...*packages.Package) (dirs map[string]bool, ok bool) {
+	var moduleDir string
+
+	for _, p := range pkgs {
+		if p != nil && p.Module != nil && p.Module.Dir != "" {
+			moduleDir = p.Module.Dir
+
+			break
+		}
+	}
+
+	if moduleDir == "" {
 		return nil, false
 	}
 
-	if info, err := os.Stat(filepath.Join(pkg.Module.Dir, "vendor")); err == nil && info.IsDir() {
+	if info, err := os.Stat(filepath.Join(moduleDir, "vendor")); err == nil && info.IsDir() {
 		return nil, false
 	}
 
-	replaces, err := localReplaces(pkg.Module.Dir)
+	replaces, err := localReplaces(moduleDir)
 	if err != nil || len(replaces) > 0 {
 		return nil, false
 	}
 
-	return closureDirs(pkg)
+	dirs, ok = closureDirs(mergeVariants(pkgs))
+	if !ok {
+		return nil, false
+	}
+
+	// go.mod is copied unmodified into the narrower workspace (copyClosure
+	// does no replace rewriting, unlike copyModule's rewriteReplaces): an
+	// in-module replace directive is only safe to leave as-is if its target
+	// is itself part of the closure just computed, since only then is it
+	// guaranteed to exist at the same relative offset in the copy. The Go
+	// toolchain resolves a module's replace directives while loading the
+	// module graph regardless of whether the specific package under test
+	// needs them, so a dangling one is not merely wasted — it is a build
+	// failure for every mutant in the run, not just an inefficiency.
+	inModule, err := inModuleReplaceTargets(moduleDir)
+	if err != nil {
+		return nil, false
+	}
+
+	for _, target := range inModule {
+		if !dirs[target] {
+			return nil, false
+		}
+	}
+
+	return dirs, true
+}
+
+// mergeVariants combines every non-nil package in pkgs — assumed to be
+// go/packages variants of the same target directory — into one synthetic
+// root [closureDirs] can walk: their GoFiles/CompiledGoFiles pooled (so
+// [hasEmbedDirective] sees a black-box test file's `//go:embed` directive
+// too, not just the production file's), their Imports maps unioned (so a
+// same-module package imported only by a _test.go file ends up in the
+// closure), and their Errors concatenated (so an error on any variant marks
+// the whole thing unsafe, same as [closureDirs] already does for a single
+// package). Module is taken from the first variant that has one; PkgPath is
+// only used as [closureDirs]' recursion-root dedupe key, so which variant's
+// it ends up as does not matter.
+func mergeVariants(pkgs []*packages.Package) *packages.Package {
+	merged := &packages.Package{Imports: map[string]*packages.Package{}}
+
+	for _, p := range pkgs {
+		if p == nil {
+			continue
+		}
+
+		if merged.Module == nil {
+			merged.Module = p.Module
+		}
+
+		merged.PkgPath = p.PkgPath
+		merged.Errors = append(merged.Errors, p.Errors...)
+		merged.GoFiles = append(merged.GoFiles, p.GoFiles...)
+		merged.CompiledGoFiles = append(merged.CompiledGoFiles, p.CompiledGoFiles...)
+
+		for path, imp := range p.Imports {
+			merged.Imports[path] = imp
+		}
+	}
+
+	return merged
 }
 
 // copyClosure builds a workspace containing only dirs — pkg's forward
@@ -815,8 +1073,8 @@ func copyClosure(dst, moduleDir string, dirs map[string]bool) (string, error) {
 	return newModuleDir, nil
 }
 
-// copyDirFiles copies every regular file directly inside src — not
-// subdirectories — into dst.
+// copyDirFiles copies every regular file, and preserves every symlink (same
+// as copyTree), directly inside src — not subdirectories — into dst.
 func copyDirFiles(src, dst string) error {
 	entries, err := os.ReadDir(src)
 	if err != nil {
@@ -828,12 +1086,37 @@ func copyDirFiles(src, dst string) error {
 			continue
 		}
 
+		srcPath := filepath.Join(src, entry.Name())
+		dstPath := filepath.Join(dst, entry.Name())
+
+		if entry.Type()&fs.ModeSymlink != 0 {
+			link, err := os.Readlink(srcPath)
+			if err != nil {
+				return err
+			}
+
+			if err := os.MkdirAll(dst, 0o700); err != nil {
+				return err
+			}
+
+			//nolint:gosec // copying the developer's own trusted module into a temp workspace, not a multi-tenant or attacker-controlled path
+			if err := os.Symlink(link, dstPath); err != nil {
+				return err
+			}
+
+			continue
+		}
+
+		if !entry.Type().IsRegular() {
+			continue // sockets, devices, named pipes: nothing a build reads
+		}
+
 		info, err := entry.Info()
 		if err != nil {
 			return err
 		}
 
-		if err := copyFile(filepath.Join(src, entry.Name()), filepath.Join(dst, entry.Name()), info.Mode().Perm()); err != nil {
+		if err := copyFile(srcPath, dstPath, info.Mode().Perm()); err != nil {
 			return err
 		}
 	}
@@ -850,13 +1133,13 @@ type localReplace struct {
 	target string
 }
 
-// localReplaces reads moduleDir's go.mod and returns its filesystem-path
-// replace directives.
-//
-// Replacements pointing inside the module itself are ignored: they are copied
-// wholesale with the module and their relative paths still resolve, so
-// rewriting them would only risk breaking something that already works.
-func localReplaces(moduleDir string) ([]localReplace, error) {
+// parseReplaces reads moduleDir's go.mod and returns every replace directive
+// whose right-hand side is a filesystem path (per [isLocalPath]), each
+// resolved to an absolute, cleaned target directory — regardless of whether
+// that target lies inside or outside moduleDir. [localReplaces] and
+// [inModuleReplaceTargets] each filter this to the half they care about, so
+// the two agree on what counts as a "local" replace by construction.
+func parseReplaces(moduleDir string) ([]localReplace, error) {
 	path := filepath.Join(moduleDir, goModFile)
 
 	data, err := os.ReadFile(path)
@@ -885,16 +1168,66 @@ func localReplaces(moduleDir string) ([]localReplace, error) {
 			target = filepath.Join(moduleDir, target)
 		}
 
-		target = filepath.Clean(target)
-		if target == moduleDir || strings.HasPrefix(target, moduleDir+string(filepath.Separator)) {
-			continue
-		}
-
 		out = append(out, localReplace{
 			oldPath:    rep.Old.Path,
 			oldVersion: rep.Old.Version,
-			target:     target,
+			target:     filepath.Clean(target),
 		})
+	}
+
+	return out, nil
+}
+
+// isInModule reports whether target — already absolute and cleaned, as
+// [parseReplaces] produces it — lies at or under moduleDir.
+func isInModule(moduleDir, target string) bool {
+	return target == moduleDir || strings.HasPrefix(target, moduleDir+string(filepath.Separator))
+}
+
+// localReplaces returns [parseReplaces]' filesystem-path directives whose
+// target lies outside moduleDir — the ones [copyModule]'s rewriteReplaces
+// needs to repoint.
+//
+// Replacements pointing inside the module itself are excluded: under
+// copyModule they are copied wholesale with the module and their relative
+// paths still resolve, so rewriting them would only risk breaking something
+// that already works. [resolveClosure] cannot make that same assumption —
+// see [inModuleReplaceTargets].
+func localReplaces(moduleDir string) ([]localReplace, error) {
+	all, err := parseReplaces(moduleDir)
+	if err != nil {
+		return nil, err
+	}
+
+	var out []localReplace
+
+	for _, rp := range all {
+		if !isInModule(moduleDir, rp.target) {
+			out = append(out, rp)
+		}
+	}
+
+	return out, nil
+}
+
+// inModuleReplaceTargets returns the target directories of [parseReplaces]'
+// filesystem-path directives that DO lie inside moduleDir — the half
+// [localReplaces] excludes because [copyModule] copies them wholesale.
+// [resolveClosure] copies only a package's dependency closure, not the whole
+// module, so it cannot assume an in-module replace target was copied; it
+// checks each of these against the closure it computed instead.
+func inModuleReplaceTargets(moduleDir string) ([]string, error) {
+	all, err := parseReplaces(moduleDir)
+	if err != nil {
+		return nil, err
+	}
+
+	var out []string
+
+	for _, rp := range all {
+		if isInModule(moduleDir, rp.target) {
+			out = append(out, rp.target)
+		}
 	}
 
 	return out, nil

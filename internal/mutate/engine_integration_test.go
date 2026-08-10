@@ -16,6 +16,7 @@ package mutate_test
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -613,5 +614,76 @@ func TestRunWithTCEFiltersEquivalentMutant(t *testing.T) {
 
 	if !foundSurvivor {
 		t.Errorf("Run() without TCE: no MutantResult for %q, got %+v", tceDeadStoreDescription, without.Mutants)
+	}
+}
+
+// TestRunWorkspaceWorktreeMatchesCopy is ROADMAP.md gap 6's end-to-end
+// proof: the same fixture, mutated once with the default [mutate.WorkspaceCopy]
+// and once with [mutate.WorkspaceWorktree], must classify every mutant
+// identically. A git worktree is a different mechanism for building the
+// same execution copy, not a different scope or classification rule, so
+// any divergence here is a bug in the worktree path, not a legitimate
+// difference in verdict.
+func TestRunWorkspaceWorktreeMatchesCopy(t *testing.T) {
+	t.Parallel()
+
+	root := fixtureModule(t)
+	gitCommitFixture(t, root)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Minute)
+	defer cancel()
+
+	opts := mutate.Options{
+		Packages:    []string{"./..."},
+		Dir:         root,
+		Scope:       mutate.ScopePackage,
+		TestTimeout: 30 * time.Second,
+	}
+
+	copyResult, err := mutate.Run(ctx, opts)
+	if err != nil {
+		t.Fatalf("Run() with WorkspaceCopy error = %v", err)
+	}
+
+	opts.Workspace = mutate.WorkspaceWorktree
+
+	worktreeResult, err := mutate.Run(ctx, opts)
+	if err != nil {
+		t.Fatalf("Run() with WorkspaceWorktree error = %v", err)
+	}
+
+	if len(copyResult.Mutants) != len(worktreeResult.Mutants) {
+		t.Fatalf("mutant count: copy=%d worktree=%d, want equal", len(copyResult.Mutants), len(worktreeResult.Mutants))
+	}
+
+	copyKilled, copySurvived, copyNotViable := copyResult.Counts()
+	wtKilled, wtSurvived, wtNotViable := worktreeResult.Counts()
+
+	if copyKilled != wtKilled || copySurvived != wtSurvived || copyNotViable != wtNotViable {
+		t.Errorf("verdict counts differ: copy killed=%d survived=%d notViable=%d, worktree killed=%d survived=%d notViable=%d",
+			copyKilled, copySurvived, copyNotViable, wtKilled, wtSurvived, wtNotViable)
+	}
+}
+
+// gitCommitFixture turns root — an already-populated fixture module
+// directory — into a real, committed git repository, so
+// [mutate.WorkspaceWorktree] (which requires one, see runner.go's
+// gitWorktreeClean) has something real to work against.
+func gitCommitFixture(t *testing.T, root string) {
+	t.Helper()
+
+	for _, args := range [][]string{
+		{"init", "--quiet"},
+		{"config", "user.email", "turango-test@example.com"},
+		{"config", "user.name", "turango test"},
+		{"add", "-A"},
+		{"commit", "--quiet", "-m", "fixture"},
+	} {
+		//nolint:gosec // root and args are test-controlled, not external input.
+		cmd := exec.CommandContext(t.Context(), "git", append([]string{"-C", root}, args...)...)
+
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+		}
 	}
 }

@@ -24,21 +24,25 @@ are the load-bearing evidence for the eventual stdlib pitch:
 4. **Done.** Deterministic mutant IDs — a `-fuzz`-style content hash per
    mutant, so a specific mutant can be referenced in a comment, a
    regression test, or replayed directly via `-mutatemutant=<id>`.
-5. **Components built and tested; not wired in.** Dependency-closure
-   workspace copy — `copyModule` copies the whole module per mutant today,
-   not just the target package's actual build/test closure. The design
-   question the original sketch left open ("how does this interact with
-   `-mutatescope=full`?") turned out to have a hard answer, not a
-   preference: it doesn't, and must not — see the section below for why.
-   `closureDirs`/`resolveClosure`/`copyClosure`/`copyDirFiles` exist in
-   `internal/mutate/runner.go`, unit-tested, but nothing calls them yet.
-   Activating them (having `runner.run` call `copyClosure` instead of
-   `copyModule` under `ScopePackage`/`ScopeImpact`) is deliberately left as
-   its own step — a wrong decision on the `ScopeFull`/narrower-scope
-   boundary would silently misclassify a mutant's verdict, not just cost
-   performance, and that line is worth a human looking at before it goes
-   live.
-6. Git-worktree-based execution, strictly opt-in — a cheaper *mechanism* for
+5. **Done.** Dependency-closure workspace copy — `copyModule` used to copy
+   the whole module per mutant regardless of scope; under `ScopePackage`/
+   `ScopeImpact`, `runner.workspaceFor` now calls `copyClosure` with a
+   per-package closure resolved once by `engine.planClosure`/
+   `resolveClosure` (loaded test-aware via the new `engine.loadClosures`),
+   falling back to `copyModule`/`copyWorktree` automatically on any
+   uncertainty (a `vendor/` directory, a `//go:embed` directive, an unsafe
+   replace target, or `ScopeFull` itself, where a forward closure is
+   provably wrong — see the section below for why). Two real bugs an
+   independent review found before activation (a blackbox `_test.go`
+   package's imports being invisible to the closure walk; an in-module
+   `replace` target outside the closure not triggering fallback) were fixed
+   first — see the section below's "Independent review before activation."
+   Verified end to end: `TestRunWithImpactScope` (an existing integration
+   test, already running under `ScopeImpact`) now exercises this path for
+   real against a real module and passes; `TestWorkspaceForPrefersClosure
+   OverWorktree` proves the closure-over-worktree precedence directly.
+6. **Done.** Git-worktree-based execution, strictly opt-in (`-mutateworkspace=worktree`,
+   `Options.Workspace`) — a cheaper *mechanism* for
    the same copy step gap 5 addresses the *scope* of, only for users already
    inside a git repo; lower priority than gap 5 because it only benefits git
    users, whereas gap 5 benefits everyone the same way `-fuzz` does (no git
@@ -52,6 +56,19 @@ are the load-bearing evidence for the eventual stdlib pitch:
    mutex is invisible to a synctest bubble. Lowest priority of the seven:
    nothing in the collector is timing-dependent today, so there is nothing
    to synctest-test yet — this is a door to leave open, not a bug to fix.
+8. **Not started.** Benchmark mutation-testing overhead — real elapsed-time
+   numbers (not the anecdotal "17+ minutes" and "minutes" data points
+   scattered across PROGRESS.md today) for how much wall-clock a mutation
+   run adds over a plain `go test`, as a function of production KLOC and
+   test KLOC, across scope modes and TCE. Built on Go's own `testing.B`/
+   `go test -bench`/`benchstat` pipeline, not a bespoke script — matches
+   how turango itself extends `go test`. This is the actual cost side of
+   the `PROPOSAL.md` cost/benefit pitch, currently unquantified.
+9. **Not started.** Comment cleanup pass across the codebase and its docs —
+   five distinct sub-tasks (staleness audit, a verbosity-trim style
+   question, dead-code/stray-marker removal, format consistency, and
+   proper academic citations for named techniques like TCE) that should
+   not be treated as one mechanical task — see below for why.
 
 Each section below states the problem, the design decisions and their
 rationale, the exact files and functions touched, a build order, and how to
@@ -408,9 +425,11 @@ behavioral gap, because there was no behavioral difference to notice.
 `PROPOSAL.md`'s "Costs and risks" section already documents this as a known,
 only-partially-solved limitation.
 
-TCE (Kintis/Papadakis/Malevris et al., "Trivial Compiler Equivalence") is
-deliberately unsophisticated: compile both versions, compare the resulting
-object code, declare equivalent on a match. Per this project's own prior
+TCE ([Papadakis, Jia, Harman & Le Traon, "Trivial Compiler Equivalence: A
+Large Scale Empirical Study of a Simple, Fast and Effective Equivalent
+Mutant Detection Technique," ICSE'15][tce]) is deliberately unsophisticated:
+compile both versions, compare the resulting object code, declare
+equivalent on a match. Per this project's own prior
 research pass (referenced in the task framing), it should be **always-on**,
 unlike mutant subsumption (a *selection* technique that trades completeness
 for speed and should stay opt-in) — TCE is a *filtering* technique with no
@@ -495,6 +514,7 @@ same source unless specific conditions are controlled for:
 
 [go.dev/blog/rebuild]: https://go.dev/blog/rebuild
 [filippo-repro]: https://words.filippo.io/reproducing-go-binaries-byte-by-byte/
+[tce]: https://doi.org/10.1109/ICSE.2015.103
 
 **Genuinely unresolved — flagged, not papered over**: this project has not
 empirically verified that `go build -o` with `-trimpath` and a fixed
@@ -1077,9 +1097,150 @@ means this gap carries zero risk to the default scope by construction — a
 bug in the new closure logic can only ever affect `ScopePackage`/
 `ScopeImpact` runs, never the default.
 
+### Independent review before activation (findings 1 and 2 fixed; now wired in)
+
+**Verification status, updated 2026-08-10 (later the same day, post-reboot):
+the fixes below were re-verified from scratch this session** — `go build
+./...`, `go vet ./...`, `gofmt -l .` (clean except frozen `corpus/stdlib-*`
+fixtures, expected), `go tool -modfile=tools/golangci-lint/go.mod
+golangci-lint run` both with and without `--build-tags=integration` (0
+issues each), `go test ./...`, and `go test -tags=integration
+./internal/mutate/...` (which includes `TestRunWithImpactScope`, a real
+`ScopeImpact` run against a real module) — all clean, not just trusted from
+the prior session's self-report. **Activation itself landed the same
+session**: `engine.loadClosures`/`engine.planClosure` resolve each
+package's closure once (gated to non-`ScopeFull` runs, mirroring
+`needsTypes`' zero-cost-by-default shape), threaded onto `fileJob`/`mutant`
+as `closureDirs`, and `runner.workspaceFor` now tries `copyClosure` first
+when non-nil, before its existing worktree/copyModule fallback chain — see
+this document's summary list, item 5, and `runner.workspaceFor`'s own doc
+comment for the full three-way precedence.
+
+Per this section's own opening note, activating `runner.run`/`planPackage`
+to actually call `copyClosure` was deliberately withheld from an unattended
+session for review. That review happened (an independent pass over the
+unwired code, not by the same session that wrote it) and found two real
+correctness bugs — both in the "silently copy too little → spurious build
+failure → a real mutant misclassified `NotViable`" category this section's
+own risk framing worried about, and both invisible to the existing unit
+tests because every test fixture hand-builds a `*packages.Package` whose
+`Imports` already contains everything needed. A follow-up session fixed both,
+plus one of the two minor findings, and added the regression coverage the
+review called out as missing:
+
+1. **Fixed.** `closureDirs`/`resolveClosure` only walked `pkg.Imports`,
+   which is production-code-only unless the loader used `Tests: true` — and
+   even then, a blackbox test file (`package foo_test`) is a *separate*
+   `*packages.Package` whose imports were never merged into the one that
+   code walked. `resolveClosure` is now variadic (`pkgs
+   ...*packages.Package`) and merges every variant it's given — production,
+   `"pkg [pkg.test]"`, and `"pkg_test [pkg.test]"` — into one synthetic root
+   via the new `mergeVariants` before handing it to `closureDirs` (which
+   itself is unchanged: it still only ever walks the single root it's
+   given, and its doc comment now says so explicitly, pointing callers at
+   `resolveClosure` instead). `mergeVariants` also pools `GoFiles`/
+   `CompiledGoFiles` across variants, which incidentally fixes the "minor"
+   `hasEmbedDirective` finding below too: a `//go:embed` directive in a
+   black-box test file is now seen. **Residual risk, not eliminated**: this
+   moves the correctness requirement from "impossible to get right" to "the
+   future wiring code must actually load with `Tests: true` and pass every
+   variant it gets back for the target directory into `resolveClosure`,
+   not just the production one" — a caller contract now documented on
+   `resolveClosure`'s doc comment, but not something the type system
+   enforces. The new regression test
+   (`TestResolveClosure/a_black-box_test_package's_own_import_is_included`)
+   covers the external `"pkg_test"` shape specifically, since that's this
+   project's own default and the shape the original review traced the bug
+   through; it does not add a dedicated case for an *internal* test file's
+   import (the `"pkg [pkg.test]"` variant, a whitebox `_test.go` in
+   `package pkg` itself) — the merge mechanism treats every variant
+   identically with no special-casing per shape, so there is no reason to
+   expect it behaves differently, but that specific shape is asserted by
+   inference from `TestMergeVariants`' generic union coverage, not by a
+   dedicated `resolveClosure` case.
+2. **Fixed.** `resolveClosure` reused `copyModule`'s `localReplaces()` as
+   its only replace-directive bail-out check, but that function deliberately
+   filters out replace targets whose destination resolves *inside*
+   `moduleDir` (correct for `copyModule`, which copies the whole module so
+   those paths always exist regardless). `localReplaces` now shares parsing
+   with a new `parseReplaces`/`isInModule` pair, and a new
+   `inModuleReplaceTargets` returns the half `localReplaces` excludes;
+   `resolveClosure` checks each of those targets against the closure it just
+   computed and falls back to `copyModule` if any target isn't already part
+   of it. Covered by two new subtests: one where the in-module replace
+   target is outside the closure (falls back) and one where it's already
+   inside (resolves normally, proving the fix isn't just maximally
+   conservative).
+
+One minor finding fixed as part of the same change: `copyDirFiles` now
+preserves symlinks the way `copyTree` already does (`os.Readlink`/
+`os.Symlink` instead of transparently following the link and copying its
+target's content as a plain file), covered by an extended `TestCopyDirFiles`.
+The other minor finding (`hasEmbedDirective` scanning test files) was fixed
+as a side effect of finding 1's fix, described above.
+
+**Activation landed clean**: `engine.loadClosures` does load with `Tests:
+true` and hands every variant it gets back for a directory into
+`resolveClosure` via `engine.planClosure` — the caller obligation finding
+1's fix could only document, not enforce, is satisfied by the actual
+wiring code. Residual risk carried forward, not new: finding 1's "internal
+test-file variant" gap in dedicated test coverage (see above — only the
+external `pkg_test` shape has its own `TestResolveClosure` case) is
+unchanged by activation and still worth closing if this area is touched
+again.
+
 ---
 
 ## 6. Git-worktree-based execution (optional, opt-in only)
+
+**Status: done.** `-mutateworkspace=worktree` (`Options.Workspace`,
+`mutate.WorkspaceWorktree`), strictly opt-in as this section always
+required — the zero value (`Options{}`, and every existing caller before
+this change) is `WorkspaceCopy`, today's filesystem-copy behavior,
+completely unchanged. `internal/mutate/runner.go`'s `copyWorktree` builds
+each mutant's workspace with `git worktree add --detach` instead of a
+recursive copy when requested, falling back to `copyModule` automatically
+— not as an error — whenever the target isn't inside a *clean* git working
+tree (`gitWorktreeClean`: the whole repository, not just the mutated
+module, since `git worktree add` checks out HEAD, the last commit, never
+the on-disk working copy, so any uncommitted edit anywhere in the repo
+would otherwise be silently dropped from every mutant's workspace) or
+isn't inside a git repository at all (`gitRepoRoot`, ok=false for any
+plain directory — every `corpus/*/module/` fixture, deliberately not a git
+repo, keeps working exactly as before).
+
+One real bug found and fixed during implementation, not anticipated by
+this section's original design sketch: computing a worktree's
+module-relative path with `filepath.Rel(repoRoot, moduleDir)` is unsafe on
+macOS, where `t.TempDir()`-style paths under `/var/...` are themselves a
+symlink to `/private/var/...` that `git rev-parse --show-toplevel` always
+resolves through, but `moduleDir` as handed to this code is not guaranteed
+to be pre-resolved the same way — the lexical mismatch produced a wrong
+relative path that (via the arithmetic of `filepath.Join`'s `..`
+collapsing) could land back on the *original* module's files instead of
+the new worktree's copy, silently defeating the whole point without
+erroring. Fixed by asking git itself for the prefix (`git rev-parse
+--show-prefix`, run with the same `-C moduleDir` as the toplevel lookup,
+so both resolve consistently) instead of computing it with `filepath.Rel`.
+Caught by `TestCopyWorktree`/`TestWorkspaceForUsesWorktreeWhenRequested`
+actually asserting on the *content* of the checked-out `go.mod` and on
+`cleanup()` really removing the worktree directory, not just on `ok==true`
+— a weaker assertion would have passed against the bug.
+
+Cleanup uses `git worktree remove --force`, not a plain filesystem delete:
+a worktree is registered in the parent repository's `.git/worktrees/`
+administrative area, and this runs once per mutant, so leaving that entry
+dangling (as a bare `os.RemoveAll` on the checkout directory would) is a
+real accumulating leak across a run with any real mutant count, not a
+one-off. `TestRunWorkspaceWorktreeMatchesCopy` (integration-tagged) is the
+end-to-end proof this section's own scope note implies is needed: the same
+fixture, git-committed, mutated once under each workspace mode, must
+classify every mutant identically — a worktree is a different mechanism
+for the same execution copy, not a different verdict rule.
+
+Per the scope note below, this only ever addresses workspace-*setup* cost;
+it does nothing for the actual per-mutant `go build`/`go test` time, which
+still dominates a real run.
 
 ### Problem
 
@@ -1179,6 +1340,362 @@ verified by `-race`, which channels would not improve on.
   consumer goroutine), `Run` (starts the consumer, closes the channel after
   `execute`'s `errgroup.Wait()` returns), `execute`/`mutateFile`/`visitNode`
   (send on the channel instead of calling `sink.mutant`/`sink.suppression`).
+
+---
+
+## 8. Benchmark mutation-testing overhead
+
+### Problem
+
+`PROPOSAL.md` argues turango is worth upstreaming, but its "Costs and
+risks" section quantifies almost nothing about the actual cost side of
+that argument. The only timing data points anywhere in this repo are
+incidental and non-comparable: PROGRESS.md's "known limitation 1" notes
+turango's own `ScopeFull` dogfooding run took "17+ minutes" (and explains
+why — nested `go test ./...` re-runs, not a representative number for a
+normal target), and scattered mentions of "minutes" for `stdlib-crypto-aes`
+sweeps that were never even successfully captured (see PROGRESS.md's open
+corpus-provenance thread). Nobody has run a controlled comparison and
+written down "for a package this size, a full mutation run costs
+approximately this many multiples of one `go test` run." Without that, the
+stdlib pitch is asserting a qualitative benefit (catches real bugs — the
+phase-7 case studies) while leaving the quantitative cost an open question
+a reviewer will ask about immediately.
+
+### Design decisions
+
+**8a. Metric shape.** Report, per target package:
+
+- production KLOC and test KLOC (`gocloc`-or-equivalent line count of
+  non-`_test.go` vs. `_test.go` files — a `go build`/`go vet`-clean count,
+  not a hand estimate),
+- mutant count (`Result`'s own `Counts()`),
+- one baseline `go test` wall-clock time (`goTestSuite`'s existing 3-run
+  average is the right number to reuse here — see 8b),
+- total mutation-run wall-clock time, and
+- the ratio of the two (**mutation multiplier**) — the actual number worth
+  putting in a proposal doc, e.g. "a full-scope run costs roughly Nx one
+  `go test` invocation for a package this size."
+
+Report this once per **scope mode** (`full`/`package`/`impact`) and once
+with **TCE on vs. off**, since those are exactly the levers a user (or the
+stdlib pitch) would reach for to control cost, and neither has published
+numbers today either. Report at the parallelism level turango already
+recommends by default (`-mutateparallel` unset, i.e. file-level workers up
+to `NumCPU`) — a serial-vs-parallel comparison is worth one extra data
+point, not the focus.
+
+**8b. Use `go test -bench`, Go's own built-in benchmark suite — not a
+shell script.** This is idiomatic for this codebase specifically: turango
+*is* a `go test` extension, so measuring it with the standard
+`testing.B`/`go test -bench=...`/`benchstat` pipeline is the same "eat our
+own dog food" instinct that already produced the corpus regression harness
+(`TestCorpus`) rather than a bespoke checker. Concretely, a `BenchmarkMutate`
+function with one `b.Run(name, func(b *testing.B) {...})` subtest per
+`target x scope x TCE` combination, each calling `mutate.Run` in-process
+(not shelling out to a separately-built `turango` binary — this repo
+already links `internal/mutate` directly, so an in-process call is both
+faster to iterate on and avoids a stale-binary trap a shell script would
+risk).
+
+Because one iteration of `mutate.Run` against a real package is itself a
+full mutation sweep — seconds to minutes, not the microseconds `testing.B`
+is built to auto-calibrate `b.N` around — this must run with
+**`-benchtime=1x`** (a real, documented `go test` flag for exactly this
+"one call is already expensive" case, e.g. how the Go toolchain's own
+compiler benchmarks are run) rather than letting `testing.B` loop to fill a
+time budget. Statistical stability then comes from the standard
+`go test -bench=BenchmarkMutate -benchtime=1x -count=N` external-repeat
+convention (`benchstat`'s own docs recommend `-count=6` or more) feeding
+into `golang.org/x/perf/cmd/benchstat` for a proper before/after comparison
+(e.g. TCE on vs. off, or this gap's own future re-runs after an engine
+change) — a tool this project doesn't currently depend on, but whose whole
+job is exactly this comparison and is the standard companion to `go test
+-bench`, not a bespoke stats script.
+
+Per-target metadata (KLOC, test KLOC, mutant count, the mutation
+multiplier itself) is reported via `b.ReportMetric` as custom units
+alongside the built-in `ns/op` timing, so a single `go test -bench` run's
+output already carries everything `BENCHMARKS.md` needs — nothing to
+cross-reference from a separate JSON file by hand. `goTestSuite`'s existing
+3-run baseline average (the same number `-mutatetimeout`'s default already
+depends on) is still the right source for the "one `go test` run" baseline
+half of the multiplier — reused here, not recomputed by a second
+mechanism, whether that means reading it back off `Result` (adding a field
+if `report.go` doesn't already expose it) or, more simply, giving the
+benchmark its own `b.Run("baseline/"+target, ...)` sibling subtest that
+times a plain `go test` invocation of the same target the same way.
+
+**8c. Target selection — real code, a real range of sizes, and this is a
+human call, not an automated one.** The existing `corpus/` fixtures are the
+wrong instrument for this specific question: the 13 `op-*/` fixtures are
+deliberately tiny single-function files (systematic operator coverage, not
+size variety), and the `stdlib-*` fixtures are frozen *partial* files (a
+handful of functions each, not a whole real package with its whole real
+test suite) — see PROGRESS.md's corpus-provenance thread for exactly how
+narrow `stdlib-x509-pkix`/`stdlib-strconv-parseuint` are. Meaningful KLOC-vs-time
+numbers need a handful of **real, complete Go packages** spanning roughly
+small (~500 LOC), medium (~5K LOC), and large (~20K+ LOC) production code
+with their real test suites — `example/` and `example-legacy/` are useful
+as a sanity check (turango already dogfoods them) but are far too small to
+anchor a range on their own. **Picking the actual target packages is
+flagged as an open, human decision, not resolved here** — candidates should
+be permissively licensed, fast/non-flaky under `go test` (a flaky suite
+would corrupt the "3-run average" baseline the whole ratio depends on), and
+ideally already familiar from this project's own validation work (e.g. a
+complete stdlib package, not a hand-frozen excerpt of one, would also let
+this benchmark reuse groundwork from the phase-7 case studies).
+
+These targets should **not** live under `corpus/` — that directory's
+`Discover()`/`TestCorpus` pairing has one job, asserting exact mutant
+counts against a golden file, and a target chosen for benchmark realism
+(a real, complete package, not a tiny deterministic fixture) is a poor fit
+for that exact-count assertion. Recommend a sibling top-level
+`benchmark/targets/` directory instead, kept deliberately separate in
+purpose from `corpus/` even though the two may end up sharing a
+provenance mechanism — see below.
+
+How the target packages actually get into the repo is the same open
+question PROGRESS.md's corpus-provenance thread already raised and left
+unresolved (git submodules pinned to an exact upstream commit, for
+verifiable provenance, vs. a frozen local copy): don't silently duplicate
+that decision here. If submodules end up adopted for `corpus/`'s
+stdlib-sourced fixtures, `benchmark/targets/` choosing full, complete
+packages (rather than `corpus/`'s hand-trimmed excerpts) makes it if
+anything an *easier* submodule case, not a harder one — pin a commit, use
+the whole directory, no manual trimming to keep in sync.
+
+**8d. Where results are captured.** `go test -bench`'s own output — plus
+`benchstat`'s comparison tables when relevant (8b) — is already the
+standard, reproducible artifact; the discipline this repo should still add
+is committing a captured run rather than only describing the command,
+following the same precedent `example/README.md` already sets ("real
+re-run, not hand-edited", called out explicitly in PROGRESS.md when the
+operator count changed and that doc's numbers were regenerated). Recommend
+a new `BENCHMARKS.md` at repo root (parallel to `PROPOSAL.md`,
+`ROADMAP.md`) that is substantially a pasted `go test -bench=BenchmarkMutate
+-benchtime=1x -count=N` transcript, plus a short methodology section
+(machine spec, Go version, `-mutateparallel` value, date, the exact command
+run — the same "how would someone re-run this and get comparable numbers"
+transparency `PROPOSAL.md`'s 2026 stdlib re-validation section already
+models), and a pointer from `PROPOSAL.md`'s "Costs and risks" section into
+the real numbers instead of leaving that section qualitative.
+
+**8e. Honest scope limit.** This gap produces a snapshot on one machine at
+one point in time, not a durable regression-tracked benchmark suite (that
+would be a much larger undertaking — a `benchstat`-style tracked history —
+and isn't what's being asked for here). If the numbers turn out to vary a
+lot by package shape (e.g. a package with many small functions vs. one with
+a few large ones, at the same KLOC) rather than fitting a clean per-KLOC
+rate, the honest output is a table showing that variance, not a forced
+single formula — this mirrors gap 1's "don't oversell a heuristic" instinct
+and gap 2's "state what's genuinely unresolved" instinct elsewhere in this
+document.
+
+### Files/functions touched
+
+- New `benchmark/targets/` at repo root (see 8c) — real, complete target
+  packages, provenance mechanism TBD alongside `corpus/`'s open thread.
+- New `internal/mutate/mutate_bench_test.go` (whitebox naming per this
+  project's own test-convention rules only if it needs unexported access;
+  otherwise a blackbox `internal/mutate_test` bench file, same convention
+  every other test in this package already follows) — `BenchmarkMutate`,
+  `b.Run` subtests per target/scope/TCE combination, `b.ReportMetric` calls
+  for KLOC/test-KLOC/mutant-count/multiplier. Gated behind the same
+  `//go:build integration` tag the existing real-toolchain tests use (this
+  shells out to/links against the real `go test` toolchain against real
+  package sources, exactly the reason that tag exists today) — or a new,
+  even narrower tag if these targets are too heavy to run as part of the
+  existing `make test-integration` scope; flagged as an open call, not
+  decided here.
+- New `BENCHMARKS.md` at repo root (see 8d).
+- `internal/mutate/report.go` — only if the baseline `go test` time
+  `goTestSuite` computes (8b) isn't already surfaced on `Result`; check
+  before adding a field.
+- `PROPOSAL.md`'s "Costs and risks" section — updated to cite real numbers
+  instead of the current qualitative statement.
+- `go.mod` — `golang.org/x/perf` is the only new dependency this gap needs
+  (for `benchstat`), and only as a `go tool`-style tooling dependency
+  (mirroring `tools/golangci-lint/go.mod`'s separate-module pattern) if the
+  "stdlib + `golang.org/x/*` only" project policy (PROGRESS.md's dependency
+  cleanup note) is read as still wanting it isolated from the main module's
+  own `go.mod` — `golang.org/x/perf` is itself an `x/` package either way,
+  so it's in-policy regardless of which `go.mod` it lands in.
+
+### Build order
+
+1. Confirm whether `goTestSuite`'s baseline average is already exposed
+   anywhere in `Result`/`MutantResult`; add a field only if it's genuinely
+   missing (8b).
+2. Pick the target package set and provenance mechanism (8c) — human
+   decision, not automated; resolve alongside (or explicitly after,
+   without blocking on) `corpus/`'s own open submodule thread rather than
+   inventing a second, inconsistent answer.
+3. Write `BenchmarkMutate`; sanity-run one target at `-benchtime=1x
+   -count=1` by hand and confirm `b.ReportMetric`'s custom metrics actually
+   appear in `go test -bench` output the way expected — verify against the
+   real toolchain output, not assumed from `testing` package docs alone,
+   matching this project's habit of confirming CLI/flag behavior
+   empirically before relying on it (see PROGRESS.md's `-mutate`
+   redesign, which caught a real `go help testflag` mismatch the same way).
+4. Run the full matrix: `go test -tags=integration -bench=BenchmarkMutate
+   -benchtime=1x -count=6 ./internal/mutate/...`, piped through `benchstat`
+   for the TCE-on-vs-off and scope-mode comparisons.
+5. Write `BENCHMARKS.md` (captured transcript + methodology), update
+   `PROPOSAL.md`.
+
+### Verification
+
+- `BENCHMARKS.md`'s numbers must be reproducible by re-running the exact
+  committed `go test -bench` command against the committed (or clearly
+  cited, if external) target packages — not hand-typed into the doc, the
+  same standard `example/README.md` already holds itself to.
+- Sanity check: `impact` scope's total time must never exceed `package`
+  scope's, and `package` must never exceed `full`'s, for the same target —
+  a violation means something in the run was misconfigured (mirrors the
+  "full-scope must never report fewer mutants than package-scope" sanity
+  check already called out in PROGRESS.md's aes/base64 open thread).
+- `go vet`/`golangci-lint` must stay clean with the new bench file
+  in the tree even when the `integration` tag isn't passed — the same bar
+  every other integration-tagged file in this repo already clears.
+
+---
+
+## 9. Comment cleanup pass
+
+### Problem
+
+This codebase's comments have never had a dedicated pass — they accumulated
+build-order-by-build-order, across nine build phases plus every gap in this
+document, each session adding its own without auditing what earlier
+sessions already wrote. Five genuinely different problems have been folded
+into "clean up comments" so far, and they need separate treatment because
+they trade off against each other, not because any one of them is hard:
+
+**9a. Stale/inaccurate comments — a correctness pass, not a style
+change.** A comment that asserts something about the code that is no
+longer true is worse than no comment: it actively misleads the next
+reader. This is not hypothetical — this very session found and fixed a
+live example while wiring gap 5: `runner.go`'s `closureDirs` doc comment
+said, in bold, "NOT WIRED INTO THE ENGINE YET," which became false the
+moment gap 5's activation (this same session, above) landed. Two known
+sources of this pattern going forward:
+  - **Line-number references.** Several ROADMAP.md sections (gaps 1, 3, 5)
+    cite exact line numbers ("engine.go lines 175–207," "runner.go lines
+    96–178") that were accurate *at the time each section was written* —
+    gap 1's own preamble says so explicitly ("current as of this writing
+    ... re-check line numbers before implementing if the tree has moved
+    on"). Every gap landed since has shifted line numbers in both files.
+    These references should either be re-verified and corrected, or
+    deliberately converted to function-name-only references (`[runner.run]`
+    style godoc links, which this document already uses elsewhere and which
+    don't rot the same way).
+  - **"Not wired in" / "not started" / "TODO" style status markers left in
+    code comments** (as opposed to this document, where that framing is
+    the whole point) — any surviving in `internal/mutate/*.go` after gap 5's
+    wiring should be grepped for and re-checked, not just the one this
+    session happened to notice.
+
+**9b. Verbosity — a real style question, not a mechanical trim, and
+flagged as needing a human decision.** This project's comments are
+*deliberately* long and rationale-heavy by established, repeatedly
+reaffirmed convention — nearly every doc comment in `internal/mutate/` and
+every operator package leads with *why*, often citing the specific
+alternative that was rejected and why (e.g. `runner.go`'s `workspaceFor`,
+`resolveClosure`, every `planXxx` function in `engine.go`). This is not
+incidental sprawl; PROGRESS.md and this document's own writing style is the
+same way, on purpose, and CLAUDE.md-adjacent project convention has never
+pushed back on it — the opposite: findings sessions have repeatedly added
+*more* of this kind of comment as the right way to document a non-obvious
+design decision. "Clean up" read as "make comments shorter" would be a
+genuine reversal of that convention, not a cleanup, and shouldn't happen
+silently as a side effect of a pass framed as maintenance. If verbosity
+trimming is wanted, scope it explicitly and separately (e.g. "shorten
+comments over N lines that don't cite a rejected alternative or a
+concurrency/correctness hazard") rather than folding it into 9a's
+correctness pass, where the two goals would fight each other line by line.
+
+**9c. Dead code and stray markers.** Commented-out code blocks and
+`TODO`/`FIXME`/`XXX` markers are a different, genuinely mechanical class —
+find them (`grep -rn 'TODO\|FIXME\|XXX'`, plus a manual scan for
+commented-out statements, since those don't grep for a fixed token) and
+resolve each one (do the thing, file it as a ROADMAP item if it's real
+future work, or delete it if it's stale) rather than leaving it to rot
+silently. Low risk, unlike 9a/9b: nothing here is load-bearing prose,
+so a wrong call here just deletes or keeps a marker, not a claim about the
+code's behavior.
+
+**9d. Format/consistency.** Doc-comment format varies in minor ways across
+the codebase — this document's own `[Xxx]` godoc cross-reference style is
+used inconsistently between older gaps (1–4) and newer ones (5–7), and
+some files favor a single long paragraph per comment where others break
+into the "topic sentence, then rationale" shape most of `engine.go` and
+`runner.go` use today. Worth a pass, but genuinely cosmetic — lowest
+priority of the five, and the one most amenable to an automated or
+semi-automated sweep (`gofmt`/`golangci-lint` don't check comment prose
+style, so this stays a manual or LLM-assisted read-through, not a tool
+this project can add to CI the way `gofmt -l` already is).
+
+**9e. Missing or informal citations for named techniques — a real gap,
+not paranoia.** `PROPOSAL.md` sets the right bar in one place already: its
+"[Mull]" reference (`internal/mutate`'s stated prior-art comparison, cited
+in `PROPOSAL.md`) links directly to `https://arxiv.org/pdf/1908.01540`, a
+real, checkable paper. `ROADMAP.md` gap 2 does not hold itself to the same
+bar: TCE is introduced as `"Kintis/Papadakis/Malevris et al., 'Trivial
+Compiler Equivalence'"` — a title in quotes and three surnames, with no
+link, venue, or year, unlike the `[go.dev/blog/rebuild]`/`[filippo-repro]`
+citations two paragraphs below it in the very same section, which *are*
+properly linked. For a document whose explicit goal is an eventual stdlib
+proposal (`PROPOSAL.md`'s whole purpose), an unverifiable academic
+name-drop sitting next to properly-cited blog posts is a credibility gap a
+reviewer would notice immediately. Audit every named technique or paper
+reference across `PROPOSAL.md`/`ROADMAP.md`/code comments (TCE is the one
+confirmed instance; mutant subsumption is mentioned in gap 2's own text
+without citation either) and bring each one up to the `[Mull]`-link
+standard — a real DOI/arxiv/ACM/IEEE link, not just a re-statement of the
+technique's common name.
+
+### Why this is nine sub-decisions, not one task
+
+9a and 9c are safe to do mechanically and don't require asking anyone
+anything first. 9d is cosmetic and low-stakes either way. 9b is the one
+that actually needs a human answer before any comment gets shortened — the
+project's own established practice argues against it by default, so
+proceeding without an explicit "yes, actually trim" would be silently
+overriding a convention this project has reaffirmed repeatedly, not
+"cleaning up." 9e is scoped narrowly (citations only, not prose) and is
+safe to do without asking, provided each replacement citation is a real,
+checked link — inventing a plausible-looking arxiv ID would be strictly
+worse than the informal name-drop it replaced.
+
+### Build order
+
+1. 9a (staleness audit) and 9c (dead code/markers) first — mechanical,
+   safe, no style judgment call needed. Grep-driven; a fresh read-through
+   of every doc comment against the current code it describes is the only
+   way to catch 9a's line-number and status-marker rot, since neither greps
+   for a fixed pattern.
+2. 9e (citations) next — also safe to do without further sign-off, scoped
+   to references only.
+3. 9d (format consistency) — cosmetic, do last, since it's the easiest to
+   get subsumed by whatever 9b decides (a verbosity trim would itself
+   change format in the same files).
+4. 9b (verbosity) — **do not start without an explicit go-ahead**, separate
+   from the go-ahead for this gap as a whole; this document's own framing
+   above is the reason why.
+
+### Verification
+
+- `grep -rn 'TODO\|FIXME\|XXX'` across the repo (excluding frozen
+  `corpus/stdlib-*` fixture source, which is historical stdlib code and not
+  this project's to annotate) returns nothing unresolved.
+- Every `[Xxx]`-style godoc cross-reference actually resolves to a real,
+  currently-named symbol (`go doc` or `golangci-lint`'s own doc-link check,
+  if one is enabled, would catch a reference broken by a since-renamed
+  function).
+- Every citation added under 9e is a real, dereferenceable link, spot-checked
+  by actually opening it — the same standard this section holds the
+  *existing* `[Mull]` citation to.
 
 ---
 

@@ -93,6 +93,10 @@ func TestParseMutateFlagsValues(t *testing.T) {
 			t.Errorf("output = %q, want empty (no report)", cfg.output)
 		case cfg.hasMin:
 			t.Errorf("hasMin = true, want false (no gate)")
+		case cfg.options.TCE:
+			t.Errorf("TCE = true, want false")
+		case cfg.options.Workspace != mutate.WorkspaceCopy:
+			t.Errorf("Workspace = %v, want %v", cfg.options.Workspace, mutate.WorkspaceCopy)
 		}
 	})
 
@@ -108,6 +112,8 @@ func TestParseMutateFlagsValues(t *testing.T) {
 			"-mutateoutput=/tmp/reports",
 			"-mutatemin=0.75",
 			"-mutatemutant=a1b2c3d4e5f6",
+			"-mutatetce=true",
+			"-mutateworkspace=worktree",
 			"./internal/...",
 		})
 		if err != nil {
@@ -133,6 +139,10 @@ func TestParseMutateFlagsValues(t *testing.T) {
 			t.Errorf("min = %v, %v; want 0.75, true", cfg.min, cfg.hasMin)
 		case cfg.options.MutantID != "a1b2c3d4e5f6":
 			t.Errorf("MutantID = %q, want %q", cfg.options.MutantID, "a1b2c3d4e5f6")
+		case !cfg.options.TCE:
+			t.Errorf("TCE = false, want true")
+		case cfg.options.Workspace != mutate.WorkspaceWorktree:
+			t.Errorf("Workspace = %v, want %v", cfg.options.Workspace, mutate.WorkspaceWorktree)
 		}
 	})
 
@@ -245,6 +255,8 @@ func TestParseMutateFlagsErrors(t *testing.T) {
 		"empty mutant id":       {args: []string{"-mutate=.", "-mutatemutant="}, want: "mutatemutant"},
 		"uppercase mutant id":   {args: []string{"-mutate=.", "-mutatemutant=A1B2C3"}, want: "mutatemutant"},
 		"non-hex mutant id":     {args: []string{"-mutate=.", "-mutatemutant=not-hex!"}, want: "mutatemutant"},
+		"non-bool tce":          {args: []string{"-mutate=.", "-mutatetce=sometimes"}, want: "want true or false"},
+		"unknown workspace":     {args: []string{"-mutate=.", "-mutateworkspace=network"}, want: "unknown workspace"},
 		"leftover go test flag": {args: []string{"-mutate=.", "-v"}, want: "unsupported flag"},
 		"leftover before the flag": {
 			args: []string{"-count=1", "-mutate=."}, want: "unsupported flag",

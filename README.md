@@ -69,6 +69,7 @@ All of turango's own flags require the `-flag=value` form (a bare
 | `-mutatemin=<float>` | none | Exit with status 3 if the resulting mutation score falls below this threshold (0–1) — for CI gating. |
 | `-mutatemutant=<id>` | none | Replay exactly one mutant by the ID printed for it (in the console survivor listing or a JSON report's `MutantResult.ID`). The engine still walks every file and node — that part is cheap — but only the matching mutation is ever run, so the result holds at most one mutant. |
 | `-mutatetce=true\|false` | `false` | Trivial Compiler Equivalence: filter a mutant whose compiled output exactly matches a per-package baseline before it ever reaches the test suite, reporting it separately (see below) instead of as an ordinary survivor. Off by default — see "Filtering equivalent mutants" below for why. |
+| `-mutateworkspace=copy\|worktree` | `copy` | How each mutant's throwaway execution copy is built. `copy` recursively copies the module (works everywhere, no git dependency). `worktree` uses `git worktree add` instead, which shares the repository's object store rather than duplicating files — cheaper when the target module lives in a large git repo. Strictly opt-in and self-falling-back: requesting it against a target that isn't inside a clean git working tree (or isn't a git repo at all — every corpus fixture under `corpus/*/module/` is deliberately a plain directory) silently reverts to `copy`, never an error. |
 
 ### Filtering equivalent mutants: `-mutatetce`
 
@@ -123,6 +124,27 @@ turango test -mutatemutant=a1b2c3d4e5f6 -mutate=. ./pkg/...
 `-mutatemutant` narrows further to one exact mutant once mutation mode is
 already active.
 
+### Building each mutant's workspace: `-mutateworkspace`
+
+Every mutant runs against its own throwaway copy of the target module — the
+mutated file has to sit somewhere that isn't the real source tree, and the
+copy needs the whole module graph to resolve imports (sibling packages,
+`replace` directives, `vendor/`, `//go:embed` assets). By default (`copy`)
+that's a plain recursive filesystem copy. `-mutateworkspace=worktree` builds
+it with `git worktree add` instead: a worktree shares the repository's
+object store rather than duplicating files, so it's cheaper on a large git
+repo, and a local `replace` directive pointing at a sibling checkout already
+resolves correctly with no path rewriting needed, since a worktree is the
+same repository checked out twice.
+
+It's opt-in, not a smarter default, because it has a real precondition a
+filesystem copy doesn't: `git worktree add` checks out `HEAD`, the last
+*commit*, never the on-disk working copy. Requesting `worktree` against a
+target with any uncommitted change anywhere in the repository (not just
+under the mutated package) — or against a target that isn't a git
+repository at all — falls back to `copy` on its own, silently and safely,
+so it's never wrong to ask for it; it just doesn't always help.
+
 ### Suppressing a mutant: `//nomutant`
 
 A `//nomutant` (or `//nomutant: reason`) comment above a statement excludes
@@ -162,11 +184,13 @@ but not built.
 ## Architecture
 
 Mutant generation and collection, end to end. Results are collected into one
-`*Result` by a mutex-protected `collector`, not channels — the worker pool is
-file-level (`errgroup`, bounded by `-mutateparallel`), and each file's walk
-is strictly sequential internally since a file's mutants share one AST that
-is mutated in place and reverted between mutants, so there's no producer
-fan-in that a channel would actually simplify.
+`*Result` by a single consumer goroutine draining three channels (mutants,
+suppressions, TCE-filtered equivalents) — not a mutex — so the pipeline
+stays `testing/synctest`-visible for future scheduling tests (see
+`ROADMAP.md` gap 7); the worker pool itself is file-level (`errgroup`,
+bounded by `-mutateparallel`), and each file's walk is strictly sequential
+internally since a file's mutants share one AST that is mutated in place
+and reverted between mutants.
 
 ```mermaid
 flowchart TD
@@ -175,27 +199,31 @@ flowchart TD
 
     Run --> Load["load(): go/packages.Load"]
     Run --> Baseline["resolveTimeout(): time the real suite 3x, scale by CPU count"]
-    Run --> Plan["plan()/planPackage(): one fileJob per file"]
+    Run --> Plan["plan()/planScope()/planTCEBaseline(): one fileJob per file"]
     Plan --> Pool["execute(): errgroup worker pool, bounded by -mutateparallel"]
 
     subgraph Worker["one goroutine per file, bounded"]
         MF["mutateFile(): parse once, scan //nomutant, print baseline"]
         MF --> Walk["ast.Inspect walk"]
         Walk --> VN["visitNode(): per AST node"]
-        VN -->|func pattern mismatch or suppressed| Skip["skip subtree, record suppression"]
+        VN -->|func pattern mismatch or suppressed| Skip["skip subtree, send on suppressions channel"]
         VN -->|operator.Applies| Mut["for each Mutate() result: compute mutantID"]
         Mut -->|-mutatemutant set, no match| NextMut["skip this mutation"]
         Mut --> RR["runner.run(): apply, print, diff against baseline"]
         RR -->|byte-identical| NoOp["not a real mutant, dropped"]
-        RR -->|real change| Copy["copyModule(): throwaway workspace copy"]
-        Copy --> GoTest["exec real go test (scope-limited args, derived timeout)"]
+        RR -->|real change| Copy["workspaceFor(): copyModule, or copyWorktree if -mutateworkspace=worktree and the target is a clean git repo"]
+        Copy --> TCE{"-mutatetce=true?"}
+        TCE -->|compiled output matches baseline| SendEq["send on equivalents channel"]
+        TCE -->|different, or TCE off| GoTest["exec real go test (scope-limited args, derived timeout)"]
         GoTest --> Classify["classify(): killed / survived / not-viable"]
-        Classify --> Collect["collector.mutant(): mutex-protected append"]
+        Classify --> SendMut["send on mutants channel"]
     end
 
     Pool --> Worker
-    Collect --> Sorted["collector.sorted(): stable sort by file, line, operator, description"]
-    Sorted --> Report["Result: console WriteSummary / JSON via -mutateoutput"]
+    SendMut --> Consumer["collector's consumer goroutine: append + sort by file, line, operator, description"]
+    SendEq --> Consumer
+    Skip --> Consumer
+    Consumer --> Report["Result: console WriteSummary / JSON via -mutateoutput"]
 ```
 
 ## Try it

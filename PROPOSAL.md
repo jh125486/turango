@@ -13,7 +13,12 @@ fuzzing was added as `-fuzz`: not a separate tool bolted onto the ecosystem,
 but a first-class peer of `-run`/`-bench`/`-fuzz` that reuses the existing
 test-running machinery and workflow developers already know. A working,
 validated prototype — [turango](https://github.com/jh125486/turango) — exists
-and is the basis for this proposal.
+and is the basis for this proposal. Turango is a reference implementation
+with only mild, well-understood cost controls (scope narrowing, a
+baseline-derived timeout, worker-pool parallelism, opt-in TCE and
+dependency-closure copying) — it argues the *mechanism* belongs in the
+standard toolchain, not that this is the most efficient possible
+implementation of it; see "Costs and risks" below.
 
 Mutation testing measures test-suite *quality*, not code coverage. It
 mechanically introduces small, individually reversible changes ("mutants")
@@ -308,6 +313,27 @@ score threshold are all now implemented, none of them present in 2018.
   wrong-identifier-substitution shape (as in `strconv#21278`) requires
   `go/types` and has no operator yet — stated as a known limitation, not a
   blocker.
+- **Turango is a working example with mild optimizations, not a
+  state-of-the-art mutation-testing engine — deliberately.** Everything it
+  does to control cost today is a well-understood, conservative technique:
+  narrower test scopes, a measured (not guessed) per-mutant timeout,
+  file-level parallelism, and two opt-in, correctness-preserving filters
+  (TCE, dependency-closure workspace copying). It does *not* attempt
+  several techniques the mutation-testing research literature treats as
+  standard for reducing cost at scale — mutant subsumption / selective
+  mutation (running a reduced, representative subset of mutants instead of
+  every one an operator offers — noted but explicitly deferred in
+  ROADMAP.md gap 2's own TCE discussion), higher-order mutation, ML-guided
+  mutant prioritization or kill prediction, or diff-scoped incremental
+  mutation testing keyed to what actually changed rather than a whole
+  package. None of these are built, and none are needed to validate this
+  proposal's core claim: that the mutate-rerun-classify mechanism itself
+  belongs in the standard toolchain the way `-fuzz` does. A stdlib
+  implementation is free to adopt any of them later without revisiting
+  this proposal's mechanism — this prototype's job is proving the
+  mechanism is worth having, not being the fastest possible realization of
+  it. (No cost numbers exist yet either way — see ROADMAP.md gap 8,
+  benchmarking, not yet started.)
 
 ## Open questions
 

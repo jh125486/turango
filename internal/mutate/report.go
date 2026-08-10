@@ -45,7 +45,7 @@ func (s Status) String() string {
 	case NotViable:
 		return "not-viable"
 	default:
-		return "unknown"
+		return unknownSpelling
 	}
 }
 
