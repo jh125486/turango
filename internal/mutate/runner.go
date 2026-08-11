@@ -87,6 +87,41 @@ type mutant struct {
 	// resolveClosure declined (a vendor/ directory, an embed directive, an
 	// unsafe replace target) and the caller must fall back.
 	closureDirs map[string]bool
+
+	// cacheFingerprint is this mutant's package's once-per-package content
+	// fingerprint for ROADMAP.md gap 12's persistent verdict cache (see
+	// [cacheFingerprint], [engine.planCacheFingerprint]) — empty whenever
+	// [Options.CacheDir] is unset. Combined with the other cacheKey fields
+	// in [mutant.cacheKey].
+	cacheFingerprint string
+
+	// tceEnabled mirrors [Options.TCE] verbatim — see [fileJob.tceEnabled]
+	// for why this is threaded separately from tceBaseline rather than
+	// derived from tceBaseline != nil.
+	tceEnabled bool
+
+	// replay reports whether this run is replaying exactly one mutant via
+	// -mutatemutant=<id> ([Options.MutantID] set). A replay's whole purpose
+	// is to reproduce a specific mutant against a real `go test` run, so it
+	// always bypasses a cache *read* (ROADMAP.md gap 12f) — but its
+	// freshly-confirmed verdict is still written through afterward, same as
+	// any other mutant's, since there is no reason it shouldn't benefit a
+	// later normal run's cache hit rate.
+	replay bool
+}
+
+// cacheKey assembles m's compound cache key (ROADMAP.md gap 12a) for
+// toolchain, the run's resolved toolchain identifier (see
+// [resolveToolchain]). Every field here must match for a cache lookup to be
+// trusted — see [cacheKey]'s own doc comment for why each one is present.
+func (m mutant) cacheKey(toolchain string) cacheKey {
+	return cacheKey{
+		Toolchain:   toolchain,
+		Scope:       m.scope.String(),
+		TCE:         m.tceEnabled,
+		Fingerprint: m.cacheFingerprint,
+		MutantID:    m.id,
+	}
 }
 
 // runner executes mutants one at a time, each in its own throwaway copy of the
@@ -103,6 +138,24 @@ type runner struct {
 	// workspace selects how each mutant's throwaway execution copy is
 	// built — see [workspaceFor].
 	workspace Workspace
+
+	// cache is the read-only index of a prior run's cache file (ROADMAP.md
+	// gap 12), nil whenever [Options.CacheDir] is unset or loading it
+	// failed (fail-soft — see [engine.Run]'s wiring). A nil *cacheIndex's
+	// own get method already answers every lookup with ok==false, so run
+	// need only guard the fast path with cache != nil, not thread a
+	// separate "is caching on" bool alongside it.
+	cache *cacheIndex
+
+	// store is the cache's write half, nil under the identical conditions
+	// cache is. Every verdict run.run produces, cache hit or not, is
+	// written through it when non-nil — see run.run's own two record call
+	// sites.
+	store *cacheStore
+
+	// toolchain is the resolved toolchain identifier ([resolveToolchain])
+	// every mutant's cacheKey is built with, resolved once per run.
+	toolchain string
 }
 
 // timeoutGrace is how long a mutant's process is allowed to overrun its
@@ -203,6 +256,22 @@ func (r *runner) run(ctx context.Context, m mutant) (result MutantResult, ok, eq
 		return result, true, false, nil
 	}
 
+	// ROADMAP.md gap 12e: strictly earlier than TCE's own insertion point
+	// below, since a cache hit must skip the workspace copy too, not just
+	// the `go test` call. m.replay bypasses the read unconditionally — see
+	// mutant.replay's own doc comment — but the ScopeImpact shortcut just
+	// above is deliberately left outside caching entirely (it is already
+	// zero-cost, never spawns a subprocess, so caching it would add
+	// complexity for no benefit) and so is the syntactic no-op check
+	// earlier in this function (a cache hit already requires an identical
+	// Fingerprint, which by construction means the exact bytes that
+	// produced this determination originally, so the walk's own
+	// syntactic-no-op filtering already reproduces deterministically on a
+	// fingerprint match).
+	if hitResult, hitOK, hitEquivalent, hit := r.cacheLookup(m, result); hit {
+		return hitResult, hitOK, hitEquivalent, nil
+	}
+
 	args, err := m.testArgs()
 	if err != nil {
 		return MutantResult{}, false, false, err
@@ -238,6 +307,12 @@ func (r *runner) run(ctx context.Context, m mutant) (result MutantResult, ok, eq
 	// mutant whose compiled output matches the baseline byte-for-byte never
 	// reaches r.goTest at all.
 	if isTCEEquivalent(ctx, r.goBin, moduleDir, m) {
+		// Written through unconditionally on m.replay (ROADMAP.md gap 12f):
+		// a replay run's freshly-confirmed verdict still benefits a later
+		// normal run's cache hit rate, even though replay itself never
+		// reads the cache.
+		r.cacheWrite(cacheRecord{Key: m.cacheKey(r.toolchain), Equivalent: true})
+
 		return result, false, true, nil
 	}
 
@@ -254,12 +329,60 @@ func (r *runner) run(ctx context.Context, m mutant) (result MutantResult, ok, eq
 		result.Status = Killed
 		result.Output = truncate(string(stdout) + string(stderr) + "\nturango: mutant exceeded the per-mutant timeout")
 
+		r.cacheWrite(cacheRecord{Key: m.cacheKey(r.toolchain), Status: result.Status, Output: result.Output})
+
 		return result, true, false, nil
 	}
 
 	result.Status, result.Output = classify(stdout, stderr)
 
+	r.cacheWrite(cacheRecord{Key: m.cacheKey(r.toolchain), Status: result.Status, Output: result.Output})
+
 	return result, true, false, nil
+}
+
+// cacheLookup consults r.cache for m's verdict (ROADMAP.md gap 12e),
+// building on the result skeleton run has already populated
+// (ID/File/Line/Operator/Description/Before/After — every field a cache
+// record itself does not carry, per cacheRecord's own doc comment on why
+// it deliberately minimizes what it trusts from disk).
+//
+// hit reports whether a cache record existed at all; run's caller only
+// ever needs to branch on hit, not re-derive it from ok/equivalent, since
+// a genuine cache miss must fall through to the real go test path exactly
+// like caching was never requested. When hit is true, out is the complete
+// MutantResult a caller can return immediately: Status/Output are filled
+// in from the record for an ordinary verdict, or left at their zero values
+// when equivalent is true (mirroring the TCE-equivalent return shape
+// r.run's own isTCEEquivalent branch produces).
+func (r *runner) cacheLookup(m mutant, result MutantResult) (out MutantResult, ok, equivalent, hit bool) {
+	if r.cache == nil || m.replay {
+		return result, false, false, false
+	}
+
+	rec, found := r.cache.get(m.cacheKey(r.toolchain))
+	if !found {
+		return result, false, false, false
+	}
+
+	if rec.Equivalent {
+		return result, false, true, true
+	}
+
+	result.Status, result.Output = rec.Status, rec.Output
+
+	return result, true, false, true
+}
+
+// cacheWrite appends rec through r.store when caching is active, a no-op
+// otherwise — the single guard every one of run's write call sites shares,
+// factored out purely to keep run's own branching manageable (ROADMAP.md
+// gap 12e's two write call sites plus the equivalent-branch one), not a
+// behavioural change from writing r.store.record(rec) inline at each site.
+func (r *runner) cacheWrite(rec cacheRecord) {
+	if r.store != nil {
+		r.store.record(rec)
+	}
 }
 
 // renderNode prints node's source text, or "" with a nil error if node

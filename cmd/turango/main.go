@@ -64,6 +64,7 @@ const (
 	flagTCE       = "mutatetce"
 	flagWorkspace = "mutateworkspace"
 	flagEstimate  = "mutateestimate"
+	flagCache     = "mutatecache"
 )
 
 // flagArgsSeparator is go test's own "-args" boundary: everything after it
@@ -74,7 +75,7 @@ const flagArgsSeparator = "-args"
 // mutateFlags is the recognised set, in the order they are documented.
 var mutateFlags = []string{
 	flagMutate, flagScope, flagOperators, flagParallel, flagTimeout, flagOutput, flagMin, flagMutant, flagTCE,
-	flagWorkspace, flagEstimate,
+	flagWorkspace, flagEstimate, flagCache,
 }
 
 // reportFile is the name of the JSON report written into -mutateoutput.
@@ -404,19 +405,20 @@ func parseMutateFlags(args []string) (cfg mutateConfig, found bool, err error) {
 		return mutateConfig{}, false, nil
 	}
 
-	// -mutateoutput/-mutatemin are rejected outright rather than silently
-	// becoming no-ops: estimate mode classifies nothing, so there is no
-	// report for -mutateoutput to write and no score for -mutatemin to gate
-	// on. Erroring here matches this project's standing convention of
-	// rejecting a flag combination that cannot do what it looks like it
-	// does (see, e.g., an unrecognised go test flag just below, or an
-	// unknown -mutateoperators name) rather than letting it quietly
-	// misbehave — see ROADMAP.md gap 11's "Files/functions touched" note on
-	// main.go.
-	if cfg.estimate && (cfg.output != "" || cfg.hasMin) {
+	// -mutateoutput/-mutatemin/-mutatecache are rejected outright rather
+	// than silently becoming no-ops: estimate mode classifies nothing, so
+	// there is no report for -mutateoutput to write, no score for
+	// -mutatemin to gate on, and no verdict for -mutatecache to persist or
+	// reuse (ROADMAP.md gap 12h). Erroring here matches this project's
+	// standing convention of rejecting a flag combination that cannot do
+	// what it looks like it does (see, e.g., an unrecognised go test flag
+	// just below, or an unknown -mutateoperators name) rather than letting
+	// it quietly misbehave — see ROADMAP.md gap 11's "Files/functions
+	// touched" note on main.go.
+	if cfg.estimate && (cfg.output != "" || cfg.hasMin || cfg.options.CacheDir != "") {
 		return mutateConfig{}, false, fmt.Errorf(
-			"turango: -%s and -%s have no effect on -%s=true: nothing is classified in estimate mode, so there is no report to write and no score to gate on",
-			flagOutput, flagMin, flagEstimate)
+			"turango: -%s, -%s and -%s have no effect on -%s=true: nothing is classified in estimate mode, so there is no report to write, no score to gate on, and no verdict to cache",
+			flagOutput, flagMin, flagCache, flagEstimate)
 	}
 
 	var packages []string
@@ -513,6 +515,8 @@ func (c *mutateConfig) set(name, value string) error {
 		return c.setWorkspace(value)
 	case flagEstimate:
 		return c.setEstimate(value)
+	case flagCache:
+		return c.setCache(value)
 	}
 
 	return nil
@@ -664,6 +668,34 @@ func (c *mutateConfig) setEstimate(value string) error {
 	}
 
 	c.estimate = estimate
+
+	return nil
+}
+
+// setCache validates and stores -mutatecache: a directory holding a
+// persistent JSON-Lines cache of mutant verdicts (ROADMAP.md gap 12),
+// reused on a later run against unchanged source instead of re-executing
+// `go test` for every mutant that already has a trustworthy cached
+// verdict. Empty/absent means disabled, mirroring every other opt-in
+// feature's zero-value convention (see setTCE) — there is no meaningful
+// "cache enabled with no location" state to distinguish, which is why this
+// mirrors -mutateoutput's directory-value-is-the-toggle shape (setOutput)
+// rather than needing a separate boolean flag the way -mutatetce does.
+//
+// Unlike -mutateoutput, this writes directly into c.options.CacheDir
+// rather than a separate mutateConfig field: caching must affect
+// mutate.Run's own internal execution (skip a mutant's `go test` on a
+// cache hit, write incrementally as verdicts are produced), not something
+// main.go can layer on after Run returns the way -mutateoutput does — see
+// ROADMAP.md gap 12b. -mutatecache combined with -mutatemutant is
+// deliberately accepted, not rejected — see ROADMAP.md gap 12f: a replay
+// still benefits from, and contributes to, the cache.
+func (c *mutateConfig) setCache(value string) error {
+	if value == "" {
+		return fmt.Errorf("turango: -%s= requires a directory", flagCache)
+	}
+
+	c.options.CacheDir = value
 
 	return nil
 }

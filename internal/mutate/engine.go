@@ -238,6 +238,23 @@ type Options struct {
 	// The zero value is [WorkspaceCopy] — today's existing filesystem-copy
 	// behaviour, unchanged. See ROADMAP.md gap 6.
 	Workspace Workspace
+
+	// CacheDir persists every mutant's verdict to a JSON-Lines file
+	// (mutate-cache.jsonl) inside this directory, and reuses those verdicts
+	// on a later run against unchanged source instead of re-executing
+	// `go test` for every mutant that already has a trustworthy cached
+	// verdict. Empty means disabled — the zero-value-is-safe convention
+	// every other opt-in feature in this project already follows (TCE,
+	// dependency-closure copying, git-worktree execution).
+	//
+	// The cache key is not MutantID alone: a same-position, same-width
+	// literal/identifier edit produces an identical MutantID for genuinely
+	// different code, so a scope-appropriate content fingerprint (reusing
+	// gap 5's dependency-closure machinery), Scope, TCE and a toolchain
+	// identifier are all folded in too — see ROADMAP.md gap 12a for the
+	// full reasoning and the concrete example that rules out MutantID
+	// alone.
+	CacheDir string
 }
 
 // baselineRuns is how many times the unmutated suite is timed before a run.
@@ -327,7 +344,36 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 		return nil, err
 	}
 
-	run := &runner{goBin: goBin, testTimeout: timeout, workspace: opts.Workspace}
+	// Persistent verdict cache (ROADMAP.md gap 12), resolved only when
+	// requested: a toolchain fingerprint, a read-only index loaded once
+	// before any worker starts (12d), and a single-consumer append-only
+	// writer opened once and closed once, right after execute() returns —
+	// mirroring exactly how sink is opened before, and closed after, the
+	// same call, just below. All three steps are fail-soft: a load/open
+	// error here just disables caching for this run entirely, the same
+	// zero-risk-to-correctness precedent loadClosures already sets for its
+	// own load failure a few lines up — a cache is always an optional
+	// speed-up over doing the real work, never something a run depends on
+	// to be correct.
+	var (
+		cache     *cacheIndex
+		store     *cacheStore
+		toolchain string
+	)
+
+	if opts.CacheDir != "" {
+		toolchain, _ = resolveToolchain(ctx, goBin)
+
+		if idx, cacheErr := loadCacheIndex(cachePath(opts.CacheDir)); cacheErr == nil {
+			cache = idx
+		}
+
+		if s, cacheErr := newCacheStore(cachePath(opts.CacheDir)); cacheErr == nil {
+			store = s
+		}
+	}
+
+	run := &runner{goBin: goBin, testTimeout: timeout, workspace: opts.Workspace, cache: cache, store: store, toolchain: toolchain}
 
 	jobs, err := plan(ctx, goBin, opts, pkgs, mutators, typedPkgs, closurePkgs, funcPattern, false)
 	if err != nil {
@@ -336,6 +382,15 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 
 	sink := newCollector()
 	runErr := execute(ctx, run, jobs, opts.parallel(), sink, nil)
+
+	if store != nil {
+		// The write error, if any, is deliberately dropped rather than
+		// surfaced: a cache write/sync failure is never a reason to fail an
+		// otherwise-complete run (see cacheStore.close's own doc comment) —
+		// the same fail-soft treatment this whole block already gives the
+		// load/open steps above.
+		_ = store.close()
+	}
 
 	return sink.close(), runErr
 }
@@ -1113,6 +1168,23 @@ type fileJob struct {
 	// see [runner.workspaceFor].
 	closure map[string]bool
 
+	// cacheFingerprint is the package's once-per-package content
+	// fingerprint for ROADMAP.md gap 12's persistent verdict cache (see
+	// planCacheFingerprint), empty whenever [Options.CacheDir] is unset.
+	// Threaded through to every [mutant] the package produces, alongside
+	// tceEnabled below, so mutant.cacheKey can assemble the full compound
+	// key gap 12a describes.
+	cacheFingerprint string
+
+	// tceEnabled mirrors [Options.TCE] verbatim, threaded per job rather
+	// than read from Options at the point of use. Deliberately distinct
+	// from tceBaseline being non-nil: tceBaseline already means something
+	// narrower ("TCE requested *and* this package's baseline compile
+	// succeeded"), and a cache key built from tceBaseline!=nil would
+	// silently mix a run whose baseline compile happened to fail this time
+	// into the TCE=false bucket — see ROADMAP.md gap 12a.
+	tceEnabled bool
+
 	// typedFset and typedSyntax are the FileSet and already-parsed,
 	// already-type-checked syntax tree for path, set only when mutators
 	// above was bound against type information. mutateFile uses these
@@ -1158,8 +1230,17 @@ type fileJob struct {
 func plan(ctx context.Context, goBin string, opts Options, pkgs []*packages.Package, mutators []mutator.Mutator, typedPkgs map[string]*packages.Package, closurePkgs map[string][]*packages.Package, funcPattern *regexp.Regexp, estimateOnly bool) ([]fileJob, error) {
 	var jobs []fileJob
 
+	// fingerprintMemo caches the whole-module cache fingerprint (ROADMAP.md
+	// gap 12a) by moduleDir, populated at most once per distinct moduleDir
+	// across this whole, sequential, pre-execute() planning pass — the same
+	// amortisation concern fullBaseline already solves for
+	// buildEstimateResult. See planCacheFingerprint's own doc comment for
+	// why only the whole-module fingerprint is memoized this way, not a
+	// per-package closure fingerprint.
+	fingerprintMemo := map[string]string{}
+
 	for _, pkg := range pkgs {
-		pkgJobs, err := planPackage(ctx, goBin, opts, pkg, mutators, typedPkgs, closurePkgs, funcPattern, estimateOnly)
+		pkgJobs, err := planPackage(ctx, goBin, opts, pkg, mutators, typedPkgs, closurePkgs, funcPattern, estimateOnly, fingerprintMemo)
 		if err != nil {
 			return nil, err
 		}
@@ -1262,10 +1343,60 @@ func planTCEBaseline(ctx context.Context, goBin string, opts Options, moduleDir,
 	return baseline, nil
 }
 
+// planCacheFingerprint resolves the scope-appropriate content fingerprint
+// [mutant.cacheKey] needs (ROADMAP.md gap 12a), or "" immediately when
+// opts.CacheDir == "" — the same zero-cost-unless-selected shape
+// [planTCEBaseline] already establishes for [Options.TCE].
+//
+// Only the whole-module fingerprint (dirs == nil: [ScopeFull], or gap 5's
+// closure resolution declined for this package) is memoized by moduleDir:
+// every package sharing that moduleDir would otherwise repeat the same
+// full-module walk. A non-nil dirs is a per-package closure — no two
+// packages share an identical dirs set in general — so memoizing it by
+// moduleDir would return the *wrong* package's fingerprint; it is simply
+// computed fresh every time, which is cheap relative to the whole-module
+// walk it is narrower than by construction.
+//
+// A fingerprint computation failure propagates as a real error rather than
+// failing soft and disabling caching for just this package: unlike
+// planTCEBaseline's compile failing on code that may simply not compile
+// yet (an ordinary, expected outcome), a failure here means turango could
+// not re-read a file [load] already read successfully once this same
+// run — a genuine filesystem problem, not a routine case to degrade
+// gracefully around, and getting the cache key wrong is explicitly worse
+// than not caching at all (ROADMAP.md gap 12's own framing).
+func planCacheFingerprint(ctx context.Context, opts Options, moduleDir string, dirs map[string]bool, memo map[string]string) (string, error) {
+	if opts.CacheDir == "" {
+		return "", nil
+	}
+
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+
+	if dirs == nil {
+		if fp, ok := memo[moduleDir]; ok {
+			return fp, nil
+		}
+
+		fp, err := cacheFingerprint(moduleDir, nil)
+		if err != nil {
+			return "", err
+		}
+
+		memo[moduleDir] = fp
+
+		return fp, nil
+	}
+
+	return cacheFingerprint(moduleDir, dirs)
+}
+
 // planPackage builds pkg's file jobs, or nil if pkg has nothing mutable (no
 // module info, or no non-test .go files). See [plan] for the parameters,
-// including estimateOnly.
-func planPackage(ctx context.Context, goBin string, opts Options, pkg *packages.Package, mutators []mutator.Mutator, typedPkgs map[string]*packages.Package, closurePkgs map[string][]*packages.Package, funcPattern *regexp.Regexp, estimateOnly bool) ([]fileJob, error) {
+// including estimateOnly. fingerprintMemo is [plan]'s whole-module cache
+// fingerprint memo, threaded through to [planCacheFingerprint].
+func planPackage(ctx context.Context, goBin string, opts Options, pkg *packages.Package, mutators []mutator.Mutator, typedPkgs map[string]*packages.Package, closurePkgs map[string][]*packages.Package, funcPattern *regexp.Regexp, estimateOnly bool, fingerprintMemo map[string]string) ([]fileJob, error) {
 	if pkg.Module == nil || pkg.Module.Dir == "" {
 		return nil, nil
 	}
@@ -1294,10 +1425,11 @@ func planPackage(ctx context.Context, goBin string, opts Options, pkg *packages.
 	// whole point is spawning none (see [walkForEstimate]'s doc comment and
 	// ROADMAP.md gap 11a).
 	var (
-		scope       Scope
-		cover       *impactMap
-		tceBaseline []byte
-		closure     map[string]bool
+		scope            Scope
+		cover            *impactMap
+		tceBaseline      []byte
+		closure          map[string]bool
+		cacheFingerprint string
 	)
 
 	if !estimateOnly {
@@ -1314,6 +1446,11 @@ func planPackage(ctx context.Context, goBin string, opts Options, pkg *packages.
 		}
 
 		closure = planClosure(scope, closurePkgs, filepath.Dir(files[0]))
+
+		cacheFingerprint, err = planCacheFingerprint(ctx, opts, pkg.Module.Dir, closure, fingerprintMemo)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// Per-package, not run-wide, only when a selected operator implements
@@ -1343,16 +1480,18 @@ func planPackage(ctx context.Context, goBin string, opts Options, pkg *packages.
 
 	for _, path := range files {
 		job := fileJob{
-			moduleDir:   pkg.Module.Dir,
-			pkgPath:     pkg.PkgPath,
-			path:        path,
-			scope:       scope,
-			cover:       cover,
-			mutators:    pkgMutators,
-			funcPattern: funcPattern,
-			mutantID:    opts.MutantID,
-			tceBaseline: tceBaseline,
-			closure:     closure,
+			moduleDir:        pkg.Module.Dir,
+			pkgPath:          pkg.PkgPath,
+			path:             path,
+			scope:            scope,
+			cover:            cover,
+			mutators:         pkgMutators,
+			funcPattern:      funcPattern,
+			mutantID:         opts.MutantID,
+			tceBaseline:      tceBaseline,
+			closure:          closure,
+			cacheFingerprint: cacheFingerprint,
+			tceEnabled:       opts.TCE,
 		}
 
 		if typedPkg != nil {
@@ -1476,15 +1615,25 @@ func mutateFile(ctx context.Context, run *runner, job *fileJob, sink *collector,
 	}
 
 	spec := mutant{
-		fset:        fset,
-		file:        file,
-		path:        path,
-		baseline:    baseline.Bytes(),
-		moduleDir:   job.moduleDir,
-		pkgDir:      filepath.Dir(path),
-		scope:       job.scope,
-		tceBaseline: job.tceBaseline,
-		closureDirs: job.closure,
+		fset:             fset,
+		file:             file,
+		path:             path,
+		baseline:         baseline.Bytes(),
+		moduleDir:        job.moduleDir,
+		pkgDir:           filepath.Dir(path),
+		scope:            job.scope,
+		tceBaseline:      job.tceBaseline,
+		closureDirs:      job.closure,
+		cacheFingerprint: job.cacheFingerprint,
+		tceEnabled:       job.tceEnabled,
+		// job.mutantID != "" is exactly ROADMAP.md gap 4's -mutatemutant=
+		// replay request: the walk still reaches every node, but only a
+		// matching mutation is ever handed to run.run (see visitMutations).
+		// A replay run's whole purpose is to actually reproduce a specific
+		// mutant against a real go test run, so it must always bypass a
+		// cache *read* — see mutant.replay's own doc comment and ROADMAP.md
+		// gap 12f.
+		replay: job.mutantID != "",
 	}
 
 	// Computed once per file rather than per node/mutation: it depends only on

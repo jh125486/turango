@@ -2,6 +2,8 @@
 
 ![turango mascot](turango.png)
 
+*Mascot derived from the Go gopher, designed by [Renee French](https://go.dev/blog/gopher), licensed under [Creative Commons Attribution 4.0](https://creativecommons.org/licenses/by/4.0/).*
+
 Mutation testing for `go test`, added the same way fuzzing was: not a
 separate tool bolted onto the ecosystem, but a `go`-compatible drop-in that
 adds one new test mode.
@@ -71,6 +73,39 @@ All of turango's own flags require the `-flag=value` form (a bare
 | `-mutatetce=true\|false` | `false` | Trivial Compiler Equivalence: filter a mutant whose compiled output exactly matches a per-package baseline before it ever reaches the test suite, reporting it separately (see below) instead of as an ordinary survivor. Off by default — see "Filtering equivalent mutants" below for why. |
 | `-mutateworkspace=copy\|worktree` | `copy` | How each mutant's throwaway execution copy is built. `copy` recursively copies the module (works everywhere, no git dependency). `worktree` uses `git worktree add` instead, which shares the repository's object store rather than duplicating files — cheaper when the target module lives in a large git repo. Strictly opt-in and self-falling-back: requesting it against a target that isn't inside a clean git working tree (or isn't a git repo at all — every corpus fixture under `corpus/*/module/` is deliberately a plain directory) silently reverts to `copy`, never an error. |
 | `-mutateestimate=true\|false` | `false` | Preview a run instead of executing it: walk every file/node to count how many mutants would be generated, per package, then time one baseline sample per package (whole-module under `-mutatescope=full`, per-package otherwise) to extrapolate a rough serial and `-mutateparallel`-divided time estimate — both explicitly hedged, since real speedup is sub-linear under contention. No mutation is ever applied to disk and no mutant's `go test` is ever spawned to classify it. Incompatible with `-mutateoutput`/`-mutatemin`, which are rejected at parse time (nothing was classified, so there's no report to write or score to gate on). |
+| `-mutatecache=<dir>` | none | Persist every mutant's verdict to a JSON-Lines file (`mutate-cache.jsonl`) inside this directory, and reuse those verdicts on a later run against unchanged source instead of re-executing `go test` for every mutant that's already cached — the fix for losing a whole overnight sweep to a killed process or a Ctrl+C. Keyed by more than just the mutant's ID (a same-position, same-width literal/identifier edit can otherwise collide) — see "Resuming after interruption" below. Incompatible with `-mutateestimate` (nothing is classified in estimate mode, so there's no verdict to cache); compatible with `-mutatemutant` (a replay always bypasses the cache read, but its result still gets cached for later). |
+
+### Resuming after interruption: `-mutatecache`
+
+A real mutation sweep is expensive — hours, for a large module — and until
+now turango had no way to pick back up after a kill (`SIGKILL`, an OOM
+reaper, a killed CI job) or even a graceful Ctrl+C: relaunching re-ran every
+mutant from scratch, including the ones that had already finished.
+
+`-mutatecache=<dir>` fixes this by writing every mutant's verdict to
+`<dir>/mutate-cache.jsonl` as soon as it's produced, and consulting that file
+before spawning a mutant's `go test` on a later run. Re-running the exact
+same command against unchanged source resumes near-instantly; editing the
+source in between invalidates exactly the entries the edit affects, no more
+and no fewer.
+
+The cache key is deliberately more than a mutant's ID. A mutant ID hashes a
+*position* — file, line, column, operator, mutation index — not the node's
+own bytes, so a same-width edit at the same position (`x + 5` → `x + 7`,
+same column) produces an identical ID for genuinely different code. Keying
+on ID alone would risk serving the first edit's verdict for the second.
+Instead, the key also folds in a content fingerprint of exactly the files
+that mutant's `go test` run actually depends on (the whole module under
+`-mutatescope=full`; just the dependency closure otherwise — reusing the
+same closure machinery `-mutateworkspace` and scope narrowing already use),
+plus `-mutatescope`, `-mutatetce`, and a toolchain identifier (`go version` +
+`GOOS`/`GOARCH`) — each closes a real way the identical mutant could
+legitimately classify differently across two runs.
+
+Safe to delete at any time — an empty or missing cache is just a first run,
+the same way `$GOCACHE` behaves. Not portable across machines with a
+different Go toolchain or target platform; treat it the same way you'd treat
+`$GOCACHE` itself.
 
 ### Filtering equivalent mutants: `-mutatetce`
 

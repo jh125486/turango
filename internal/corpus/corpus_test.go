@@ -118,6 +118,12 @@ func runEntry(t *testing.T, root string, entry corpus.Entry) {
 		}
 	}
 
+	if entry.Expect.Equivalent != nil {
+		if got, want := result.EquivalentCount(), *entry.Expect.Equivalent; got != want {
+			mismatches = append(mismatches, fmt.Sprintf("equivalent: got %d, want %d", got, want))
+		}
+	}
+
 	for _, m := range mismatches {
 		t.Errorf("%s (golden: %s)", m, entry.Path)
 	}
@@ -162,6 +168,7 @@ func buildOptions(t *testing.T, root string, entry corpus.Entry) mutate.Options 
 		Operators:   entry.Operators,
 		Scope:       scope,
 		TestTimeout: timeout,
+		TCE:         entry.TCE,
 		// Left unset (zero) here, an entry's own mutants would run one file
 		// at a time -- engine.go treats Parallel <= 0 as 1 -- which doesn't
 		// match the real CLI's GOMAXPROCS default and leaves real speedup on

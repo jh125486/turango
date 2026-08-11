@@ -99,12 +99,21 @@ func TestParseMutateFlagsValues(t *testing.T) {
 			t.Errorf("Workspace = %v, want %v", cfg.options.Workspace, mutate.WorkspaceCopy)
 		case cfg.estimate:
 			t.Errorf("estimate = true, want false")
+		case cfg.options.CacheDir != "":
+			t.Errorf("CacheDir = %q, want empty (caching disabled)", cfg.options.CacheDir)
 		}
 	})
 
 	t.Run("every flag set", func(t *testing.T) {
 		t.Parallel()
 
+		// -mutatecache is combined here with -mutatemutant deliberately: per
+		// ROADMAP.md gap 12f/12h, that combination is accepted, not
+		// rejected (a replay still benefits from, and contributes to, the
+		// cache) — ok, err == nil below already proves acceptance; this is
+		// the negative-of-a-negative case TestParseMutateFlagsErrors' own
+		// "accepted" note calls for, guarding against someone "fixing" this
+		// by copying the -mutateestimate rejection too broadly.
 		cfg, _, err := parseMutateFlags([]string{
 			"-mutate=Foo.*",
 			"-mutatescope=impact",
@@ -116,6 +125,7 @@ func TestParseMutateFlagsValues(t *testing.T) {
 			"-mutatemutant=a1b2c3d4e5f6",
 			"-mutatetce=true",
 			"-mutateworkspace=worktree",
+			"-mutatecache=/tmp/cache",
 			"./internal/...",
 		})
 		if err != nil {
@@ -145,6 +155,8 @@ func TestParseMutateFlagsValues(t *testing.T) {
 			t.Errorf("TCE = false, want true")
 		case cfg.options.Workspace != mutate.WorkspaceWorktree:
 			t.Errorf("Workspace = %v, want %v", cfg.options.Workspace, mutate.WorkspaceWorktree)
+		case cfg.options.CacheDir != "/tmp/cache":
+			t.Errorf("CacheDir = %q, want %q", cfg.options.CacheDir, "/tmp/cache")
 		}
 	})
 
@@ -271,6 +283,7 @@ func TestParseMutateFlagsErrors(t *testing.T) {
 		"bad duration":         {args: []string{"-mutate=.", "-mutatetimeout=30"}, want: "mutatetimeout"},
 		"negative duration":    {args: []string{"-mutate=.", "-mutatetimeout=-5s"}, want: "positive duration"},
 		"empty output":         {args: []string{"-mutate=.", "-mutateoutput="}, want: "requires a directory"},
+		"empty cache":          {args: []string{"-mutate=.", "-mutatecache="}, want: "requires a directory"},
 		"non-numeric min":      {args: []string{"-mutate=.", "-mutatemin=high"}, want: "mutatemin"},
 		"empty mutant id":      {args: []string{"-mutate=.", "-mutatemutant="}, want: "mutatemutant"},
 		"uppercase mutant id":  {args: []string{"-mutate=.", "-mutatemutant=A1B2C3"}, want: "mutatemutant"},
@@ -283,6 +296,9 @@ func TestParseMutateFlagsErrors(t *testing.T) {
 		},
 		"estimate with min": {
 			args: []string{"-mutate=.", "-mutateestimate=true", "-mutatemin=0.5"}, want: "no effect on",
+		},
+		"estimate with cache": {
+			args: []string{"-mutate=.", "-mutateestimate=true", "-mutatecache=/tmp/cache"}, want: "no effect on",
 		},
 		"leftover go test flag": {args: []string{"-mutate=.", "-v"}, want: "unsupported flag"},
 		"leftover before the flag": {

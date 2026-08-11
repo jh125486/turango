@@ -296,6 +296,51 @@ func TestMutantTestArgs(t *testing.T) {
 	}
 }
 
+// TestMutantCacheKey pins ROADMAP.md gap 12a's compound key assembly: every
+// field mutant.cacheKey draws from (scope, TCE, fingerprint, mutant ID) plus
+// the caller-supplied toolchain string must actually vary the resulting
+// cacheKey, or two genuinely different mutants/runs could collide on the
+// same cache entry — the identical "the restriction is enforced, not just
+// documented" concern TestMutantTestArgs's own table already covers for the
+// scope-to-flags mapping.
+func TestMutantCacheKey(t *testing.T) {
+	t.Parallel()
+
+	base := mutant{
+		scope:            ScopeFull,
+		tceEnabled:       false,
+		cacheFingerprint: "fp1",
+		id:               "mutant1",
+	}
+
+	baseKey := base.cacheKey("go1.26 darwin/arm64")
+
+	tests := map[string]struct {
+		m    mutant
+		tool string
+	}{
+		"scope":       {m: mutant{scope: ScopePackage, cacheFingerprint: "fp1", id: "mutant1"}, tool: "go1.26 darwin/arm64"},
+		"tce":         {m: mutant{scope: ScopeFull, tceEnabled: true, cacheFingerprint: "fp1", id: "mutant1"}, tool: "go1.26 darwin/arm64"},
+		"fingerprint": {m: mutant{scope: ScopeFull, cacheFingerprint: "fp2", id: "mutant1"}, tool: "go1.26 darwin/arm64"},
+		"mutant id":   {m: mutant{scope: ScopeFull, cacheFingerprint: "fp1", id: "mutant2"}, tool: "go1.26 darwin/arm64"},
+		"toolchain":   {m: base, tool: "go1.25 linux/amd64"},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := tt.m.cacheKey(tt.tool); got == baseKey {
+				t.Errorf("cacheKey() unchanged when only %s varied: both = %+v", name, got)
+			}
+		})
+	}
+
+	if got := base.cacheKey("go1.26 darwin/arm64"); got != baseKey {
+		t.Errorf("cacheKey() = %+v on identical inputs, want equal to %+v", got, baseKey)
+	}
+}
+
 // TestRunSkipsUncoveredMutant covers impact scope's payoff: a mutant on a line
 // no test executes is decided by the coverage map alone. The unusable go binary
 // is the assertion — reaching the toolchain at all would fail the test.

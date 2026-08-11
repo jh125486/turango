@@ -2021,6 +2021,612 @@ before implementation, the same way gap 4 flagged `-mutant` vs.
 
 ---
 
+## 12. Persistent mutant verdict cache (resume after interruption)
+
+**Status: done**, built and verified exactly per the design below, in the
+8-step build order it specifies. `internal/mutate/cache.go` (new file):
+`cacheKey`/`cacheRecord`, `cacheFingerprint` (12a, whole-module or
+dependency-closure file set per scope), `resolveToolchain`,
+`loadCacheIndex`/`cacheStore` (12c/12d, JSON-Lines, torn-write recovery by
+truncation). `Options.CacheDir` (empty disables, matching every other
+opt-in feature's zero-value convention); `-mutatecache=<dir>`
+(`cmd/turango/main.go`), rejected together with `-mutateestimate`,
+accepted together with `-mutatemutant`. The central correctness claim —
+that `mutantID` alone is unsafe, and the compound key actually closes the
+gap — is proven directly by
+`TestRunClosesSameMutantIDDifferentContentCollision`
+(`internal/mutate/runner_integration_internal_test.go`): two real,
+differently-behaving modules forced to share one `mutantID`, where the
+second is verified to run a real `go test` rather than being served the
+first's cached verdict. The resume-is-free claim is proven by
+`TestRunCacheResumeIsFree` (`internal/mutate/engine_integration_internal_test.go`):
+two `Run()` calls against the same unmodified fixture produce a
+byte-for-byte identical `Result` with zero additional `execCalls` on the
+second. Scope/TCE/`-mutatemutant` interactions each have their own
+dedicated integration test in the same file.
+
+### Problem
+
+turango has **zero resume capability today**. Confirmed by grepping the
+whole `internal/mutate`/`cmd/turango` source for "resume"/"checkpoint"/any
+cache-file write: nothing exists. The only related mechanism is
+`main.go`'s SIGINT/SIGTERM handling (`mutateRun`'s `interrupted` branch,
+"turango: interrupted; reporting the mutants completed so far") — a
+one-time snapshot of whatever `Result` the collector had accumulated in
+memory at the moment of a *graceful* shutdown. It does nothing for a hard
+kill (`SIGKILL`, an OOM reaper, a killed background job — exactly what
+happened to a real overnight sweep against `corpus/stdlib-crypto-aes/module`
+and a `corpus/stdlib-strconv-parseuint` bench run), and even on a graceful
+shutdown it is not a checkpoint: relaunching after either kind of
+interruption re-runs every mutant from scratch, including the ~97% of a
+708-mutant sweep that had already completed once that same night.
+
+The fix is a persistent, on-disk cache of mutant classification results,
+keyed so that (1) re-running the same sweep against unchanged source skips
+every mutant whose result is already cached, resuming near-instantly, and
+(2) any code change invalidates *exactly* the entries it should — never
+more silently-wrong, never fewer silently-stale. Getting (2) wrong is worse
+than not building this at all: a cache that serves a stale verdict corrupts
+exactly the number this whole tool exists to produce, silently.
+
+### Design decisions
+
+**12a. Cache key and invalidation — the central decision.** Three
+candidate designs, weighed against the stated bar (never serve a
+stale-but-still-matching verdict), not against convenience:
+
+- **(Rejected as unsafe) `mutantID` alone.** `mutantID` (engine.go) hashes
+  `(file path relative to module root, node's line, column, operator's
+  registry name, mutation's index within Mutate()'s slice)` — a *position*
+  in a specific AST, not the node's own bytes. Its own doc comment already
+  admits this: "stable across re-runs of unchanged source... but not across
+  edits to the file above the mutated line, since what's hashed is a
+  position... not self-contained bytes." A shifted ID after an upstream
+  edit is a safe *false miss* — wasteful, never wrong. The dangerous case
+  the task framing asks to think through does exist: an edit that keeps a
+  node's line, column, operator name and Mutate()-index all identical,
+  while its actual content changes. This is not a contrived corner case —
+  it's the ordinary shape of "replace this literal/identifier with a
+  same-width one." Concretely: `literal/number` mutates `x + 5` to `x + 6`
+  at some `(line, col)`; a developer later edits the source to `x + 7` at
+  the *same* `(line, col)` (single-digit literal, same column). `mutantID`
+  recomputed for the new mutation (`7`→`8`) is byte-identical to the old
+  one (`5`→`6`) — same relPath, same line/col, same operator name, same
+  index. A cache keyed on `mutantID` alone would serve the *old* mutant's
+  verdict (a test suite's reaction to `x` becoming `x+6`) as the verdict
+  for a completely different mutation (`x+7`→`x+8`) it never actually ran.
+  That is precisely "a caching bug that reuses a wrong verdict" — not
+  hypothetical, reachable by an ordinary one-character edit. `mutantID`
+  itself is **not modified** by this design — gap 4's ID computation and
+  `-mutatemutant=<id>` replay are untouched; the fix is purely additive, at
+  the cache layer.
+
+- **(Rejected as unnecessarily coarse) whole-module content fingerprint,
+  always.** Hash every file under the module root once per run; any
+  fingerprint mismatch invalidates the entire cache. This is *safe* — an
+  edit anywhere legitimately changes the fingerprint, so no stale entry
+  is ever served — but it throws away tonight's own second-order case: a
+  large module where one file, unrelated to the package being mutated,
+  changed between runs still invalidates every other package's cache too.
+  Under `ScopeFull` this coarseness is not actually excessive — see below —
+  but adopting it *unconditionally*, for every scope, gives up real,
+  correctly-available precision for `ScopePackage`/`ScopeImpact` runs.
+
+- **(Rejected as unsafe) mutated-file-only content fingerprint.** Hash only
+  the one file being mutated; a change to any *other* file never
+  invalidates its cache entries. This is the "per-file" option the task
+  framing raises, and it fails the stated bar directly: a mutant's verdict
+  is not a pure function of the mutated file's bytes. It is "did `go test`
+  (scoped per `mutant.testArgs`) still pass" — and that test run's outcome
+  depends on every file actually compiled and executed alongside it: sibling
+  packages the mutated package imports, the test files themselves, and
+  (under `ScopeFull`) potentially any package in the module, since
+  `ScopeFull`'s entire reason to exist (its own doc comment) is that "a
+  package's behaviour is frequently only asserted on by its callers'
+  tests." A change to an imported helper, or to a test file, with the
+  mutated file itself untouched, can flip a real mutant from `Survived` to
+  `Killed` (or the reverse) — exactly the false-hit risk the task
+  description warns is worse than no cache. Not adopted, even as a
+  documented v1 shortcut, because the safe alternative below is barely
+  more expensive.
+
+- **(Chosen) `mutantID` + a scope-appropriate content fingerprint, gated
+  further by scope/TCE/toolchain — reusing gap 5's dependency closure
+  rather than inventing a second notion of "the relevant files."** The
+  fingerprint's file set is defined to be **exactly the file set
+  `runner.workspaceFor` would copy to execute this mutant** — i.e. the same
+  files that actually determine `go test`'s outcome:
+
+  - Under `ScopeFull`, or whenever gap 5's `resolveClosure`/`planClosure`
+    declined for this package (`fileJob.closure == nil` — a `vendor/`
+    directory, a `//go:embed` directive, an unsafe replace target, or
+    `ScopeFull` itself, where a forward closure is provably wrong per gap
+    5's own "Open questions — resolved" section): the fingerprint covers
+    **every file under the module root** `copyModule` itself would copy
+    (excluding `.git`, mirroring `copyTree`'s own skip rule exactly).
+    This is not overcautious padding — it is the *provably correct*
+    answer for that case, for the identical reason gap 5 already
+    established: under `ScopeFull`, any file in the module could contain a
+    test that starts or stops covering the mutated line, so "exactly the
+    entries [an edit] should [invalidate]" genuinely is "all of them."
+  - Otherwise (`fileJob.closure` non-nil): the fingerprint covers **exactly
+    `go.mod`, `go.sum`, and every file directly inside each directory in
+    the closure** — the identical file set `copyClosure` copies. An edit
+    to a file outside that closure (a sibling package the mutated package
+    never imports, an unrelated fixture directory) cannot affect this
+    mutant's `go test` outcome, so it correctly does not invalidate this
+    mutant's cache entry — this is what actually delivers tonight's wanted
+    behavior (near-instant resume on zero code changes, and *narrow*
+    invalidation on a real but unrelated edit) for any run not using
+    `ScopeFull`.
+
+  Computed via a new `cacheFingerprint(dir string, dirs map[string]bool)
+  (string, error)` (mirrors `buildImpact`'s `(ctx, goBin, moduleDir, pkgDir
+  string, goFiles []string)` parameter-naming style): walks the file set
+  above in a deterministic (sorted-path) order, feeding each file's
+  relative path and full content into one `sha256.New()` writer with
+  `\x00` separators between fields — the same delimiter idiom `mutantID`
+  already uses — and returns the full 64-character hex digest, **not
+  truncated** the way `mutantID` is: `mutantID`'s truncation is fine
+  because it is user-facing (pasted into a comment, typed into
+  `-mutatemutant=`) and per-run; a truncation-induced collision on the
+  fingerprint that gates every cache read would be a much worse, silent
+  class of bug, so it keeps the full digest.
+
+  The fingerprint is combined into a compound key with three more fields,
+  each closing a specific, real gap this project has already run into
+  elsewhere in its own history:
+
+  - **`Scope` (the run's `Options.Scope.String()`)** — a real interaction
+    the task explicitly asks about: the *same* mutant can be `Killed` under
+    `ScopeFull` and `Survived` under `ScopePackage` (documented directly on
+    the `Scope` type: "a mutant only a neighbouring package's tests
+    exercise is killed under `ScopeFull` and survives under
+    `ScopePackage`"). Since the fingerprint's own file set already differs
+    by scope in the common case, this is technically redundant most of the
+    time — but not provably always (a single-package module with no
+    closure narrowing could produce the same fingerprint under both
+    scopes), so it is included explicitly rather than relied upon
+    incidentally.
+  - **`TCE` (the run's `Options.TCE`)** — a mutant recorded as
+    `Equivalent` under `TCE=true` must never be replayed as if that were a
+    real verdict when the current run has `TCE=false`: that mutant was
+    never run against the suite at all in the cached run, and under
+    `TCE=false` it needs a real `Killed`/`Survived`/`NotViable`
+    classification, which the cache does not have. Threaded onto `mutant`
+    as an explicit `tceEnabled bool` field set from `Options.TCE` — **not**
+    derived from `tceBaseline != nil`, because that field already means
+    something narrower ("TCE requested *and* this package's baseline
+    compile succeeded" — see `planTCEBaseline`'s fail-soft doc comment). A
+    run with `TCE=true` whose baseline compile fails this time must still
+    key its (real, non-equivalent) verdicts as `TCE=true` — reusing
+    `tceBaseline != nil` as the key's TCE flag would silently mix them into
+    the `TCE=false` bucket, which is wrong for the identical reason above.
+  - **A toolchain fingerprint** (`Toolchain string`, e.g. `go version`'s
+    output plus `GOOS`/`GOARCH`, resolved once via a new
+    `resolveToolchain(ctx, goBin) (string, error)`, defaulting `GOOS`/
+    `GOARCH` from `os.Getenv` with a `runtime.GOOS`/`runtime.GOARCH`
+    fallback when unset) — a compiled/tested verdict can change across a Go
+    version or a cross-compilation target even when every source byte is
+    identical. Not exhaustive (build tags, `CGO_ENABLED`, and other `go
+    env` values are not folded in for v1 — flagged honestly, not solved,
+    the same way TCE's own reproducibility spike flagged what it did and
+    did not verify): a cache directory shared across differently-configured
+    machines is not proven safe by this design and should be treated the
+    way `$GOCACHE` already implicitly is — machine/environment-scoped, not
+    portable.
+
+  ```go
+  // cacheKey identifies exactly which prior run a cache record answers
+  // for. Every field must match the current run's own value for a lookup
+  // to be trusted — see ROADMAP.md gap 12a for why each one is here.
+  type cacheKey struct {
+      Toolchain   string // resolveToolchain: go version + GOOS/GOARCH
+      Scope       string // Scope.String()
+      TCE         bool
+      Fingerprint string // cacheFingerprint's full hex SHA-256
+      MutantID    string // mutantID, unmodified
+  }
+  ```
+
+  `Options.Workspace` (copy vs. worktree) is deliberately **excluded**: it
+  selects how a workspace is *built*, never what it contains or how it's
+  tested, so two workspace strategies producing different verdicts for the
+  same key would itself be a bug in workspace construction, not a
+  legitimate source of cache variance. `Options.Parallel` needs no key
+  entry either — it changes only how fast the cache is populated, never
+  what gets written into it (the write path is already serialized, see
+  12d). `Options.TestTimeout` is also excluded, deliberately, with an
+  honest trade-off stated rather than solved: a `Killed`-by-timeout verdict
+  cached under a short timeout could in principle be replayed even though a
+  longer timeout might let that same mutant finish and reclassify as
+  `Survived`. Including the exact timeout in the key would defeat the
+  cache almost entirely in practice (the default is derived per run from a
+  noisy baseline measurement, per `resolveTimeout`/`baselineTimeout`, and
+  rarely reproduces bit-for-bit across runs) for a risk that only ever
+  biases toward `Killed` — the same direction a real timeout already biases
+  toward today (`run.run`'s own "a mutant that never terminates is a
+  mutant the suite noticed" reasoning) — not toward silently missing a real
+  kill.
+
+**12b. Storage format and location.** JSON Lines (`.jsonl`), one
+`cacheRecord` per line — chosen specifically for the "incremental append
+safety" the task calls out: an append is a single `write()` call with no
+read-modify-write of the rest of the file, unlike a single JSON array or
+object that would require rewriting the whole file (or at least seeking
+back over a trailing `]`) on every mutant. Plain `encoding/json` + a
+`bufio.Scanner`/`bufio.Writer`, stdlib only, matching the "stdlib +
+`golang.org/x/*` only" project policy (`PROGRESS.md`'s dependency-cleanup
+note) — no sqlite/bbolt/badger considered, per the task's own framing.
+
+Location: a new `Options.CacheDir string` field (empty means disabled,
+matching the zero-value-is-safe convention every other opt-in feature in
+this project already follows — TCE, dependency-closure copying,
+git-worktree execution), with a fixed file name inside it,
+`cacheFile = "mutate-cache.jsonl"` (mirroring `main.go`'s existing
+`reportFile = "mutate-report.json"` constant-naming convention), joined via
+a small `cachePath(dir string) string`.
+
+This is a **deliberate divergence from `-mutateoutput`'s own precedent**,
+worth stating explicitly rather than silently copying the wrong shape:
+`-mutateoutput` is entirely post-hoc — `mutate.Options` has no output field
+at all; `main.go`'s `mutateRun` calls `mutate.Run` to completion, then
+separately calls its own `writeReport(cfg.output, result)` against the
+*returned* `*Result`. That shape cannot work for a cache: caching must
+affect `Run`'s own internal execution (skip `runner.run`'s expensive path
+on a hit) and must write *incrementally*, mutant by mutant, not once at the
+end — a Result only exists after `Run` returns, and by the time a
+kill signal lands, it's too late to have used it. So `CacheDir` lives on
+`Options` itself (same as `TCE`/`Workspace`), not layered on top by
+`main.go` the way `-mutateoutput` is.
+
+The cache directory must live outside every per-mutant temp workspace by
+construction, and does: it is opened once, by the top-level `Run` /
+`runner`, at a path the *caller* named — never inside `os.MkdirTemp("",
+"turango-mutant-")` (deleted after every mutant, `run.run`'s own `defer
+os.RemoveAll(tmp)`) or inside a `copyModule`/`copyClosure`/`copyWorktree`
+workspace root (also per-mutant, also deleted). No change needed to make
+this true; it falls out of where the cache is opened.
+
+**12c. Write timing/durability.** Every completed verdict is appended as
+soon as it's produced — not batched to end-of-run — via a single-consumer,
+channel-fed writer (12d) opened once, before `execute()` starts, and closed
+once, right after it returns (successfully or via cancellation) — the same
+placement `sink := newCollector(); ...; return sink.close(), runErr`
+already uses in `Run`. "Crash-safe" here means specifically: surviving a
+killed *process* (tonight's actual failure mode — confirmed via `ps`/
+`uptime`/`pmset`, not a power-loss event), not surviving a lost machine.
+Each record is written with one `os.File.Write` call to a file opened
+`O_APPEND`; POSIX guarantees that call either lands in full or (only on a
+mid-write crash) leaves a partial trailing line — a killed process cannot
+interleave two records' bytes, only truncate the last one. No per-record
+`fsync` is needed against that threat model (data handed to `write()`
+survives a killed process via the OS page cache regardless of fsync); one
+`fsync`-on-close is done as a cheap, one-syscall-per-run belt-and-suspenders
+measure, not a per-mutant cost.
+
+Recovery is a **load-time truncate**, not a lazy skip: `loadCacheIndex`
+reads line by line; the first line that fails to `json.Unmarshal` (which,
+by the write guarantee above, can only ever be the *last* line present) is
+treated as a torn write from a prior kill — the file is physically
+truncated (`os.Truncate`) to the byte offset just before that line, and
+loading continues as if it were never there. Truncating on load, rather
+than only skipping the bad line while reading, keeps the on-disk invariant
+simple for every future load and every future append: the file is always
+either empty, or a sequence of complete JSON lines, never
+"complete lines + garbage + more complete lines." A missing cache file is
+not an error — `loadCacheIndex` returns an empty index — matching every
+other "first run, nothing to reuse yet" case elsewhere in this project
+(e.g. `TCE`'s fail-soft per-package baseline).
+
+**12d. Concurrency.** Two independent halves, each reusing an
+already-established pattern in this codebase rather than inventing a third:
+
+- **Reads are lock-free by construction.** The entire cache file is loaded
+  once, sequentially, into an immutable `map[cacheKey]cacheRecord`
+  (`cacheIndex`) *before* `execute()` starts spawning concurrent file
+  workers — the identical "read-only, safe to share across
+  `Options.Parallel` workers with zero synchronization" shape
+  `fileJob.mutators`'s run-wide shared slice already relies on today. No
+  mutation ever happens to a loaded `cacheIndex` during a run.
+- **Writes are serialized through a single consumer goroutine fed by one
+  channel** — `cacheStore`, structurally identical to `collector`/
+  `estimateTally` (engine.go): a `record(rec cacheRecord)` method that
+  blocking-sends on a channel (the same effective backpressure
+  `collector.mutant`'s doc comment already describes), one goroutine
+  draining it and doing the actual file `Write`, and a `close()` that
+  closes the channel and blocks for the consumer to finish (flush +
+  fsync). This is a **separate** consumer from `collector`'s own three
+  channels, not folded into it: `collector`'s job is building the
+  in-memory `*Result`, a different failure mode from cache durability — a
+  disk-full or permission error writing the cache must never lose or
+  corrupt the run's real, in-memory `Result`, so keeping them as two
+  independently-failing components means a `cacheStore` write error can be
+  logged and dropped without collector ever knowing anything went wrong.
+
+**12e. Where in the pipeline the check happens.** Inside `runner.run`
+(runner.go), immediately **after** the existing `ScopeImpact`
+no-covering-test shortcut (which stays exactly as it is — it is already
+zero-cost, never spawns a subprocess, so caching it would add complexity
+for no benefit) and **before** `testArgs`/`os.MkdirTemp`/`workspaceFor` —
+i.e., strictly earlier than TCE's own insertion point (gap 2 places TCE
+"after the workspace copy... before `r.goTest`"; the cache check must be
+even earlier, since a hit should skip the workspace copy too, not just the
+`go test` call).
+
+```go
+if r.cache != nil && !m.replay {
+    if rec, ok := r.cache.get(m.cacheKey(r.toolchain)); ok {
+        if rec.Equivalent {
+            return result, false, true, nil
+        }
+        result.Status, result.Output = rec.Status, rec.Output
+        return result, true, false, nil
+    }
+}
+```
+
+`m.cacheKey(toolchain string) cacheKey` is a small method on `mutant`
+assembling the compound key from `m.cacheFingerprint`, `m.scope.String()`,
+`m.tceEnabled`, `m.id`, and the passed-in toolchain string. `m.replay`
+(new field, `= job.mutantID != ""`, set in `mutateFile`'s `spec :=
+mutant{...}` construction) gates `-mutatemutant=<id>` replay past the
+*read* path only — see 12f.
+
+`before`/`After` are **not** persisted in the cache record and are not
+needed on a hit either as a stored value: they are cheap
+(`renderNode`/`renderAfter`, printer calls against the in-memory AST, no
+subprocess) and already computed earlier in `run.run`, before this check,
+exactly the same way a real run computes them — so a cache hit's
+`MutantResult` is built from a mix of freshly-rendered local fields
+(`ID`, `File`, `Line`, `Operator`, `Description`, `Before`, `After` — all
+already known or already computed by this point in `run.run`, cache-hit or
+not) and exactly two fields trusted from disk (`Status`, `Output`). This is
+a deliberate minimization: the fewer fields a stale or corrupted cache
+record could lie about, the smaller the blast radius of any bug in this
+mechanism, and it also shrinks the on-disk record.
+
+Two new write call-sites, both existing "a real verdict was just produced"
+return points in `run.run`, each gaining one line:
+
+- The `isTCEEquivalent` branch (`return result, false, true, nil`) — write
+  `cacheRecord{Key: ..., Equivalent: true}` first.
+- The final `classify`/timeout paths (`return result, true, false, nil`,
+  including the timeout-`Killed` branch) — write
+  `cacheRecord{Key: ..., Status: result.Status, Output: result.Output}`
+  first.
+
+Both are unconditional on `m.replay` — a replay run's freshly-confirmed
+verdict is still written through, updating (in effect, appending a fresher
+record for the same key — see 12g on why an older, now-redundant record
+for the same key is not actively removed) whatever a future normal run
+would read.
+
+The syntactic no-op check (`bytes.Equal(src, m.baseline)`) stays entirely
+outside caching, deliberately: it already runs before any subprocess, on
+every walk, so there is nothing expensive to skip, and — since a cache hit
+requires an identical `Fingerprint`, which by construction means the exact
+same file bytes that produced this determination originally — the walk's
+own upstream syntactic-no-op filtering already reproduces deterministically
+on a fingerprint match, with nothing for the cache to add.
+
+**12f. Interaction with existing features.**
+
+- **TCE**: covered in 12a (the `TCE` key field) and 12e (the `Equivalent`
+  record shape) — an equivalent verdict is cached and honored the same as
+  a real one, short-circuiting even the TCE compile step on a hit (not
+  just `go test`), and is never served to a run with a different `TCE`
+  setting.
+- **`-mutatemutant=<id>` replay**: bypasses the cache *read* unconditionally
+  (`m.replay` gate in 12e) but still *writes through* — replay exists to
+  actually reproduce/observe a specific mutant against a real `go test`
+  run (a debugging tool), and serving a cached verdict instead would defeat
+  that purpose entirely; but there's no reason a freshly-confirmed replay
+  verdict shouldn't benefit a later full run's cache hit rate, so it's
+  still recorded.
+- **`-mutatescope`**: yes, part of the key (12a) — required precisely
+  because, per `Scope`'s own doc comment, the identical mutant can classify
+  differently across scopes.
+- **`Options.Parallel`**: no effect on correctness — the read side is an
+  immutable map built before any worker starts, and the write side is
+  already serialized through one consumer goroutine (12d), so this was
+  already a solved problem by the time caching was added, inherited
+  directly from `collector`'s existing design.
+- **`Options.Workspace`**: excluded from the key (12a) — does not affect
+  what is tested, only how the workspace is built.
+- **`-mutateoutput`**: unaffected and unaware of caching — a report written
+  from a mostly-cache-hit run is field-for-field indistinguishable from one
+  produced by a fully fresh run, since every `MutantResult` field is either
+  freshly computed locally or (for `Status`/`Output` only) trusted from a
+  record whose key already proves it describes this exact mutant under
+  this exact scope/TCE/toolchain/source-fingerprint.
+- **`-mutateestimate`**: rejected together with `-mutatecache` at CLI parse
+  time (12h) — an estimate classifies nothing, so there is nothing to
+  cache and nothing a cache could short-circuit.
+
+**12g. Cache growth/pruning.** **Unbounded growth is accepted for v1**,
+stated plainly rather than silently ignored. Every edit that changes a
+package's fingerprint (12a) makes every previously-written record for that
+fingerprint permanently dead — never looked up again, since lookups are
+always keyed by the *current* fingerprint — but nothing here actively
+removes it, so a project edited and re-mutated repeatedly over its lifetime
+accumulates an ever-growing `mutate-cache.jsonl`. Records are individually
+small (a status enum plus an already-≤16KB-truncated `Output` string,
+usually far smaller for `Killed` verdicts), so this is a slow, bounded-rate
+leak, not a runaway one, and the fix for v1 is the same one `$GOCACHE`
+itself relies on: **deleting the `-mutatecache=<dir>` directory is always
+safe and is the v1 pruning mechanism** — no code needed, no correctness
+risk (an empty/missing cache is just a first run). A real compaction
+pass (rewrite the file keeping only the newest record per key still worth
+keeping, or `-mutatecacheprune`-style command) is reasonable future work,
+explicitly not part of this build order.
+
+**12h. Flag design.** `-mutatecache=<dir>`, mirroring `-mutateoutput`'s
+exact shape (a directory value is itself the opt-in — no separate boolean
+toggle the way `-mutatetce=true` needs one, since there is no meaningful
+"cache enabled with no location" state to distinguish). Empty/absent means
+disabled, the safe zero-value default every other opt-in feature in this
+project uses. `flagCache = "mutatecache"` joins the `mutateFlags` const
+block and slice; `mutateConfig.set` gains `case flagCache: return
+c.setCache(value)`; `setCache` mirrors `setOutput` exactly (reject an empty
+value with the same message shape). Unlike `-mutateoutput`, `setCache`
+writes directly to `c.options.CacheDir` — no separate `mutateConfig` field
+— per 12b's rationale (`Options` must own this, not `main.go`
+post-hoc). The existing `-mutateestimate` rejection block in
+`parseMutateFlags` (today: `cfg.estimate && (cfg.output != "" ||
+cfg.hasMin)`) extends its condition to `|| cfg.options.CacheDir != ""`,
+same error shape, same rationale ("nothing is classified in estimate mode,
+so there is no verdict to cache"). `-mutatecache` combined with
+`-mutatemutant` is explicitly **allowed**, not rejected — see 12f.
+
+### Files/functions touched
+
+- **`internal/mutate/cache.go`** (new file, mirroring `impact.go`'s role as
+  a self-contained per-concern file):
+  - `cacheKey`, `cacheRecord` types (12a, 12e).
+  - `cacheFile`, `cachePath(dir string) string` (12b).
+  - `cacheFingerprint(dir string, dirs map[string]bool) (string, error)`
+    (12a) — whole-module walk when `dirs` is nil, `go.mod`/`go.sum` +
+    `dirs`' files otherwise, mirroring `copyModule`/`copyClosure`'s exact
+    file sets.
+  - `resolveToolchain(ctx context.Context, goBin string) (string, error)`
+    (12a).
+  - `cacheIndex` type, `loadCacheIndex(path string) (*cacheIndex, error)`,
+    `(*cacheIndex) get(key cacheKey) (cacheRecord, bool)` (12c, 12d).
+  - `cacheStore` type, `newCacheStore(path string) (*cacheStore, error)`,
+    `(*cacheStore) record(rec cacheRecord)`, `(*cacheStore) close() error`
+    (12c, 12d).
+- **`internal/mutate/engine.go`**:
+  - `Options.CacheDir string` (new field, doc comment matching `TCE`'s
+    "off by default... every other `Options` field's safe-default
+    philosophy" framing).
+  - `Run` (lines ~275–341 as of this writing): resolves `toolchain` once
+    (only if `CacheDir != ""`), loads `cacheIndex` once, opens
+    `cacheStore` once — both fail-soft (a load/open error disables caching
+    for this run with a warning, never fails the run outright, mirroring
+    `loadClosures`' own "a load error here just means no package gets a
+    narrower workspace this run" precedent) — constructs `runner{...,
+    cache:, store:, toolchain:}`, and closes `store` after `execute`
+    returns (success or cancellation).
+  - `plan()`/`planPackage()`: gain a `fingerprintMemo map[string]string`
+    (moduleDir → fingerprint), populated at most once per distinct
+    `moduleDir` across the whole (sequential, pre-`execute()`) planning
+    pass — the `ScopeFull`/closure-declined case's whole-module hash must
+    not be recomputed once per package, the same amortization concern
+    `fullBaseline` already solves for `buildEstimateResult`. A new
+    `planCacheFingerprint(ctx, opts, moduleDir string, dirs map[string]bool,
+    memo map[string]string) (string, error)` returns `""` immediately when
+    `opts.CacheDir == ""`, the identical zero-cost-unless-selected shape
+    `planTCEBaseline` already establishes for `Options.TCE`.
+  - `fileJob` gains `cacheFingerprint string`, `tceEnabled bool` (=
+    `opts.TCE`, threaded alongside the existing `tceBaseline []byte`, kept
+    distinct per 12a's rationale).
+  - `mutateFile`'s `spec := mutant{...}` construction threads
+    `cacheFingerprint: job.cacheFingerprint`, `tceEnabled:
+    job.tceEnabled`, `replay: job.mutantID != ""`.
+- **`internal/mutate/runner.go`**:
+  - `runner` struct gains `cache *cacheIndex`, `store *cacheStore`,
+    `toolchain string`.
+  - `mutant` struct gains `cacheFingerprint string`, `tceEnabled bool`,
+    `replay bool`; new method `(m mutant) cacheKey(toolchain string)
+    cacheKey`.
+  - `run.run`: new cache-check branch (12e) inserted after the
+    `ScopeImpact` shortcut, before `testArgs`; two new `r.store.record(...)`
+    call sites (12e).
+- **`cmd/turango/main.go`**:
+  - `flagCache = "mutatecache"` const, added to the `mutateFlags` slice.
+  - `mutateConfig.set`: new `case flagCache`.
+  - `setCache(value string) error` (mirrors `setOutput`).
+  - `parseMutateFlags`'s existing `-mutateestimate` rejection condition
+    extended per 12h.
+
+### Build order
+
+1. `cache.go`: `cacheKey`/`cacheRecord` + `cacheFingerprint` +
+   `resolveToolchain`, unit-tested standalone (see Verification) with no
+   engine wiring at all — matching gap 2's "the load-bearing test... must
+   be written and passing *before* wiring [it] into the run loop, not
+   after" precedent, since a broken fingerprint is exactly the class of
+   bug this whole design exists to prevent.
+2. `cache.go`: `loadCacheIndex`/`cacheStore`, unit-tested standalone
+   (recovery-truncate behavior in particular) before any engine wiring.
+3. `Options.CacheDir`; `plan()`/`planPackage()`'s fingerprint memo and
+   `planCacheFingerprint`; `fileJob.cacheFingerprint`/`.tceEnabled`.
+4. `mutant.cacheFingerprint`/`.tceEnabled`/`.replay`, `mutant.cacheKey`;
+   `mutateFile`'s threading.
+5. `runner.cache`/`.store`/`.toolchain`; `Run`'s construction/fail-soft
+   load-and-open/close-after-execute wiring.
+6. `run.run`'s cache-check branch and the two `store.record` call sites.
+7. `main.go`: `-mutatecache` flag wiring and the `-mutateestimate`
+   rejection extension.
+8. Integration tests (see Verification) — in particular the
+   resume-is-free test and the same-mutantID-different-content
+   collision-safety test, since those two are the concrete proof of this
+   section's central correctness claim, not just its prose.
+
+### Verification
+
+- `cacheFingerprint` unit tests: identical file set/content, hashed from
+  two different temp-dir copies (mirrors gap 2's `compile()` reproducibility
+  test shape) → equal fingerprints; one byte changed anywhere in the
+  relevant file set → different fingerprint; a change to a file *outside*
+  the relevant set (narrow-scope case: a file in a sibling package the
+  closure doesn't include) → **unchanged** fingerprint — this is the
+  concrete "the scope restriction is enforced, not just documented" test
+  gap 1's own verification section models.
+- `loadCacheIndex`/`cacheStore` recovery test: write N complete JSONL
+  records via the real writer, then append a deliberately truncated,
+  syntactically-invalid trailing line directly (simulating a kill mid-write,
+  not going through `cacheStore` to produce it) — assert `loadCacheIndex`
+  recovers exactly the N complete records, silently drops the trailing
+  garbage, and that the file is truncated on disk to end exactly after the
+  Nth record; assert a subsequent `newCacheStore` on that same path can
+  append further records cleanly afterward.
+- **The load-bearing end-to-end test**: run `Run()` twice against the same
+  unmodified fixture module with the same `Options.CacheDir`. Assert the
+  first run performs the expected number of real `go test`/`go build`
+  subprocesses (via the existing `execCalls` atomic counter, the same
+  technique `TestWalkForEstimateSpawnsNoSubprocess` already established)
+  and the second run against **unchanged source** produces a byte-for-byte
+  identical `Result` (same mutants, same `Status`/`Output`) while
+  `execCalls` does **not increase at all** — the concrete proof of
+  "resumes near-instantly," not an assertion in prose.
+- **The central correctness test, proving the dangerous direction is
+  actually closed**: two fixture variants sharing the exact same
+  `(relPath, line, column, operator, index)` tuple — so `mutantID` is
+  identical across them — but genuinely different content at that node
+  (e.g. a same-width literal edit, `x + 5` → `x + 7`, at the same column).
+  Populate the cache against variant A; run against variant B with the same
+  `CacheDir`. Assert variant B's mutant is **not** served from the cached
+  verdict (a fresh `go test` actually runs — `execCalls` increases — and
+  the resulting verdict, if it differs from A's, is what's reported) — this
+  is the test that directly disproves "mutantID alone is a safe cache key"
+  rather than merely asserting it, and is the single most important test
+  in this whole build order.
+- Scope-interaction test: cache a verdict under `ScopeFull`; re-run the
+  identical mutant, unchanged source, under `ScopePackage` — assert it is
+  **not** served from cache (independently computed), proving `Scope` is
+  load-bearing in the key, not decorative.
+- TCE-interaction test: cache an `Equivalent` verdict under `TCE=true`;
+  re-run with `TCE=false` on unchanged source — assert the mutant is
+  **not** short-circuited as equivalent, and instead receives a real
+  `Killed`/`Survived`/`NotViable` classification.
+- `-mutatemutant` interaction test: prime the cache with a normal run, then
+  run `-mutatemutant=<id>` for one of its mutants with the same
+  `CacheDir` — assert a real `go test` execution still happens
+  (`execCalls` increases), proving replay always bypasses the cache read;
+  assert a subsequent normal run's cache now reflects that replay's result.
+- `main_internal_test.go`: `-mutatecache=<dir>` combined with
+  `-mutateestimate=true` is rejected at parse time, mirroring the existing
+  `-mutateoutput`/`-mutatemin` + `-mutateestimate` rejection test;
+  `-mutatecache=<dir>` combined with `-mutatemutant=<id>` is **accepted**
+  (a negative-of-a-negative test, guarding against someone "fixing" this
+  by copying the estimate rejection too broadly).
+- `go vet`/`golangci-lint` clean with the new file in the tree, same bar
+  every other file in this repo already clears.
+
+---
+
 ## Suggested sequencing across all six
 
 Independent enough to parallelize, but if built serially, **3 before 1

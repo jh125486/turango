@@ -33,6 +33,14 @@ type Expect struct {
 	// from an explicit "expect zero suppressions"; a caller checks Suppressed
 	// != nil before comparing.
 	Suppressed *int `json:"suppressed,omitempty"`
+
+	// Equivalent pins the count of mutants Trivial Compiler Equivalence
+	// filtered before they ever reached the test suite (see
+	// [internal/mutate.Result.EquivalentCount]) — meaningful only when the
+	// entry itself has [Entry.TCE] set; a pointer for the same reason
+	// Suppressed is one, since most entries don't run under TCE at all and
+	// an absent field must not silently mean "expect zero".
+	Equivalent *int `json:"equivalent,omitempty"`
 }
 
 // Entry is one parsed golden.json: what to run, and what the run must
@@ -83,6 +91,14 @@ type Entry struct {
 	// both known ahead of time and free of the run-to-run flakiness a
 	// borderline-slow mutant near a derived boundary would otherwise cause.
 	Timeout string `json:"timeout"`
+
+	// TCE enables Trivial Compiler Equivalence (internal/mutate.Options.TCE)
+	// for this entry. False (the zero value, and every entry's implicit
+	// default before this field existed) matches every other entry's
+	// existing behavior exactly. Only a fixture built specifically to
+	// demonstrate TCE actually filtering a mutant (see
+	// corpus/op-tce-equivalent) needs this set.
+	TCE bool `json:"tce,omitempty"`
 
 	// Expect is the pinned outcome the run must match.
 	Expect Expect `json:"expect"`
