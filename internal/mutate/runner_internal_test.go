@@ -947,6 +947,66 @@ func TestResolveClosure(t *testing.T) {
 		}
 	})
 
+	// This covers the other go/packages test variant shape resolveClosure's
+	// own doc comment calls out: a *whitebox* _test.go file — same package
+	// clause as the production code (this repo's own convention is
+	// black-box by default, but a handful of files, e.g. runner_internal_test.go
+	// itself, are whitebox for a documented reason) — is not a second
+	// *packages.Package with a plain PkgPath; go/packages instead produces
+	// a distinct, bracketed "pkg [pkg.test]" variant that recompiles the
+	// production files together with the internal test file(s). Its own
+	// Imports map can hold an import used only by the internal test file,
+	// exactly as the black-box case above, and mergeVariants must not drop
+	// it either.
+	t.Run("an internal test file's own import is included", func(t *testing.T) {
+		t.Parallel()
+
+		moduleDir := t.TempDir()
+		targetDir := filepath.Join(moduleDir, "target")
+		helperDir := filepath.Join(moduleDir, "helper")
+
+		writeFiles(t, map[string]string{
+			filepath.Join(moduleDir, "go.mod"):         "module example.com/mod\n\ngo 1.23\n",
+			filepath.Join(targetDir, "target.go"):      "package target\n",
+			filepath.Join(targetDir, "target_test.go"): "package target\n",
+			filepath.Join(helperDir, "helper.go"):      "package helper\n",
+		})
+
+		mod := &packages.Module{Dir: moduleDir}
+
+		helper := &packages.Package{
+			PkgPath: "example.com/mod/helper",
+			Module:  mod,
+			GoFiles: []string{filepath.Join(helperDir, "helper.go")},
+		}
+
+		prod := &packages.Package{
+			PkgPath: "example.com/mod/target",
+			Module:  mod,
+			GoFiles: []string{filepath.Join(targetDir, "target.go")},
+		}
+
+		internalTest := &packages.Package{
+			PkgPath: "example.com/mod/target [example.com/mod/target.test]",
+			Module:  mod,
+			GoFiles: []string{
+				filepath.Join(targetDir, "target.go"),
+				filepath.Join(targetDir, "target_test.go"),
+			},
+			Imports: map[string]*packages.Package{"example.com/mod/helper": helper},
+		}
+
+		dirs, ok := resolveClosure(prod, internalTest)
+		if !ok {
+			t.Fatal("resolveClosure() ok = false, want true")
+		}
+
+		want := map[string]bool{targetDir: true, helperDir: true}
+		if !reflect.DeepEqual(dirs, want) {
+			t.Errorf("resolveClosure() dirs = %v, want %v — the internal test variant's own import must not be dropped", dirs, want)
+		}
+	})
+
 	// This is the regression test for the review's second finding: go.mod is
 	// copied unmodified into a closure-only workspace, so an in-module
 	// replace directive is only safe to leave untouched when its target is

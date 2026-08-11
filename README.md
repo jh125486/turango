@@ -70,6 +70,7 @@ All of turango's own flags require the `-flag=value` form (a bare
 | `-mutatemutant=<id>` | none | Replay exactly one mutant by the ID printed for it (in the console survivor listing or a JSON report's `MutantResult.ID`). The engine still walks every file and node — that part is cheap — but only the matching mutation is ever run, so the result holds at most one mutant. |
 | `-mutatetce=true\|false` | `false` | Trivial Compiler Equivalence: filter a mutant whose compiled output exactly matches a per-package baseline before it ever reaches the test suite, reporting it separately (see below) instead of as an ordinary survivor. Off by default — see "Filtering equivalent mutants" below for why. |
 | `-mutateworkspace=copy\|worktree` | `copy` | How each mutant's throwaway execution copy is built. `copy` recursively copies the module (works everywhere, no git dependency). `worktree` uses `git worktree add` instead, which shares the repository's object store rather than duplicating files — cheaper when the target module lives in a large git repo. Strictly opt-in and self-falling-back: requesting it against a target that isn't inside a clean git working tree (or isn't a git repo at all — every corpus fixture under `corpus/*/module/` is deliberately a plain directory) silently reverts to `copy`, never an error. |
+| `-mutateestimate=true\|false` | `false` | Preview a run instead of executing it: walk every file/node to count how many mutants would be generated, per package, then time one baseline sample per package (whole-module under `-mutatescope=full`, per-package otherwise) to extrapolate a rough serial and `-mutateparallel`-divided time estimate — both explicitly hedged, since real speedup is sub-linear under contention. No mutation is ever applied to disk and no mutant's `go test` is ever spawned to classify it. Incompatible with `-mutateoutput`/`-mutatemin`, which are rejected at parse time (nothing was classified, so there's no report to write or score to gate on). |
 
 ### Filtering equivalent mutants: `-mutatetce`
 
@@ -169,7 +170,8 @@ Thirteen operators, across six packages:
 - **`operator`** — `operator/assignment`, `operator/binary`,
   `operator/boundary` (`<`↔`<=`, `>`↔`>=` — the classic off-by-one mutant),
   `operator/inc_dec`, `operator/unary`: token-swap mutations.
-- **`literal`** — `literal/number` (shifts an int/float literal by ±1),
+- **`literal`** — `literal/number` (shifts an integer literal by ±1, or a
+  float literal by a small relative nudge in each direction),
   `literal/boolean` (`true`↔`false`).
 - **`identifier`** — `identifier/constswap`: swaps a package-level const
   reference for a same-type sibling in the same `const(...)` block — the

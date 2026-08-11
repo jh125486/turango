@@ -472,7 +472,7 @@ func TestMutateFileCascade(t *testing.T) {
 
 		sink := newCollector()
 
-		if err := mutateFile(t.Context(), run, &fileJob{moduleDir: root, path: path, mutators: mutator.All()}, sink); err != nil {
+		if err := mutateFile(t.Context(), run, &fileJob{moduleDir: root, path: path, mutators: mutator.All()}, sink, nil); err != nil {
 			t.Fatalf("mutateFile() error = %v, want the walk to stop at the suppressed loop", err)
 		}
 
@@ -499,7 +499,7 @@ func TestMutateFileCascade(t *testing.T) {
 
 		sink := newCollector()
 
-		if err := mutateFile(t.Context(), run, &fileJob{moduleDir: root, path: path, mutators: mutator.All()}, sink); err == nil {
+		if err := mutateFile(t.Context(), run, &fileJob{moduleDir: root, path: path, mutators: mutator.All()}, sink, nil); err == nil {
 			t.Fatal("mutateFile() error = nil: the fixture produced no mutants even unsuppressed")
 		}
 

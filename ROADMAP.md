@@ -56,19 +56,26 @@ are the load-bearing evidence for the eventual stdlib pitch:
    mutex is invisible to a synctest bubble. Lowest priority of the seven:
    nothing in the collector is timing-dependent today, so there is nothing
    to synctest-test yet — this is a door to leave open, not a bug to fix.
-8. **Not started.** Benchmark mutation-testing overhead — real elapsed-time
-   numbers (not the anecdotal "17+ minutes" and "minutes" data points
-   scattered across PROGRESS.md today) for how much wall-clock a mutation
-   run adds over a plain `go test`, as a function of production KLOC and
-   test KLOC, across scope modes and TCE. Built on Go's own `testing.B`/
-   `go test -bench`/`benchstat` pipeline, not a bespoke script — matches
-   how turango itself extends `go test`. This is the actual cost side of
-   the `PROPOSAL.md` cost/benefit pitch, currently unquantified.
+8. **Harness done (committed); real benchmark run in progress, not yet
+   finalized.** `BenchmarkMutate` (`internal/mutate/mutate_bench_test.go`)
+   is built and verified — see below. The actual `-count=1` overnight run
+   is executing as of this writing: `op-control-if`'s full 18-subtest
+   matrix completed cleanly, and `stdlib-strconv-parseuint`'s heavy
+   subtests are landing real data (e.g. `full/tce=false/parallel=1`:
+   3517 mutants, ~45.7 minutes, 6077x baseline). `BENCHMARKS.md` still
+   holds placeholder content until the full run finishes and gets written
+   up — don't treat this as done until that happens.
 9. **Not started.** Comment cleanup pass across the codebase and its docs —
    five distinct sub-tasks (staleness audit, a verbosity-trim style
    question, dead-code/stray-marker removal, format consistency, and
    proper academic citations for named techniques like TCE) that should
    not be treated as one mechanical task — see below for why.
+10. **Done.** `literal/number` now mutates float literals too (a relative
+    0.1% nudge, not a flat ±1 — see below for why). Found via an
+    independent fable-model review, built the same night.
+11. **Done.** `-mutateestimate=true` — a walk-only preview of a real run's
+    mutant count and a rough, honestly-hedged time estimate, per package,
+    before committing to it. See below for the full design.
 
 Each section below states the problem, the design decisions and their
 rationale, the exact files and functions touched, a build order, and how to
@@ -1345,6 +1352,22 @@ verified by `-race`, which channels would not improve on.
 
 ## 8. Benchmark mutation-testing overhead
 
+**Sequencing constraint, set explicitly by the user 2026-08-10: build the
+harness whenever, but do not actually *execute* a real timing run until
+it's the last thing done before proposal submission — plugged in, not on
+battery.** Two reasons stated: timing numbers captured on battery power are
+untrustworthy on their own (CPU frequency/power-state throttling skews
+wall-clock measurements in a way that has nothing to do with the code being
+measured), and more generally, benchmarking should happen once, right
+before the numbers go into `PROPOSAL.md`/`BENCHMARKS.md` for real — not
+repeatedly, mid-development, every time the harness changes. This was
+learned the concrete way: a subagent building this harness was caught
+mid-run actually executing `go test -bench` on battery and had to be
+killed and redirected. `BenchmarkMutate` itself should be built, verified
+to *compile* and pass lint (`go build`/`go vet`/`golangci-lint`), and
+reasoned about for correctness — but not run for real numbers — until
+someone explicitly says it's time.
+
 ### Problem
 
 `PROPOSAL.md` argues turango is worth upstreaming, but its "Costs and
@@ -1371,19 +1394,53 @@ a reviewer will ask about immediately.
   not a hand estimate),
 - mutant count (`Result`'s own `Counts()`),
 - one baseline `go test` wall-clock time (`goTestSuite`'s existing 3-run
-  average is the right number to reuse here — see 8b),
-- total mutation-run wall-clock time, and
-- the ratio of the two (**mutation multiplier**) — the actual number worth
-  putting in a proposal doc, e.g. "a full-scope run costs roughly Nx one
-  `go test` invocation for a package this size."
+  average is the right number to reuse here — see 8b), and
+- total mutation-run wall-clock time **at each of several
+  `-mutateparallel` settings** (see below) — each itself averaged over
+  multiple runs, not a single sample, for the same reason `goTestSuite`
+  already averages 3 baseline runs rather than trusting one (a cold build
+  cache, background system load, or GC pause can dominate a single
+  sample). **At least 3 runs per (target, scope, TCE, parallelism) cell.**
+  This is what `go test -bench`'s own `-count=N` flag already gives for
+  free — 8b's design already calls for `-count=6`+ per `benchstat`'s own
+  recommendation, so there is no need for a second, hand-rolled averaging
+  loop inside `BenchmarkMutate` itself: run the whole matrix with
+  `-count=3` (minimum) or `-count=6` (preferred, matching 8b), and average
+  (or let `benchstat` average) the repeated `ns/op`/custom-metric lines
+  `go test -bench`'s own output already produces per subbenchmark name.
 
-Report this once per **scope mode** (`full`/`package`/`impact`) and once
-with **TCE on vs. off**, since those are exactly the levers a user (or the
-stdlib pitch) would reach for to control cost, and neither has published
-numbers today either. Report at the parallelism level turango already
-recommends by default (`-mutateparallel` unset, i.e. file-level workers up
-to `NumCPU`) — a serial-vs-parallel comparison is worth one extra data
-point, not the focus.
+**Parallelism is swept, not fixed at one setting** — this is a deliberate
+correction to an earlier draft of this section, which treated a single
+serial-vs-parallel comparison as a nice-to-have, not the point. It is the
+point: `-mutateparallel` is the one lever most directly under a CI author's
+control (unlike scope, which trades away correctness confidence, or TCE,
+which trades away a small chance of a false equivalence), so its actual
+payoff curve — does doubling parallelism roughly halve wall-clock, or flatten
+out well before `NumCPU` because of I/O or `go test`'s own build-cache
+contention across concurrent workers — is exactly the number worth
+publishing. Sweep at minimum `{1, 4, 8}` (serial, a common small-CI-runner
+core count, a common larger one); scale the upper end to the actual
+benchmarking machine's `NumCPU` if it's smaller than 8, rather than
+requesting more workers than cores.
+
+**Final report shape**: one table per (target `x` scope `x` TCE)
+combination, columns = baseline plus one column per swept parallelism
+level, e.g.:
+
+| Package | Baseline test time | Mutate @ parallel=1 | Mutate @ parallel=4 | Mutate @ parallel=8 |
+|---|---|---|---|---|
+| `internal/mutate` | 1.2s | 4m30s | 1m20s | 52s |
+
+with the **mutation multiplier** (total / baseline) worth deriving as a
+secondary column or a follow-on note per row, not a replacement for the raw
+times — a reader evaluating "is this affordable in my CI" wants the actual
+wall-clock at the parallelism level they'd realistically run, not just a
+dimensionless ratio.
+
+Report this table once per **scope mode** (`full`/`package`/`impact`) and
+once with **TCE on vs. off**, since those are exactly the other two levers
+a user (or the stdlib pitch) would reach for to control cost, and neither
+has published numbers today either.
 
 **8b. Use `go test -bench`, Go's own built-in benchmark suite — not a
 shell script.** This is idiomatic for this codebase specifically: turango
@@ -1539,8 +1596,11 @@ document.
    empirically before relying on it (see PROGRESS.md's `-mutate`
    redesign, which caught a real `go help testflag` mismatch the same way).
 4. Run the full matrix: `go test -tags=integration -bench=BenchmarkMutate
-   -benchtime=1x -count=6 ./internal/mutate/...`, piped through `benchstat`
-   for the TCE-on-vs-off and scope-mode comparisons.
+   -benchtime=1x -count=6 ./internal/mutate/...` — the matrix already
+   includes the `{1, 4, 8}` (or machine-scaled) `-mutateparallel` sweep as
+   part of `BenchmarkMutate`'s own subbenchmark table per 8a, so this one
+   command produces every row of the final table — piped through
+   `benchstat` for the TCE-on-vs-off and scope-mode comparisons.
 5. Write `BENCHMARKS.md` (captured transcript + methodology), update
    `PROPOSAL.md`.
 
@@ -1696,6 +1756,268 @@ worse than the informal name-drop it replaced.
 - Every citation added under 9e is a real, dereferenceable link, spot-checked
   by actually opening it — the same standard this section holds the
   *existing* `[Mull]` citation to.
+
+---
+
+## 10. `literal/number` doesn't mutate float literals despite being documented to
+
+**Done.** Found during the gap-1 v2 corpus investigation (2026-08-11, via
+an independent fable-model review asked to sanity-check a suspiciously
+high mutant count) — an incidental finding, not what that review was
+actually looking for. Built the same night via a parallel worktree
+subagent. `Applies`/`Mutate` now match `token.FLOAT` too, staying in
+`literal/number` rather than a new sibling (int and float share the same
+node shape and `Apply`/`Revert` mechanics — only the shift math differs).
+Two of this section's own open questions were resolved with real,
+empirically-confirmed answers that overturned an assumption in the
+original design sketch below: a flat `±1` (or even a flat absolute
+epsilon) either produces a trivially-caught mutant or, at large
+magnitudes, a silent no-op once rendered — the fix uses a relative 0.1%
+nudge instead, and `constant.Value.ExactString()` (the design sketch's
+assumed rendering path) turns out to render a non-integer float as an
+invalid-Go-syntax exact fraction, not a usable literal — `String()`'s
+~6-significant-digit approximate rendering is used instead. See
+`internal/mutator/literal/number.go`'s `shiftFloat` doc comment for the
+full, evidence-based writeup.
+
+### Problem
+
+`internal/mutator/literal/number.go`'s `Applies` (line 35) matches only
+`*ast.BasicLit` nodes with `Kind == token.INT`; `Mutate` (line 48) has the
+same guard. Float literals (`token.FLOAT`) are never offered a mutation —
+confirmed by reading the code directly, not inferred. But `PROGRESS.md`
+("Extra: two new mutation operators + a literal package") and `README.md`
+both describe this operator as shifting "an int **or float** literal by
+±1." The operator's own doc comment on `NumberMutator` (in `number.go`
+itself) is honest — it says "shifts an integer literal," no float claim —
+so the mismatch is in the *surrounding* docs overselling what the code
+actually does, not the code lying about itself.
+
+Practical effect: a real bug in a float boundary constant (e.g. a
+threshold like `const maxRatio = 0.95`) gets zero coverage from this
+operator today, silently — nothing errors, nothing warns, the mutant
+simply never gets generated. Lower severity than an overcounting bug would
+have been (fewer mutants than claimed, not a wrong/misleading count), but
+still a real gap between documentation and behavior.
+
+### Design sketch (not built out to gap 1/2/5's precision — small, bounded fix)
+
+Extend `Applies`/`Mutate` to also match `token.FLOAT`, and extend
+`shiftBy` to handle a float `constant.Value` (`val.Kind() == constant.Float`)
+alongside the existing `constant.Int` path. Open questions worth resolving
+before implementing, not resolved here:
+
+- **What does "shift by 1" mean for a float?** `constant.BinaryOp(val,
+  token.ADD, constant.MakeInt64(1))` works generically across numeric
+  `constant.Value` kinds per `go/constant`'s own API (it's not
+  int-specific), so the *mechanism* likely just works unchanged — but
+  "shift `0.95` to `1.95`" is a much less interesting mutant than "shift
+  `0.95` to `0.949999...` or `0.950001...`" (a boundary-adjacent nudge,
+  closer to what actually catches a float comparison bug in practice).
+  Worth deciding whether float literals want a *different* shift magnitude
+  (e.g. a small epsilon, or a percentage-of-value nudge) rather than
+  reusing the integer operator's literal "±1," which could produce a
+  float mutant so far from the original value that it's trivially caught
+  by almost any test — low signal, same "avoid uninteresting mutants"
+  instinct `operator/boundary` and `literal/number` already follow for
+  integers.
+- **Rendering.** `shifted.ExactString()` already handles float rendering
+  via `go/constant`'s own formatting — verify it produces valid, minimal Go
+  float syntax (not e.g. an over-precise decimal expansion) before trusting
+  it unchanged for the float path.
+- **Same operator or a new one?** Given the shift-magnitude question above
+  might call for genuinely different logic (not just "run the same
+  arithmetic on a different `constant.Kind`"), consider whether this
+  belongs as `literal/number`'s extension or a new sibling operator (e.g.
+  `literal/float`) — mirroring how `literal/number`/`literal/boolean` are
+  already split by literal kind rather than one operator switching on
+  `token.Kind` internally.
+
+### Files/functions touched
+
+- `internal/mutator/literal/number.go` — `Applies`, `Mutate`, `shiftBy` (or
+  a new sibling file, per the open question above).
+- `PROGRESS.md`/`README.md` — no change needed if the fix ships (docs
+  become accurate); if the fix is *not* built, correct the "int or float"
+  claim down to "int only" instead, so the docs stay honest either way.
+
+### Verification
+
+- Table-driven test (same pattern `number_test.go` already uses for the
+  integer case) covering a float literal in each Go float syntax form
+  (decimal, exponent notation) offering the expected two mutations.
+- A corpus fixture or existing example package with a real float constant
+  used in a boundary comparison, confirming the new mutant is actually
+  generated end-to-end through the engine, not just at the unit level.
+
+---
+
+## 11. `-mutateestimate`: predict mutant count and run time before committing to a real run
+
+**Done.** Built the same night via a parallel worktree subagent as gap 10.
+`mutate.Estimate(ctx, opts) (*EstimateResult, error)` — a separate entry
+point, not an `Options` flag (11a), reusing `load`/`plan`/`planPackage`/
+`mutateFile`/`visitNode` exactly, with one new branch in `visitNode`'s
+per-mutation loop (gated on a non-nil tally) that records a package hit
+instead of calling `runner.run`. Per-package baseline timing (11b) runs
+after the count-only walk, only for packages the walk actually found a
+mutant in — deliberately, not precomputed alongside `ScopeImpact`'s
+coverage map the way the ROADMAP's own "files touched" section originally
+implied, since timing a package before knowing it has any mutants would
+waste `go test` invocations; the design section's own prose (not that
+list) already called for this. Extrapolation reports both a serial and a
+`-mutateparallel`-divided number, both explicitly hedged (11c). TCE is
+ignored for v1 as planned (11d). Flag name: `-mutateestimate=true` (11e),
+combined with `-mutateoutput`/`-mutatemin` as a hard parse-time error
+rather than a silent no-op. The zero-subprocess claim for the counting
+phase is proven by a real test (`TestWalkForEstimateSpawnsNoSubprocess`),
+not just asserted — an `execCalls` atomic counter (mirroring
+`loadTypedCalls`'s existing precedent) confirms zero `go test`/`go build`
+subprocesses during the walk. `README.md`'s flag table still needs a
+`-mutateestimate` entry — flagged as a follow-up, not done as part of this
+gap.
+
+### Problem
+
+There is currently no way to know, before starting a real `-mutate` run,
+how many mutants it will generate or how long it will take. Tonight's own
+benchmark work found this out the expensive way:
+`corpus/stdlib-strconv-parseuint`'s `isprint.go` alone produces 2552
+`literal/number` mutants (see gap 10's sibling finding, and PROGRESS.md's
+gap-1 v2 section) — a run that looked like an ordinary small-package sweep
+turned into a multi-hour one with zero warning beforehand. `-fuzz` doesn't
+have a direct analogue to crib from here (it runs for a caller-specified
+*duration*, not until a fixed, unknown-in-advance corpus is exhausted), so
+this is new ground, not a port of an existing `go test` flag's behavior.
+
+### Design decisions
+
+**11a. Reuse the existing walk to count, don't build a second one.**
+`engine.mutateFile`/`visitNode` already visits every node and computes
+every mutation's ID unconditionally, even under `-mutatemutant=<id>`
+replay, where only one matching mutation is ever handed to `run.run` (see
+gap 4's `mutantID`/`Options.MutantID` mechanism — the exact precedent for
+"walk everything, execute selectively"). Counting mode is the same shape
+taken further: walk everything, execute *nothing*. Concretely, a new
+`Options.EstimateOnly bool` (or a dedicated `mutate.Estimate(ctx, opts)`
+entry point, sharing `plan()`/`mutateFile`/`visitNode` — open question,
+not resolved here, on whether this is a mode of `Run` or a separate
+function; a separate function is probably cleaner given the return shape
+is genuinely different, not a `*Result` with `Status` fields that were
+never actually determined) that makes `visitNode` skip the `run.run(ctx,
+*spec)` call entirely and instead increment a per-package counter. This is
+cheap — an AST walk with no `go test` subprocess anywhere — so estimate
+mode should complete in roughly the time a normal run's *setup* takes
+(parsing + `//nomutant` scanning), not meaningfully longer.
+
+**11b. Baseline timing must be per-package, not one whole-module number,
+whenever scope is narrower than `ScopeFull`.** This is the load-bearing
+design point, not a detail: under `ScopePackage`/`ScopeImpact`, a real
+mutant's `go test` invocation is scoped to just its own package
+(`mutant.testArgs`, runner.go), so a single whole-module baseline
+(`goTestSuite(goBin, opts.Dir, opts.patterns())`, already computed for
+`-mutatetimeout`'s derivation) is the *wrong* per-mutant cost proxy — it
+would systematically overestimate every package's cost by however much
+larger the whole module's test suite is than that one package's own tests.
+The estimate needs one baseline sample per package that actually has
+mutants (encountered during 11a's walk), each timed the same way
+`goTestSuite` already times the whole-module baseline, just scoped to that
+package's own pattern instead of `opts.patterns()`. Under `ScopeFull`, the
+existing whole-module baseline *is* the right number (every mutant really
+does run `go test ./...` under that scope) — no new per-package timing
+needed there, reuse what `resolveTimeout` already computes.
+
+Real cost/accuracy tension worth surfacing, not hiding: a single baseline
+sample per package (vs. `baselineRuns`' existing 3-run average) is faster
+but noisier — cold-cache variance alone was measured tonight at 5x
+(0.75s warm vs. 3.95s cold `GOCACHE`, see this session's conversation) for
+the exact same test invocation. An estimate built on one noisy sample per
+package could be off by a similar factor. Whether to spend 3x the setup
+time for a steadier per-package average, or accept a rougher single-sample
+estimate in exchange for speed (the entire point of this feature is being
+*fast* to check before committing to the real run), is an open call —
+lean toward a single sample for v1, with the estimate's own output text
+saying plainly that it's a rough, not authoritative, number.
+
+**11c. Extrapolation is honest about being optimistic, given tonight's own
+evidence that parallel speedup is sub-linear under contention.** Total
+estimated time = Σ over packages of (that package's mutant count ×
+that package's baseline time), reported at least two ways: a naive
+serial number (dividing by 1), and a number divided by the run's actual
+`-mutateparallel` worker count (or its default) — labeled clearly as an
+optimistic lower bound, not a promise, since real wall-clock speedup
+depends on CPU contention this session directly observed tonight (a
+measured ~8 mutants/minute against a raw per-mutant cost that should have
+supported far more, once system load and shared-`GOCACHE` contention were
+accounted for). Do not present a single confident number without that
+caveat.
+
+**11d. TCE interaction — explicitly out of scope for v1.** A mutant TCE
+would filter as compiler-equivalent never reaches `go test` at all (see
+gap 2), so a perfectly accurate estimate under `-mutatetce=true` would
+need to run the (cheaper, but still real) TCE compile-and-compare step per
+mutant during the walk — meaningfully more expensive than 11a's pure AST
+walk, working against this feature's whole point of being a fast preview.
+v1: the estimate ignores TCE and reports the raw mutant count regardless
+of `-mutatetce`; note in the output that the real run may filter some
+mutants TCE would catch, making the real run potentially faster than
+estimated when TCE is on. A TCE-aware estimate is a reasonable v2, not
+built here.
+
+**11e. Flag naming — open question.** `-mutateestimate=true` (mirroring
+`-mutatetce`'s boolean-flag shape) is the working name in this section;
+alternatives like `-mutatedryrun` were considered and are also reasonable
+— "dry run" signals "don't actually run it" clearly but doesn't by itself
+promise a time estimate the way "estimate" does. Worth a naming call
+before implementation, the same way gap 4 flagged `-mutant` vs.
+`-mutatemutant` as an open naming question before that flag shipped.
+
+### Files/functions touched
+
+- `internal/mutate/engine.go` — new `Options.EstimateOnly` (or a separate
+  `Estimate` entry point per 11a's open question), `visitNode`'s skip-run
+  branch, per-package baseline timing threaded from `plan()`/
+  `planPackage` the same way `planScope`'s `buildImpact`/`planTCEBaseline`
+  already precompute other per-package artifacts once, before any mutant
+  of that package runs.
+- `internal/mutate/report.go` — a new result shape for the estimate (not
+  `*Result`, which carries `Status`/`Output` fields an estimate never
+  populates) and a console printer, parallel to `WriteSummary`.
+- `cmd/turango/main.go` — new flag (name per 11e), short-circuiting to the
+  estimate path and exiting before any real mutation run, `-mutateoutput`/
+  `-mutatemin` presumably both no-ops in estimate mode (nothing was
+  classified, so there's no report to write and no score to gate on) —
+  worth an explicit check that main.go actually skips those rather than
+  silently misbehaving.
+
+### Build order
+
+1. 11a (walk-only counting, `Options.EstimateOnly`) alone first — verify
+   against a corpus fixture with a known golden mutant count that estimate
+   mode's count exactly matches a real run's total, with zero `go test`
+   subprocesses spawned (assert via the same kind of call-counter
+   technique `loadTypedCalls` already uses to prove `loadTyped` is
+   skipped when unneeded).
+2. 11b (per-package baseline timing) — reuses `goTestSuite`'s existing
+   shape, scoped per package.
+3. 11c (extrapolation + console output).
+4. CLI flag wiring (name per 11e).
+
+### Verification
+
+- Unit/fast test: estimate mode's mutant count matches a real `Run()`'s
+  `len(Result.Mutants) + len(Result.Equivalents)` (equivalents still count
+  as "would have been attempted" for an estimate that ignores TCE per
+  11d) exactly, for at least one multi-package fixture — not just a
+  single-file one, since 11b's per-package-not-whole-module design is the
+  point being tested.
+- Sanity check against tonight's own overnight benchmark data once it
+  finishes: does the estimate's predicted time for
+  `stdlib-strconv-parseuint` land anywhere near the real measured time
+  `BENCHMARKS.md` will eventually record? This won't be an exact match
+  (11c's own honesty about contention/sub-linear speedup), but a
+  wildly-off estimate (10x+) would mean the design's cost model itself is
+  wrong, not just imprecise.
 
 ---
 

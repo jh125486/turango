@@ -1,14 +1,16 @@
 // Whitebox: these tests exercise engine.go's unexported machinery directly —
-// mutantID, the collector, mutateFile, Options.mutators/parallel, and
-// baselineTimeout/resolveTimeout — none of which is reachable through the
-// exported Run/Options/Result surface alone. Blackbox coverage of Run's
-// exported behaviour lives in engine_test.go; the whitebox integration test
-// touching the loadTypedCalls counter lives in
-// engine_integration_internal_test.go (behind the "integration" build tag).
+// mutantID, the collector, mutateFile, Options.mutators/parallel,
+// baselineTimeout/resolveTimeout, and walkForEstimate/estimateTally — none
+// of which is reachable through the exported Run/Estimate/Options/Result
+// surface alone. Blackbox coverage of Run's exported behaviour lives in
+// engine_test.go; the whitebox integration test touching the loadTypedCalls
+// counter lives in engine_integration_internal_test.go (behind the
+// "integration" build tag).
 package mutate
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -167,7 +169,7 @@ func TestMutateFileStopsWhenCancelled(t *testing.T) {
 
 	job := &fileJob{moduleDir: root, path: path, mutators: mutator.All()}
 
-	err := mutateFile(ctx, run, job, sink)
+	err := mutateFile(ctx, run, job, sink, nil)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("mutateFile() error = %v, want %v", err, context.Canceled)
 	}
@@ -452,4 +454,117 @@ func TestResolveTimeout(t *testing.T) {
 			t.Errorf("resolveTimeout() = %v, want %v", got, want)
 		}
 	})
+}
+
+// TestWalkForEstimateSpawnsNoSubprocess is the concrete, checkable form of
+// ROADMAP.md gap 11a's claim that Estimate's counting phase costs "an AST
+// walk with no go test subprocess anywhere": it asserts execCalls (see
+// runner.go) never increments while walkForEstimate runs, the same
+// call-counter technique TestRunWithoutConstSwapNeverLoadsTypes
+// (engine_integration_internal_test.go) uses to prove loadTyped is skipped
+// when unneeded.
+//
+// The fixture is corpus/op-operator-binary, whose golden.json already pins
+// its expected mutant count (1) as part of this project's own regression
+// harness (internal/corpus's TestCorpus) — read directly from the golden
+// file here via goldenMutantCount, rather than hardcoded a second time, so
+// this test cannot silently drift from the file it is supposed to be
+// cross-checking against.
+//
+// goBin is a deliberately nonexistent path, the same defensive pattern
+// every other whitebox test in this package uses (see e.g.
+// TestRunSkipsNoOpMutation in runner_internal_test.go): walkForEstimate
+// should never reach a point where it would matter, and reaching the
+// toolchain at all would fail loudly rather than silently passing this
+// test.
+//
+// It deliberately does not call t.Parallel(): execCalls is a process-wide
+// counter shared by every test in this compiled binary, and this is the one
+// test that specifically needs its own delta to be exactly zero rather than
+// merely whatever it happened to be — running non-parallel, and therefore
+// to completion before any t.Parallel() sibling resumes past its own
+// Parallel() call, is what makes that assertion reliable rather than a race
+// (see TestRunWithoutConstSwapNeverLoadsTypes's identical reasoning).
+func TestWalkForEstimateSpawnsNoSubprocess(t *testing.T) {
+	root := repoModuleRoot(t)
+	moduleDir := filepath.Join(root, "corpus", "op-operator-binary", "module")
+	golden := filepath.Join(root, "corpus", "op-operator-binary", "golden.json")
+
+	want := goldenMutantCount(t, golden)
+
+	before := execCalls.Load()
+
+	counts, err := walkForEstimate(t.Context(), "/nonexistent/go", Options{
+		Packages: []string{"./..."},
+		Dir:      moduleDir,
+	})
+	if err != nil {
+		t.Fatalf("walkForEstimate() error = %v", err)
+	}
+
+	if counts.total != want {
+		t.Errorf("walkForEstimate() total = %d, want %d (per %s)", counts.total, want, golden)
+	}
+
+	if after := execCalls.Load(); after != before {
+		t.Errorf("walkForEstimate() spawned %d go test/go build subprocess(es), want 0", after-before)
+	}
+}
+
+// goldenMutantCount reads a corpus golden.json's pinned expect.mutants
+// field directly, so a test asserting against it cannot silently drift from
+// the file it is meant to be cross-checking. Only the one field this
+// package's tests need is decoded — internal/corpus.Entry's full schema
+// belongs to that package, not duplicated here for one int.
+func goldenMutantCount(t *testing.T, path string) int {
+	t.Helper()
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile(%s) error = %v", path, err)
+	}
+
+	var golden struct {
+		Expect struct {
+			Mutants int `json:"mutants"`
+		} `json:"expect"`
+	}
+
+	if err := json.Unmarshal(data, &golden); err != nil {
+		t.Fatalf("Unmarshal(%s) error = %v", path, err)
+	}
+
+	return golden.Expect.Mutants
+}
+
+// repoModuleRoot resolves the repository root from the test binary's
+// working directory (internal/mutate, under `go test`'s default behaviour)
+// by walking upward to the directory holding go.mod — the same approach
+// internal/corpus/corpus_test.go's repoRoot and mutate_bench_test.go's
+// benchRepoRoot both take, duplicated here (a two-line helper) rather than
+// shared, for the same reason benchRepoRoot's own doc comment gives: each
+// caller needs a different testing type (*testing.T here), and promoting
+// this to shared exported API for a handful of callers isn't worth the
+// churn.
+func repoModuleRoot(t *testing.T) string {
+	t.Helper()
+
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd() error = %v", err)
+	}
+
+	dir := wd
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir
+		}
+
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			t.Fatalf("repoModuleRoot: no go.mod found above %s", wd)
+		}
+
+		dir = parent
+	}
 }

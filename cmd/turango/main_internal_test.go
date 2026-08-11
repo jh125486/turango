@@ -97,6 +97,8 @@ func TestParseMutateFlagsValues(t *testing.T) {
 			t.Errorf("TCE = true, want false")
 		case cfg.options.Workspace != mutate.WorkspaceCopy:
 			t.Errorf("Workspace = %v, want %v", cfg.options.Workspace, mutate.WorkspaceCopy)
+		case cfg.estimate:
+			t.Errorf("estimate = true, want false")
 		}
 	})
 
@@ -143,6 +145,24 @@ func TestParseMutateFlagsValues(t *testing.T) {
 			t.Errorf("TCE = false, want true")
 		case cfg.options.Workspace != mutate.WorkspaceWorktree:
 			t.Errorf("Workspace = %v, want %v", cfg.options.Workspace, mutate.WorkspaceWorktree)
+		}
+	})
+
+	t.Run("estimate flag", func(t *testing.T) {
+		t.Parallel()
+
+		// Deliberately not combined with -mutateoutput/-mutatemin in this
+		// subtest: that combination is rejected outright (see
+		// TestParseMutateFlagsErrors), so "every flag set" above
+		// intentionally leaves -mutateestimate out rather than needing two
+		// separate near-duplicate "every flag" cases.
+		cfg, _, err := parseMutateFlags([]string{"-mutate=.", "-mutateestimate=true"})
+		if err != nil {
+			t.Fatalf("parseMutateFlags() error = %v", err)
+		}
+
+		if !cfg.estimate {
+			t.Error("estimate = false, want true")
 		}
 	})
 
@@ -240,23 +260,30 @@ func TestParseMutateFlagsErrors(t *testing.T) {
 		args []string
 		want string
 	}{
-		"bare -mutate":          {args: []string{"-mutate", "."}, want: "= form"},
-		"bare -mutatescope":     {args: []string{"-mutate=.", "-mutatescope"}, want: "= form"},
-		"bare -mutateparallel":  {args: []string{"-mutateparallel"}, want: "= form"},
-		"invalid regexp":        {args: []string{"-mutate=(unclosed"}, want: "mutate"},
-		"unknown mutate flag":   {args: []string{"-mutate=.", "-mutatescopes=full"}, want: "unknown flag"},
-		"unknown scope":         {args: []string{"-mutate=.", "-mutatescope=module"}, want: "unknown scope"},
-		"non-numeric parallel":  {args: []string{"-mutate=.", "-mutateparallel=lots"}, want: "positive integer"},
-		"zero parallel":         {args: []string{"-mutate=.", "-mutateparallel=0"}, want: "positive integer"},
-		"bad duration":          {args: []string{"-mutate=.", "-mutatetimeout=30"}, want: "mutatetimeout"},
-		"negative duration":     {args: []string{"-mutate=.", "-mutatetimeout=-5s"}, want: "positive duration"},
-		"empty output":          {args: []string{"-mutate=.", "-mutateoutput="}, want: "requires a directory"},
-		"non-numeric min":       {args: []string{"-mutate=.", "-mutatemin=high"}, want: "mutatemin"},
-		"empty mutant id":       {args: []string{"-mutate=.", "-mutatemutant="}, want: "mutatemutant"},
-		"uppercase mutant id":   {args: []string{"-mutate=.", "-mutatemutant=A1B2C3"}, want: "mutatemutant"},
-		"non-hex mutant id":     {args: []string{"-mutate=.", "-mutatemutant=not-hex!"}, want: "mutatemutant"},
-		"non-bool tce":          {args: []string{"-mutate=.", "-mutatetce=sometimes"}, want: "want true or false"},
-		"unknown workspace":     {args: []string{"-mutate=.", "-mutateworkspace=network"}, want: "unknown workspace"},
+		"bare -mutate":         {args: []string{"-mutate", "."}, want: "= form"},
+		"bare -mutatescope":    {args: []string{"-mutate=.", "-mutatescope"}, want: "= form"},
+		"bare -mutateparallel": {args: []string{"-mutateparallel"}, want: "= form"},
+		"invalid regexp":       {args: []string{"-mutate=(unclosed"}, want: "mutate"},
+		"unknown mutate flag":  {args: []string{"-mutate=.", "-mutatescopes=full"}, want: "unknown flag"},
+		"unknown scope":        {args: []string{"-mutate=.", "-mutatescope=module"}, want: "unknown scope"},
+		"non-numeric parallel": {args: []string{"-mutate=.", "-mutateparallel=lots"}, want: "positive integer"},
+		"zero parallel":        {args: []string{"-mutate=.", "-mutateparallel=0"}, want: "positive integer"},
+		"bad duration":         {args: []string{"-mutate=.", "-mutatetimeout=30"}, want: "mutatetimeout"},
+		"negative duration":    {args: []string{"-mutate=.", "-mutatetimeout=-5s"}, want: "positive duration"},
+		"empty output":         {args: []string{"-mutate=.", "-mutateoutput="}, want: "requires a directory"},
+		"non-numeric min":      {args: []string{"-mutate=.", "-mutatemin=high"}, want: "mutatemin"},
+		"empty mutant id":      {args: []string{"-mutate=.", "-mutatemutant="}, want: "mutatemutant"},
+		"uppercase mutant id":  {args: []string{"-mutate=.", "-mutatemutant=A1B2C3"}, want: "mutatemutant"},
+		"non-hex mutant id":    {args: []string{"-mutate=.", "-mutatemutant=not-hex!"}, want: "mutatemutant"},
+		"non-bool tce":         {args: []string{"-mutate=.", "-mutatetce=sometimes"}, want: "want true or false"},
+		"unknown workspace":    {args: []string{"-mutate=.", "-mutateworkspace=network"}, want: "unknown workspace"},
+		"non-bool estimate":    {args: []string{"-mutate=.", "-mutateestimate=maybe"}, want: "want true or false"},
+		"estimate with output": {
+			args: []string{"-mutate=.", "-mutateestimate=true", "-mutateoutput=/tmp/reports"}, want: "no effect on",
+		},
+		"estimate with min": {
+			args: []string{"-mutate=.", "-mutateestimate=true", "-mutatemin=0.5"}, want: "no effect on",
+		},
 		"leftover go test flag": {args: []string{"-mutate=.", "-v"}, want: "unsupported flag"},
 		"leftover before the flag": {
 			args: []string{"-count=1", "-mutate=."}, want: "unsupported flag",

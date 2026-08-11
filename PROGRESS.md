@@ -21,7 +21,7 @@ Ported the original go-turango prototype's example.go/example_test.go unchanged 
 Added after the phase-7 historical-bug validation surfaced a concrete gap ("no constant-mutation operator" — see task 7 above and PROPOSAL.md's Evidence section):
 
 - **`operator/boundary`** (`internal/mutator/operator/boundary.go`) — relational boundary shift: `<`↔`<=`, `>`↔`>=`. The classic off-by-one mutant. Distinct from `operator/binary`, which does negation-style swaps (`==`↔`!=`, `&&`↔`||`, etc.) and never touches boundary relations.
-- **`internal/mutator/literal/`** (new package) — `literal/number` (shifts an int or float literal by ±1) and `literal/boolean` (`true`↔`false`).
+- **`internal/mutator/literal/`** (new package) — `literal/number` (shifts an integer literal by ±1, or a float literal by a small relative nudge — see ROADMAP.md gap 10, done) and `literal/boolean` (`true`↔`false`).
 
 This closes *part* of the constant-mutation gap — literal ints/floats/bools and relational boundaries are now covered. A full identifier/constant-swap operator (rewriting a named constant or identifier reference, e.g. the historical strconv#21278 wrong-bit-width-constant shape) still requires `go/types` to resolve identifier bindings and is not built — that remains open, documented as a known limitation in PROPOSAL.md.
 
@@ -395,10 +395,201 @@ incremental testing) — the proposal's claim is that the *mechanism*
 belongs in the toolchain, not that this is the fastest possible
 implementation of it.
 
-**Not yet committed** as of this section: `PROPOSAL.md`, `ROADMAP.md`,
-`internal/mutate/engine.go`, `internal/mutate/runner.go`,
-`internal/mutate/runner_internal_test.go` — ask before committing, per
-standing instruction.
+**Committed as `686e12a`.**
+
+## Gap 1 v2 (`identifier/localconstswap`), a real corpus bug found and fixed, PROPOSAL.md concurrency-testing limitation noted (2026-08-11, same session, overnight)
+
+Built via two parallel worktree subagents (gap 1 v2, gap 8 benchmark
+harness) per the user's request — see each agent's own worktree diff for
+full detail; this section covers what actually landed after independent
+verification, not the agents' self-reports at face value.
+
+**Gap 1 v2 — done, `identifier/localconstswap`.** Closes the strconv
+`ParseUint` bug shape gap 1 v1 explicitly left open (v1 is const-for-const
+only; the real historical bug was local-var-to-const). New operator swaps
+a function-local variable's use, when it's an operand of a comparison
+(`<`/`<=`/`>`/`>=`/`==`/`!=`), for a type-compatible package-level
+constant. Untyped constants need `representable()` (a narrow replica of
+the compiler's own constant-overflow check) rather than `types.AssignableTo`,
+which was verified empirically to accept nonsense like a negative untyped
+constant assigned to `uint64`. **Real reproduction verified**: a unit test
+(`TestLocalMutateReproducesStrconvShape`, type-checks the real frozen
+`corpus/stdlib-strconv-parseuint/module/atoi.go`) confirms `Mutate()` on
+`n1 > maxVal` offers `maxVal -> maxUint64` — the exact historical bug.
+
+**A real design bug found and fixed mid-session, not shipped as-is.** The
+subagent's first version had no restriction beyond "type-compatible" —
+validated against the strconv fixture, this produced a real ~24x mutant
+blowup, and inspecting the survivors showed why: `quote.go`'s unrelated
+loop-index locals (`r`, `i`, `j`, `rr`) were being offered against
+`intSize`/`IntSize` (declared in `atoi.go`) and `nSmalls` (declared in
+`itoa.go`) — three different files, zero conceptual relationship, pure
+type-compatibility noise. Fixed by restricting candidates to
+package-level constants declared in the *same file* as the local's use
+(mirroring v1's own same-file fallback rule) — verified this preserves the
+strconv reproduction (`maxUint64`/`maxVal`/`n1` are all in `atoi.go`
+together) while eliminating the cross-file noise entirely. Isolated
+operator count for this fixture: 81 mutants (41 killed/33 survived/7
+not-viable), stable and reproducible across multiple runs.
+
+**A second, unrelated, pre-existing corpus bug found while chasing the
+above — `corpus/stdlib-strconv-parseuint/golden.json` was already wrong,
+independent of gap 1 entirely.** Proven by stashing all gap-1 work and
+running the pure pre-v2 HEAD binary against the current fixture files: it
+produced 1276+ mutants (partial — killed by the environment's backgrounded-job
+ceiling before finishing, still climbing) against a golden claiming 157.
+Root cause: the fixture includes `isprint.go` (683 lines, a Unicode
+range table) — nothing to do with identifiers. **Independently verified by
+a fable-model review** (asked for specifically because the original 2443
+figure was itself a partial-run estimate, not something to trust at face
+value): no double-counting bug in `literal/number.go` or the engine's
+walk — exactly 2 mutations per matched `token.INT` literal, confirmed by
+code reading. The real, complete count is **2552** (1077 of the fixture's
+1276 total `INT` literals — 84% — are in `isprint.go` alone, cross-checked
+against a plain `grep -c '0x[0-9a-f]\+'`), meaning the original "roughly
+2443" *undercounted* by ~4%, consistent with a killed-mid-walk partial run,
+not a code flaw. Incidental finding: `literal/number`'s docs (this file,
+README.md) claim it mutates "int or float" literals; the code only matches
+`token.INT` — floats are never touched, a doc-only mismatch (fewer real
+mutants than documented, not more) worth a follow-up fix, not urgent. This
+golden was stale (or never validated at the fixture's current size) well
+before this session.
+**`corpus/stdlib-strconv-parseuint/golden.json` has been removed** (`git rm`),
+moving this fixture into the same "no golden, `Discover()` skips it, needs
+a proper foreground recapture" bucket `stdlib-crypto-aes`/
+`stdlib-encoding-base64` are already in (see "Extra: mutation corpus"
+section above) — a full run takes many minutes minimum here, the same
+"backgrounded Bash gets killed regardless of concurrency" environment
+limitation already documented for aes/base64. The fixture's frozen source
+and its now-outdated "operators can't reproduce this" description are
+still valuable/true history (v2 *does* now reproduce it, per the unit test
+above) — only the stale aggregate golden.json was removed, not the module
+source. **Corpus regression harness is now back to a clean, fully-passing
+17/18 discoverable entries** (was 18 including this one's wrong golden;
+aes/base64 already excluded — see existing "Extra: mutation corpus"
+section's 17/19-intended count, now effectively 17/20-intended with this
+one moved into the paused bucket too).
+
+**A real, previously-undocumented limitation found via a sharp user
+question, not code work**: turango's `goTest` always passes `-parallel=1`
+(resource-contention hygiene — avoids `GOMAXPROCS x -mutateparallel`
+workers thread-multiplication misclassifying slow-but-fine mutants as
+timeout-killed) and never adds `-race` itself. Net effect: a mutation
+that only breaks under real concurrent execution (e.g. deleting a
+`mutex.Lock()`) is not reliably caught by a default run — reduced
+scheduling pressure from `-parallel=1` can hide a race a real `t.Parallel()`
+fan-out would have surfaced, and without `-race`, Go's own race detector
+never even runs. Both are opt-in via turango's existing flag passthrough
+(`turango test -race -mutate=... ./...`), but this was undocumented
+anywhere before now. **Not yet added to PROPOSAL.md/ROADMAP.md as a
+written limitation** — flagged to the user, awaiting a decision on where
+it should live.
+
+**Verification, all independently re-run after intervening in the
+subagent's work — all clean**: `go build ./...`, `go vet ./...`,
+`gofmt -l .` (excluding frozen `corpus/stdlib-*`), `golangci-lint`
+(both modes, 0 issues), `go test ./...` (`internal/corpus` now passes for
+real — 239s, no timeout, confirming the stale-golden removal fixed it),
+`go test -tags=integration ./internal/mutate/... ./internal/mutator/...`.
+One real hiccup along the way: `internal/mutate`'s git-worktree tests
+(`TestWorkspaceFor*`/`TestGitRepoRoot`/`TestGitWorktreeClean`/
+`TestCopyWorktree`) failed once on `1Password: agent returned an error`
+during test-fixture `git commit` calls — an environment/session issue
+(1Password's agent had gone idle overnight), not a code regression; a
+clean re-run after the user unlocked 1Password passed in ~4s per test
+(vs. the prior 60s timeout), confirming the diagnosis.
+
+## Gaps 10/11 built via parallel worktree subagents; real overnight benchmark run in progress (2026-08-11, same session, later)
+
+Two more parallel worktree subagents (one per gap, both independently
+verified after the fact, not trusted from self-report):
+
+**Gap 10 — done, committed `afd0420`.** `literal/number` now mutates
+float literals too. Two real, empirically-confirmed findings overturned
+the original design sketch's assumptions: a flat `±1` (or a flat absolute
+epsilon) either produces a trivially-caught mutant or, at large
+magnitudes, a silent no-op once rendered (`0.001` added to `1.5e10`
+round-trips to the exact same printed text) — fixed with a relative 0.1%
+nudge instead. `constant.Value.ExactString()` — the assumed rendering
+path — renders a non-integer float as an exact `numerator/denominator`
+fraction, not valid Go syntax at all; `String()`'s ~6-significant-digit
+approximate rendering is used instead. Stayed in `literal/number` rather
+than a new `literal/float` sibling (same node shape, same `Apply`/`Revert`
+mechanics). `PROGRESS.md`/`README.md`'s stale "int or float ±1" claim is
+now corrected for real.
+
+**Gap 11 — done, committed `7c23c2d`.** `-mutateestimate=true`:
+`mutate.Estimate(ctx, opts)`, a separate entry point from `Run` (not an
+`Options` flag — the two results answer structurally different
+questions), reusing the exact same walk/plan/type-resolution machinery
+with one new branch in `visitNode` that tallies a package hit instead of
+calling `runner.run`. Per-package baseline timing (not one whole-module
+number) whenever scope is narrower than `ScopeFull` — the load-bearing
+design point, since a real mutant's `go test` invocation is itself
+package-scoped under `ScopePackage`/`ScopeImpact`. Extrapolation reports
+both a naive-serial and a `-mutateparallel`-divided number, both
+explicitly hedged as an optimistic lower bound. The zero-subprocess claim
+for the counting phase is proven, not asserted — a new `execCalls` atomic
+counter (mirroring `loadTypedCalls`' existing precedent) backs
+`TestWalkForEstimateSpawnsNoSubprocess`. Smoke-tested live against
+`example/`: 271 total mutants, matching `corpus/example/golden.json`'s
+count exactly.
+
+Both merged into the main checkout by copying files directly from each
+worktree (not a branch merge) since the worktrees had diverged from a
+stale base; doc lines (`ROADMAP.md`/`README.md`/`PROGRESS.md`) that had
+moved on in the main checkout since each worktree branched were hand-merged
+rather than overwritten.
+
+**ROADMAP.md gap 8's real benchmark run started overnight, still in
+progress as of this writing** — `go test -tags=integration
+-bench=BenchmarkMutate -benchtime=1x -count=1 -timeout=0
+./internal/mutate/...`, run in the background, restarted twice after
+being killed by an unrelated environment ceiling (see below), currently
+on its third attempt. Real data landed so far: `op-control-if`'s full
+18-subtest matrix completed cleanly (e.g. `full/tce=false/parallel=1`:
+8 mutants, ~6.9s, ~15x baseline); `stdlib-strconv-parseuint` (the
+isprint.go-inflated ~3500-mutant fixture) has landed
+`full/tce=false/parallel=1`: 3517 mutants, **~45.7 minutes**, 6077x
+baseline — the single most expensive subtest in the matrix, now past.
+`-count=1` (not `-count=6`) and the accepted-overnight-runtime tradeoff
+were both explicit user choices after being told the full matrix could
+take 20+ hours. **`BENCHMARKS.md` has not been updated yet** — still
+placeholder content until the run finishes for real; do not cite numbers
+from it until that happens.
+
+**Real environment/session issues hit and diagnosed along the way, not
+code bugs:**
+- The benchmark process was killed outright twice by what looks like a
+  wall-clock ceiling on backgrounded Bash jobs in this environment —
+  consistent with the exact same issue PROGRESS.md's aes/base64 thread
+  already documented, now also hitting a `go test -bench` invocation, not
+  just raw `turango` runs. Each time, the *process itself* was still
+  alive and cycling through mutants (confirmed via `ps` — distinct
+  `strconvbug.test` PIDs appearing seconds apart) when checked, meaning
+  the earlier "it's just slow" read was correct and "it's stuck" reads
+  were not — but background job termination still happened as a separate
+  mechanism, unrelated to actual liveness.
+- The user twice caught the assistant overclaiming a *cause* for slowness
+  without direct evidence: first, "system contention" was asserted before
+  checking real load average (which was under the machine's core count,
+  6.88–9.92 on a 10-core M1 Pro); second, after being pointed at `top`
+  showing mostly idle CPU, a live check found the top CPU consumers were
+  unrelated desktop apps (Microsoft Edge, WindowServer) and even the
+  `claude` process itself — not competing `go test` invocations. The
+  measured, *proven* cost factor remains the cold-vs-warm `GOCACHE` gap
+  (0.75s vs. 3.95s for an identical invocation, 5.2x) found earlier via
+  direct isolated timing; the *cause* of the remaining gap to observed
+  real-world throughput (~8 mutants/min) was never conclusively pinned
+  down beyond that, and should not be re-asserted as "contention" without
+  new evidence.
+- `internal/corpus`'s `TestCorpus` (600s default `go test` timeout) failed
+  once during gap-11's verification while the benchmark was mid-run,
+  concurrently with two subagents' own verification passes; re-run in
+  isolation with `-timeout=20m` it passed cleanly at 468.6s — genuinely
+  slower than this same suite's earlier 233–245s runs tonight, cause not
+  pinned down (see above — don't assume "contention" explains this either
+  without checking).
 
 ## If resuming after a break
 

@@ -329,15 +329,284 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 
 	run := &runner{goBin: goBin, testTimeout: timeout, workspace: opts.Workspace}
 
-	jobs, err := plan(ctx, goBin, opts, pkgs, mutators, typedPkgs, closurePkgs, funcPattern)
+	jobs, err := plan(ctx, goBin, opts, pkgs, mutators, typedPkgs, closurePkgs, funcPattern, false)
 	if err != nil {
 		return &Result{}, err
 	}
 
 	sink := newCollector()
-	runErr := execute(ctx, run, jobs, opts.parallel(), sink)
+	runErr := execute(ctx, run, jobs, opts.parallel(), sink, nil)
 
 	return sink.close(), runErr
+}
+
+// Estimate performs a walk-only preview of what -mutate would produce: how
+// many mutants a real [Run] would generate, broken down per package, and a
+// rough, honestly-hedged prediction of how long running them would take —
+// without ever writing a mutation to disk or spawning a single `go test`
+// subprocess to classify one. See ROADMAP.md gap 11 for the full design and
+// the reasoning behind every caveat [EstimateResult] carries.
+//
+// It is a separate entry point from Run, not an [Options] flag, deliberately
+// — see gap 11a: the two results answer structurally different questions.
+// Run's *Result carries Status/Output fields a mutant that was never
+// executed could never populate honestly (a zero Status would even print as
+// "killed", the iota's zero value); [EstimateResult]'s fields — a count, a
+// single timing sample — are exactly what an unexecuted walk actually knows
+// and nothing it doesn't.
+//
+// Estimate reuses exactly the same package/operator/type resolution and AST
+// walk Run does — load, needsTypes/loadTyped, plan/planPackage, mutateFile/
+// visitNode — via [walkForEstimate]. The only behavioural difference is one
+// branch inside visitNode's per-mutation loop (guarded by a non-nil tally)
+// that tallies a package's count instead of calling [runner.run]. Dependency-
+// closure resolution (ROADMAP.md gap 5) and per-package coverage maps
+// (ScopeImpact) are both execution-time concerns with nothing to contribute
+// to a count, so planPackage skips building them for an estimate-only job.
+//
+// Per-package baseline timing (ROADMAP.md gap 11b) intentionally runs
+// *after* the count-only walk finishes, not precomputed alongside it the way
+// ScopeImpact's coverage map or TCE's baseline compile are for a real run:
+// only a package that the walk actually found at least one mutant in is
+// worth timing at all, and that is only known once the walk is done.
+func Estimate(ctx context.Context, opts Options) (*EstimateResult, error) {
+	goBin, err := goproxy.Resolve()
+	if err != nil {
+		return nil, err
+	}
+
+	counts, err := walkForEstimate(ctx, goBin, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	return buildEstimateResult(ctx, goBin, opts, counts), nil
+}
+
+// walkForEstimate performs [Estimate]'s counting phase alone: resolve
+// mutators and packages exactly as [Run] does, then reuse plan/execute/
+// mutateFile/visitNode with a non-nil tally so visitNode's estimate branch
+// tallies every matching mutation instead of calling [runner.run].
+//
+// Split out from Estimate specifically so a test can assert this phase alone
+// spawns zero `go test`/`go build` subprocesses (see execCalls in
+// runner.go), independent of [buildEstimateResult]'s per-package baseline
+// timing, which deliberately does spawn them — the same "prove the cheap
+// part is actually cheap" technique [loadTypedCalls] already established for
+// the identifier/constswap typed-operator gate.
+func walkForEstimate(ctx context.Context, goBin string, opts Options) (estimateCounts, error) {
+	mutators, err := opts.mutators()
+	if err != nil {
+		return estimateCounts{}, err
+	}
+
+	funcPattern, err := regexp.Compile(opts.FuncPattern)
+	if err != nil {
+		return estimateCounts{}, fmt.Errorf("mutate: func pattern %q: %w", opts.FuncPattern, err)
+	}
+
+	pkgs, err := load(ctx, opts)
+	if err != nil {
+		return estimateCounts{}, err
+	}
+
+	// Type information is resolved under the identical zero-cost-unless-needed
+	// gate Run() uses — an estimate must select the same TypedMutator-bound
+	// mutations a real run would, or its count would not match Run()'s.
+	var typedPkgs map[string]*packages.Package
+
+	if needsTypes(mutators) {
+		typedPkgs, err = loadTyped(ctx, opts)
+		if err != nil {
+			return estimateCounts{}, err
+		}
+	}
+
+	// closurePkgs is deliberately nil: dependency-closure resolution only
+	// ever affects how a mutant's *execution* workspace is built
+	// (runner.workspaceFor), never which mutations the walk finds, so
+	// resolving it here would cost real time for zero effect on the count.
+	jobs, err := plan(ctx, goBin, opts, pkgs, mutators, typedPkgs, nil, funcPattern, true)
+	if err != nil {
+		return estimateCounts{}, err
+	}
+
+	tally := newEstimateTally()
+	walkErr := execute(ctx, nil, jobs, opts.parallel(), nil, tally)
+	counts := tally.close()
+
+	return counts, walkErr
+}
+
+// buildEstimateResult times each package the walk found a mutant in and
+// extrapolates a total, per ROADMAP.md gap 11b/11c.
+//
+// Under [ScopeFull] every mutant really does run `go test ./...`
+// (mutant.testArgs), so one whole-module sample applies identically to
+// every package; it is measured once, not per package, and only if the walk
+// found at least one mutant anywhere (nothing to time otherwise). Under a
+// narrower scope, a whole-module baseline would systematically overestimate
+// every package's real per-mutant cost — see gap 11b — so each package gets
+// its own single-sample timing instead, scoped to just its own pattern, via
+// [packageBaseline].
+//
+// Every timing here is a single sample, not [baselineRuns]' three-run
+// average a real run uses to derive its timeout: cold-cache variance alone
+// was measured at roughly 5x for an identical invocation (0.75s warm vs.
+// 3.95s cold GOCACHE) during this gap's own validation, so treat every
+// [PackageEstimate.Baseline] as a rough number, not an authoritative one —
+// spending 3x the setup time for a steadier average would work directly
+// against this feature's whole point of being fast to check before
+// committing to the real run.
+func buildEstimateResult(ctx context.Context, goBin string, opts Options, counts estimateCounts) *EstimateResult {
+	result := &EstimateResult{
+		Total:   counts.total,
+		Workers: opts.parallel(),
+		TCE:     opts.TCE,
+	}
+
+	var fullBaseline time.Duration
+
+	if opts.Scope == ScopeFull && counts.total > 0 {
+		fullBaseline, _ = goTestSuite(goBin, opts.Dir, opts.patterns())(ctx)
+	}
+
+	for _, pkgPath := range counts.order {
+		h := counts.hits[pkgPath]
+
+		baseline := fullBaseline
+		if opts.Scope != ScopeFull {
+			baseline = packageBaseline(ctx, goBin, h.moduleDir, h.pkgDir)
+		}
+
+		result.Packages = append(result.Packages, PackageEstimate{
+			Package:  pkgPath,
+			Mutants:  h.count,
+			Baseline: baseline,
+		})
+
+		result.SerialEstimate += time.Duration(h.count) * baseline
+	}
+
+	if result.Workers > 0 {
+		result.ParallelEstimate = result.SerialEstimate / time.Duration(result.Workers)
+	}
+
+	return result
+}
+
+// packageBaseline times one sample of pkgDir's own tests, scoped to just
+// that package's pattern — the same [mutant.testArgs] shape a real mutant's
+// `go test` invocation uses under [ScopePackage]/[ScopeImpact]. A pattern or
+// timing failure reports a zero baseline rather than failing the whole
+// estimate: a rough number for every other package is more useful than
+// none at all over one package's toolchain hiccup, matching the fail-soft
+// precedent [planScope] and [planTCEBaseline] already set for per-package
+// precomputes that are optimisations, not correctness requirements.
+func packageBaseline(ctx context.Context, goBin, moduleDir, pkgDir string) time.Duration {
+	pattern, err := packagePattern(moduleDir, pkgDir)
+	if err != nil {
+		return 0
+	}
+
+	d, err := goTestSuite(goBin, moduleDir, []string{pattern})(ctx)
+	if err != nil {
+		return 0
+	}
+
+	return d
+}
+
+// estimateHit is one matching mutation [Estimate]'s walk found, carrying
+// just enough for [buildEstimateResult] to later time a per-package baseline
+// sample against the right pattern.
+type estimateHit struct {
+	pkgPath, moduleDir, pkgDir string
+}
+
+// pkgHits is one package's running tally plus the location
+// [buildEstimateResult] needs to time its own baseline sample under a scope
+// narrower than [ScopeFull].
+type pkgHits struct {
+	moduleDir, pkgDir string
+	count             int
+}
+
+// estimateCounts is [estimateTally]'s final, aggregated result: how many
+// matching mutations the walk found for each package.
+type estimateCounts struct {
+	total int
+
+	// order preserves each package's first-seen position during the walk —
+	// a pkgPath is an import path, not otherwise a meaningful sort key, so
+	// insertion order is what [EstimateResult.Packages] is reported in.
+	order []string
+	hits  map[string]*pkgHits
+}
+
+// estimateTally aggregates every file worker's walk-only mutation count into
+// one per-package [estimateCounts], via a single consumer goroutine draining
+// one channel — the same channel-not-mutex shape [collector] uses, for the
+// identical testing/synctest reason documented on collector's own doc
+// comment. It is [Estimate]'s stand-in for collector: where collector
+// records a verdict per mutant, estimateTally only ever records that a
+// matching mutation exists, and never touches [runner.run] to find out —
+// see visitNode's tally branch.
+type estimateTally struct {
+	hits chan estimateHit
+	done chan estimateCounts
+}
+
+// newEstimateTally starts the consumer goroutine and returns a tally ready
+// to receive hits. The caller must call close exactly once, after every
+// producer goroutine that might call count has finished — the same contract
+// [newCollector] documents for its own close.
+func newEstimateTally() *estimateTally {
+	t := &estimateTally{
+		hits: make(chan estimateHit),
+		done: make(chan estimateCounts),
+	}
+
+	go t.consume()
+
+	return t
+}
+
+// count records one matching mutation for pkgPath. Blocks until the
+// consumer goroutine receives it, the same effective backpressure
+// [collector.mutant] provides.
+func (t *estimateTally) count(pkgPath, moduleDir, pkgDir string) {
+	t.hits <- estimateHit{pkgPath: pkgPath, moduleDir: moduleDir, pkgDir: pkgDir}
+}
+
+// consume drains hits until the channel is closed, accumulating into one
+// estimateCounts, then publishes it on done.
+func (t *estimateTally) consume() {
+	result := estimateCounts{hits: map[string]*pkgHits{}}
+
+	for hit := range t.hits {
+		h, ok := result.hits[hit.pkgPath]
+		if !ok {
+			h = &pkgHits{moduleDir: hit.moduleDir, pkgDir: hit.pkgDir}
+			result.hits[hit.pkgPath] = h
+			result.order = append(result.order, hit.pkgPath)
+		}
+
+		h.count++
+		result.total++
+	}
+
+	t.done <- result
+}
+
+// close signals that no more hits will be sent, and blocks until the
+// consumer goroutine has finished aggregating, returning the final
+// estimateCounts. Must be called exactly once, after every producer
+// goroutine has already returned.
+func (t *estimateTally) close() estimateCounts {
+	close(t.hits)
+
+	return <-t.done
 }
 
 // execute drives the file workers, bounded at parallel files in flight.
@@ -345,7 +614,12 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 // The group's context is derived from ctx, so the first failing file cancels
 // the rest instead of leaving a doomed run to grind through every remaining
 // mutant — each of which costs a full `go test`.
-func execute(ctx context.Context, run *runner, jobs []fileJob, parallel int, sink *collector) error {
+//
+// Exactly one of sink/tally is non-nil: a real run passes sink and a nil
+// tally; [walkForEstimate] passes a nil sink, a nil run, and a non-nil
+// tally — see [visitNode]'s branch on tally, the only place either is
+// actually read.
+func execute(ctx context.Context, run *runner, jobs []fileJob, parallel int, sink *collector, tally *estimateTally) error {
 	group, groupCtx := errgroup.WithContext(ctx)
 	group.SetLimit(parallel)
 
@@ -353,7 +627,7 @@ func execute(ctx context.Context, run *runner, jobs []fileJob, parallel int, sin
 		job := &jobs[i]
 
 		group.Go(func() error {
-			return mutateFile(groupCtx, run, job, sink)
+			return mutateFile(groupCtx, run, job, sink, tally)
 		})
 	}
 
@@ -788,6 +1062,13 @@ type fileJob struct {
 	// moduleDir is the absolute root of the module holding path.
 	moduleDir string
 
+	// pkgPath is the import path of the package holding path, e.g.
+	// "example.com/fixture/mathx". It is only consulted by [Estimate]'s
+	// tally (see visitNode) to key a package's mutant count and, later, its
+	// baseline-timing sample — a real run never reads it, since every
+	// [MutantResult] already identifies its package via File.
+	pkgPath string
+
 	// path is the absolute path of the file to mutate.
 	path string
 
@@ -868,11 +1149,17 @@ type fileJob struct {
 // closurePkgs is non-nil only when [Run] determined the run's scope is not
 // [ScopeFull]; it is used, per package, to resolve [fileJob.closure] via
 // [resolveClosure] (ROADMAP.md gap 5).
-func plan(ctx context.Context, goBin string, opts Options, pkgs []*packages.Package, mutators []mutator.Mutator, typedPkgs map[string]*packages.Package, closurePkgs map[string][]*packages.Package, funcPattern *regexp.Regexp) ([]fileJob, error) {
+//
+// estimateOnly is true only for [walkForEstimate]'s call: it makes
+// planPackage skip every execution-time-only per-package precompute
+// (ScopeImpact's coverage map, TCE's baseline compile, gap 5's dependency
+// closure) since none of them affect which mutations the walk finds — only
+// how a real mutant would later be executed, which [Estimate] never does.
+func plan(ctx context.Context, goBin string, opts Options, pkgs []*packages.Package, mutators []mutator.Mutator, typedPkgs map[string]*packages.Package, closurePkgs map[string][]*packages.Package, funcPattern *regexp.Regexp, estimateOnly bool) ([]fileJob, error) {
 	var jobs []fileJob
 
 	for _, pkg := range pkgs {
-		pkgJobs, err := planPackage(ctx, goBin, opts, pkg, mutators, typedPkgs, closurePkgs, funcPattern)
+		pkgJobs, err := planPackage(ctx, goBin, opts, pkg, mutators, typedPkgs, closurePkgs, funcPattern, estimateOnly)
 		if err != nil {
 			return nil, err
 		}
@@ -976,8 +1263,9 @@ func planTCEBaseline(ctx context.Context, goBin string, opts Options, moduleDir,
 }
 
 // planPackage builds pkg's file jobs, or nil if pkg has nothing mutable (no
-// module info, or no non-test .go files). See [plan] for the parameters.
-func planPackage(ctx context.Context, goBin string, opts Options, pkg *packages.Package, mutators []mutator.Mutator, typedPkgs map[string]*packages.Package, closurePkgs map[string][]*packages.Package, funcPattern *regexp.Regexp) ([]fileJob, error) {
+// module info, or no non-test .go files). See [plan] for the parameters,
+// including estimateOnly.
+func planPackage(ctx context.Context, goBin string, opts Options, pkg *packages.Package, mutators []mutator.Mutator, typedPkgs map[string]*packages.Package, closurePkgs map[string][]*packages.Package, funcPattern *regexp.Regexp, estimateOnly bool) ([]fileJob, error) {
 	if pkg.Module == nil || pkg.Module.Dir == "" {
 		return nil, nil
 	}
@@ -999,17 +1287,34 @@ func planPackage(ctx context.Context, goBin string, opts Options, pkg *packages.
 		return nil, nil
 	}
 
-	scope, cover, err := planScope(ctx, goBin, opts.Scope, pkg, files)
-	if err != nil {
-		return nil, err
-	}
+	// Every precompute below is an execution-time-only concern — it changes
+	// how a real mutant would later be tested, never which mutations the
+	// walk finds — so [Estimate]'s walk skips all three: computing them
+	// would cost real go test/go build subprocesses for a preview whose
+	// whole point is spawning none (see [walkForEstimate]'s doc comment and
+	// ROADMAP.md gap 11a).
+	var (
+		scope       Scope
+		cover       *impactMap
+		tceBaseline []byte
+		closure     map[string]bool
+	)
 
-	tceBaseline, err := planTCEBaseline(ctx, goBin, opts, pkg.Module.Dir, files[0])
-	if err != nil {
-		return nil, err
-	}
+	if !estimateOnly {
+		var err error
 
-	closure := planClosure(scope, closurePkgs, filepath.Dir(files[0]))
+		scope, cover, err = planScope(ctx, goBin, opts.Scope, pkg, files)
+		if err != nil {
+			return nil, err
+		}
+
+		tceBaseline, err = planTCEBaseline(ctx, goBin, opts, pkg.Module.Dir, files[0])
+		if err != nil {
+			return nil, err
+		}
+
+		closure = planClosure(scope, closurePkgs, filepath.Dir(files[0]))
+	}
 
 	// Per-package, not run-wide, only when a selected operator implements
 	// mutator.TypedMutator: most jobs keep pkgMutators == mutators (the
@@ -1039,6 +1344,7 @@ func planPackage(ctx context.Context, goBin string, opts Options, pkg *packages.
 	for _, path := range files {
 		job := fileJob{
 			moduleDir:   pkg.Module.Dir,
+			pkgPath:     pkg.PkgPath,
 			path:        path,
 			scope:       scope,
 			cover:       cover,
@@ -1113,7 +1419,11 @@ func syntaxFor(typedPkg *packages.Package, path string) *ast.File {
 // The FileSet is per file rather than per run: positions only ever have to be
 // consistent within the file currently being printed, and a fresh set keeps
 // memory flat over a large module.
-func mutateFile(ctx context.Context, run *runner, job *fileJob, sink *collector) error {
+//
+// Exactly one of sink/tally is non-nil — see [execute]'s doc comment; both
+// are threaded straight through to [visitNode], the only place either is
+// read.
+func mutateFile(ctx context.Context, run *runner, job *fileJob, sink *collector, tally *estimateTally) error {
 	// Checked before parsing, not just inside the walk: with a bounded worker
 	// pool most jobs start after cancellation rather than before it, and
 	// parsing a file whose mutants will never run is pure waste.
@@ -1200,7 +1510,7 @@ func mutateFile(ctx context.Context, run *runner, job *fileJob, sink *collector)
 			return false
 		}
 
-		visit, err := visitNode(ctx, run, job, relPath, suppressed, sink, &spec, node)
+		visit, err := visitNode(ctx, run, job, relPath, suppressed, sink, tally, &spec, node)
 		if err != nil {
 			walkErr = err
 
@@ -1243,7 +1553,14 @@ func mutantID(relPath string, line, col int, operator string, index int) string 
 // function only fills in the per-node/per-mutation fields before handing a
 // copy to run.run. relPath is path relative to its module root, computed once
 // per file by the caller — see [mutantID].
-func visitNode(ctx context.Context, run *runner, job *fileJob, relPath string, suppressed suppressions, sink *collector, spec *mutant, node ast.Node) (bool, error) {
+//
+// Exactly one of sink/tally is non-nil (see [execute]'s doc comment). sink
+// is nil-checked before every use, since a suppression can be found — and
+// reported, in a real run — regardless of which mode this is; tally being
+// non-nil is what actually makes this an [Estimate] walk rather than a real
+// one: the branch just above run.run below tallies the mutation and moves
+// on, never touching run (which the estimate path never even constructs).
+func visitNode(ctx context.Context, run *runner, job *fileJob, relPath string, suppressed suppressions, sink *collector, tally *estimateTally, spec *mutant, node ast.Node) (bool, error) {
 	// Returning false here skips this function's body entirely, the same
 	// cascade mechanism suppression uses below — a function whose name does
 	// not match FuncPattern (and everything nested inside it) is simply
@@ -1265,11 +1582,13 @@ func visitNode(ctx context.Context, run *runner, job *fileJob, relPath string, s
 	// compound statement covers everything nested inside it without the walk
 	// having to carry any "am I inside a suppressed subtree" state.
 	if reason, ok := suppressed.anchored(spec.fset, node); ok {
-		sink.suppression(SuppressionResult{
-			File:   spec.path,
-			Line:   spec.fset.Position(node.Pos()).Line,
-			Reason: reason,
-		})
+		if sink != nil {
+			sink.suppression(SuppressionResult{
+				File:   spec.path,
+				Line:   spec.fset.Position(node.Pos()).Line,
+				Reason: reason,
+			})
+		}
 
 		return false, nil
 	}
@@ -1279,52 +1598,77 @@ func visitNode(ctx context.Context, run *runner, job *fileJob, relPath string, s
 			continue
 		}
 
-		pos := spec.fset.Position(node.Pos())
-
-		spec.operator = m.Name()
-		spec.line = pos.Line
-		// The before/after fallback for any [mutator.Mutation] that leaves
-		// Node nil — see runner.go's renderNode.
-		spec.node = node
-		// Looked up per node rather than per mutant: every mutation of a node
-		// shares its line, and the map is only consulted at all under
-		// ScopeImpact (covering reports nil for a nil map).
-		spec.covering = job.cover.covering(spec.path, spec.line)
-
-		for i, mutation := range m.Mutate(node) {
-			if err := ctx.Err(); err != nil {
-				return false, err
-			}
-
-			spec.mutation = mutation
-			spec.id = mutantID(relPath, pos.Line, pos.Column, spec.operator, i)
-
-			// job.mutantID replays exactly one mutant (see [Options.MutantID]):
-			// the walk still reaches every node and computes every ID — that
-			// part is cheap — but only a matching mutation is ever handed to
-			// the runner.
-			if job.mutantID != "" && spec.id != job.mutantID {
-				continue
-			}
-
-			res, ok, equivalent, err := run.run(ctx, *spec)
-			if err != nil {
-				return false, err
-			}
-
-			switch {
-			case ok:
-				sink.mutant(res)
-			case equivalent:
-				sink.equivalent(EquivalentResult{
-					File:        res.File,
-					Line:        res.Line,
-					Operator:    res.Operator,
-					Description: res.Description,
-				})
-			}
+		if err := visitMutations(ctx, run, job, relPath, sink, tally, spec, m, node); err != nil {
+			return false, err
 		}
 	}
 
 	return true, nil
+}
+
+// visitMutations runs every mutation m offers for node — either tallying it
+// ([Estimate]'s walk, when tally is non-nil) or classifying it via
+// run.run (a real run) — recording the per-node bookkeeping (operator,
+// line, covering) every one of m's mutations shares. Split out of
+// [visitNode] purely to keep that function's own branching manageable; the
+// split changes nothing about behaviour, only where it's written.
+func visitMutations(ctx context.Context, run *runner, job *fileJob, relPath string, sink *collector, tally *estimateTally, spec *mutant, m mutator.Mutator, node ast.Node) error {
+	pos := spec.fset.Position(node.Pos())
+
+	spec.operator = m.Name()
+	spec.line = pos.Line
+	// The before/after fallback for any [mutator.Mutation] that leaves
+	// Node nil — see runner.go's renderNode.
+	spec.node = node
+	// Looked up per node rather than per mutant: every mutation of a node
+	// shares its line, and the map is only consulted at all under
+	// ScopeImpact (covering reports nil for a nil map).
+	spec.covering = job.cover.covering(spec.path, spec.line)
+
+	for i, mutation := range m.Mutate(node) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		spec.mutation = mutation
+		spec.id = mutantID(relPath, pos.Line, pos.Column, spec.operator, i)
+
+		// job.mutantID replays exactly one mutant (see [Options.MutantID]):
+		// the walk still reaches every node and computes every ID — that
+		// part is cheap — but only a matching mutation is ever handed to
+		// the runner.
+		if job.mutantID != "" && spec.id != job.mutantID {
+			continue
+		}
+
+		// Estimate's walk-only counting mode (ROADMAP.md gap 11a): tally
+		// records that a real run would classify this mutation, without
+		// ever calling run.run — the one branch that makes this whole
+		// walk a preview rather than a run. run is never touched here;
+		// walkForEstimate never even constructs one.
+		if tally != nil {
+			tally.count(job.pkgPath, spec.moduleDir, spec.pkgDir)
+
+			continue
+		}
+
+		res, ok, equivalent, err := run.run(ctx, *spec)
+		if err != nil {
+			return err
+		}
+
+		switch {
+		case ok:
+			sink.mutant(res)
+		case equivalent:
+			sink.equivalent(EquivalentResult{
+				File:        res.File,
+				Line:        res.Line,
+				Operator:    res.Operator,
+				Description: res.Description,
+			})
+		}
+	}
+
+	return nil
 }

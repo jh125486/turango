@@ -1,7 +1,9 @@
 // Package literal implements mutation operators that change a literal value
-// in source rather than swapping an operator or removing a statement: an
-// integer constant shifted by one (the classic off-by-one — `x < 0` becomes
-// `x < 1`), or a boolean literal flipped (`true` becomes `false`).
+// in source rather than swapping an operator or removing a statement: a
+// numeric constant shifted — an integer by one in each direction (the
+// classic off-by-one — `x < 0` becomes `x < 1`), a float by a small
+// relative nudge in each direction (`x < 0.95` becomes `x < 0.95095`) — or
+// a boolean literal flipped (`true` becomes `false`).
 //
 // These are a different failure mode from the token-swap operators in
 // package operator: a boundary shift (operator/boundary) moves which

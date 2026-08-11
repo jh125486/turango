@@ -33,6 +33,18 @@
 // package-const, not const-to-const — and is a known, deliberate v1
 // limitation (see ROADMAP.md, gap 1).
 //
+// # v2: local-variable-to-package-constant swap (identifier/localconstswap)
+//
+// [localConstSwap], also in this file, is the v2 extension ROADMAP.md's gap 1
+// flags as follow-on: it closes the strconv gap directly by allowing a
+// *local* variable's use — not just another package-level constant's use —
+// to be swapped for a same-type package-level constant. It is a separate
+// registered operator (a separate node shape needs a separate Applies/Mutate
+// pair, following this codebase's existing precedent of splitting related-
+// but-distinct mutation shapes into distinct operators — see how
+// control/if and control/else are two operators despite both editing parts
+// of the same *ast.IfStmt), not a change to [constSwap] above.
+//
 // # Why this operator opts into TypedMutator
 //
 // Every other operator in this codebase implements only [mutator.Mutator] and
@@ -54,8 +66,10 @@ package identifier
 
 import (
 	"go/ast"
+	"go/constant"
 	"go/token"
 	"go/types"
+	"math"
 	"sort"
 
 	"github.com/jh125486/turango/internal/mutator"
@@ -262,4 +276,436 @@ func buildGroups(info *types.Info) map[*types.Const][]*types.Const {
 	}
 
 	return groups
+}
+
+// LocalConstSwapName is the registry name of the v2, local-variable-to-
+// package-constant swap operator (ROADMAP.md gap 1's follow-on).
+const LocalConstSwapName = "identifier/localconstswap"
+
+func init() {
+	mutator.Register(LocalConstSwapName, func() mutator.Mutator { return &localConstSwap{} })
+}
+
+// comparisonOps is the set of relational and equality operators
+// [localConstSwap] restricts its scan to: the same "boundary-relevant"
+// family operator/boundary targets (<, <=, >, >=), plus == and != per
+// ROADMAP.md's v2 sketch. This is where a wrong-constant substitution
+// actually changes observable behaviour — the strconv ParseUint bug this
+// operator is modelled on was exactly a boundary check, `n1 > maxVal`
+// silently becoming `n1 > maxUint64`. Restricting to comparison operands
+// (rather than, say, every identifier use of matching type) is also the
+// operator's primary defence against combinatorial explosion: only
+// identifiers that are themselves operands of a *specific* comparison node
+// are ever considered, one AST node at a time, so a function with many
+// unrelated identifier references never contributes candidates it isn't
+// directly comparing against something.
+var comparisonOps = map[token.Token]bool{
+	token.LSS: true,
+	token.LEQ: true,
+	token.GTR: true,
+	token.GEQ: true,
+	token.EQL: true,
+	token.NEQ: true,
+}
+
+// localConstSwap swaps a use of a function-local variable, when it appears
+// as an operand of a comparison, for a package-level constant whose type is
+// compatible with the variable's declared type. It is the v2 extension
+// ROADMAP.md's gap 1 documents as a follow-on to [constSwap]: v1 only swaps
+// one package-level constant for another; this operator additionally
+// reaches into the historical strconv#21278 ParseUint shape, where the bug
+// was a bitSize-scoped local (`maxVal`) used where the package-level
+// constant `maxUint64` should have been.
+//
+// # Why "compatible" is not always types.Identical
+//
+// v1's package-const-for-const swap requires an exact [types.Identical]
+// match, and the same rule is used here whenever the candidate constant was
+// given an explicit type in its declaration (e.g. `const limit uint64 =
+// 100`). But the strconv fixture this operator is validated against declares
+// its constant as `const maxUint64 = (1<<64 - 1)` — no explicit type — and
+// for an untyped constant declaration, go/types records [types.Const.Type]
+// as one of the untyped basic kinds (here, untyped int), never the type the
+// constant happens to fit into at any particular use site. types.Identical
+// between "untyped int" and "uint64" is false, so a literal port of v1's
+// exact-match rule would silently fail to reproduce the one bug shape this
+// whole operator exists to close.
+//
+// The fix is not to loosen this to [types.AssignableTo]: that function
+// reports whether V's *type* is assignable to T without ever consulting the
+// constant's actual value, so it treats every untyped integer constant as
+// assignable to every integer-kinded variable regardless of magnitude or
+// sign — verified empirically (see the constswap_test.go case built around
+// it): types.AssignableTo(negative-untyped-int, uint64) reports true, but
+// `var x uint64 = -1` is a real compile error ("constant -1 overflows
+// uint64"). Offering that swap would be a guaranteed-uncompilable mutant
+// this operator could have avoided, contradicting the "avoid
+// guaranteed-uncompilable mutants where the operator can tell in advance"
+// standard v1 already holds itself to (see this file's package doc).
+//
+// Instead, for an untyped candidate constant, [representable] replicates
+// (a deliberately narrow slice of) the compiler's own constant-overflow
+// check directly against the constant's actual value and the variable's
+// underlying basic kind — see representable's own doc for exactly what it
+// does and does not cover.
+//
+// # Why the candidate set is restricted to the local's own file
+//
+// An earlier version of this operator had no such restriction — every
+// package-level constant whose type was compatible with the local's
+// declared type was a candidate, on the theory that a local has no natural
+// "block" to share with a package constant the way two package constants
+// might. That theory was validated against the real, frozen
+// corpus/stdlib-strconv-parseuint fixture (a 4-file slice of real strconv
+// source) during ROADMAP.md gap 1's own flagged validation pass, and it
+// failed: mutant count on that fixture went up roughly 24x, and the large
+// majority of the new mutants were nonsense, not "wrong identifier" bugs —
+// e.g. quote.go's loop-index locals (`r`, `i`, `j`, `rr`) being offered
+// against `intSize`/`IntSize` (declared in atoi.go) and `nSmalls` (declared
+// in itoa.go), three unrelated files with no conceptual relationship to a
+// rune-quoting loop's index variables. Package-wide, untyped integer
+// constants are common enough, and integer comparisons common enough, that
+// "type-compatible" alone is nowhere near "plausibly confusable" once a
+// package spans more than one file.
+//
+// The fix restricts candidates to package-level constants declared in the
+// *same file* as the local variable's use — the same file-scoped fallback
+// v1's own same-block-or-file rule already uses for a constant that isn't
+// part of a parenthesized block. This keeps the strconv reproduction intact
+// (`maxUint64`, `maxVal`, and the `n1 > maxVal` comparison are all declared
+// in atoi.go) while eliminating the cross-file noise entirely — quote.go's
+// locals no longer see atoi.go's or itoa.go's constants as candidates at
+// all, since [fileOf] resolves file identity from position ranges (this
+// operator has no *token.FileSet to consult directly — TypedMutator's
+// WithScope signature deliberately keeps to type information only — so
+// identity comes from each *ast.File's own [ast.File.Pos]/[ast.File.End]
+// range instead, which info.Scopes' *ast.File keys already provide).
+//
+// This is a real, load-bearing restriction, not a defensive nicety: without
+// it, this operator would ship default-on and measurably degrade the
+// mutant-to-signal ratio on any real multi-file package, which is exactly
+// the risk this section originally flagged as unvalidated and is now
+// validated to be real.
+//
+// # Why "local variable" excludes package-level and file-scope vars
+//
+// The strconv shape is specifically a *local* mistakenly standing in for a
+// constant; a package-level variable of the same type swapped for a
+// same-type package-level constant is a different (and already-questionable
+// — why would you compare a var against itself via a differently-named
+// constant?) mutation shape this operator does not attempt. [localVarUse]
+// excludes any *types.Var whose Parent scope is the package scope, and
+// excludes struct fields (accessed through a selector, not a bare
+// identifier use, so they are already excluded by node shape — the
+// IsField() check is defence in depth against a future info.Uses edge
+// case, not something the current node-shape restriction alone strictly
+// requires).
+//
+// Like [constSwap], the zero value is inert: Applies always reports false
+// until [localConstSwap.WithScope] returns a package-bound instance.
+type localConstSwap struct {
+	info *types.Info
+	pkg  *types.Package
+
+	// constsByFile maps each *ast.File to the package-level constants it
+	// declares, sorted by name for a deterministic Mutate order — see "Why
+	// the candidate set is restricted to the local's own file" above for why
+	// this is keyed by file rather than being one flat, package-wide slice.
+	constsByFile map[*ast.File][]*types.Const
+}
+
+// Name reports the operator's registry name.
+func (*localConstSwap) Name() string { return LocalConstSwapName }
+
+// Applies reports whether node is a comparison whose left or right operand
+// is a local variable with at least one type-compatible package-level
+// constant to swap in.
+func (l *localConstSwap) Applies(node ast.Node) bool {
+	if l.info == nil {
+		return false
+	}
+
+	expr, ok := node.(*ast.BinaryExpr)
+	if !ok || !comparisonOps[expr.Op] {
+		return false
+	}
+
+	return len(l.candidatesFor(expr.X)) > 0 || len(l.candidatesFor(expr.Y)) > 0
+}
+
+// Mutate returns one mutation per (eligible operand, candidate constant)
+// pair found on node's two sides. Both operands are considered
+// independently — a comparison between two locals that are each eligible
+// (e.g. `n1 > maxVal` where both n1 and maxVal happen to share a
+// package-constant-compatible type) yields mutations for both, since each
+// is, on its own, the same "wrong identifier used at a boundary" shape this
+// operator targets.
+func (l *localConstSwap) Mutate(node ast.Node) []mutator.Mutation {
+	if l.info == nil {
+		return nil
+	}
+
+	expr, ok := node.(*ast.BinaryExpr)
+	if !ok || !comparisonOps[expr.Op] {
+		return nil
+	}
+
+	mutations := l.operandMutations(expr.X)
+	mutations = append(mutations, l.operandMutations(expr.Y)...)
+
+	return mutations
+}
+
+// WithScope returns a new localConstSwap bound to pkg's type information.
+// The receiver is not modified, matching [constSwap.WithScope]'s contract.
+func (*localConstSwap) WithScope(info *types.Info, pkg *types.Package) mutator.Mutator {
+	return &localConstSwap{
+		info:         info,
+		pkg:          pkg,
+		constsByFile: constsByFile(info),
+	}
+}
+
+// candidatesFor returns the package-level constants, declared in the same
+// file as operand's use (see "Why the candidate set is restricted to the
+// local's own file" above), compatible with operand's type — or nil if
+// operand is not an eligible local variable use, or its file can't be
+// resolved.
+func (l *localConstSwap) candidatesFor(operand ast.Expr) []*types.Const {
+	ident, v, ok := localVarUse(l.info, l.pkg, operand)
+	if !ok {
+		return nil
+	}
+
+	file := fileOf(l.info, ident.Pos())
+	if file == nil {
+		return nil
+	}
+
+	var out []*types.Const
+
+	for _, c := range l.constsByFile[file] {
+		if typeMatches(v.Type(), c) {
+			out = append(out, c)
+		}
+	}
+
+	return out
+}
+
+// operandMutations returns one mutation per candidate constant for operand,
+// each rewriting the operand identifier's Name field directly — the same
+// in-place-field-edit idiom [constSwap.Mutate] uses. Node is set explicitly
+// to the operand's *ast.Ident, since the node Applies/Mutate were called on
+// is the enclosing *ast.BinaryExpr, not the identifier the edit actually
+// targets (see mutator.Mutation.Node's doc and, e.g., statement/remover.go
+// for the established precedent of a narrower mutation target than the
+// walk's outer node).
+func (l *localConstSwap) operandMutations(operand ast.Expr) []mutator.Mutation {
+	ident, _, ok := localVarUse(l.info, l.pkg, operand)
+	if !ok {
+		return nil
+	}
+
+	candidates := l.candidatesFor(operand)
+	if len(candidates) == 0 {
+		return nil
+	}
+
+	original := ident.Name
+
+	mutations := make([]mutator.Mutation, 0, len(candidates))
+
+	for _, c := range candidates {
+		replacement := c.Name()
+
+		mutations = append(mutations, mutator.Mutation{
+			Description: original + " -> " + replacement,
+			Apply:       func() { ident.Name = replacement },
+			Revert:      func() { ident.Name = original },
+			Node:        ident,
+		})
+	}
+
+	return mutations
+}
+
+// localVarUse reports whether expr is a use of a function-local variable —
+// a parameter, named result, or a variable declared inside a function body
+// — as opposed to a package-level variable, a struct field, or anything
+// that is not a variable at all (a constant, a function, a type name).
+func localVarUse(info *types.Info, pkg *types.Package, expr ast.Expr) (*ast.Ident, *types.Var, bool) {
+	ident, ok := expr.(*ast.Ident)
+	if !ok {
+		return nil, nil, false
+	}
+
+	v, ok := info.Uses[ident].(*types.Var)
+	if !ok || v.IsField() {
+		return nil, nil, false
+	}
+
+	if v.Parent() == nil || v.Parent() == pkg.Scope() {
+		return nil, nil, false
+	}
+
+	return ident, v, true
+}
+
+// constsByFile groups every package-level constant declared in any file
+// reachable through info.Scopes (the same *ast.File-keyed walk
+// [buildGroups] uses for v1, minus the block-vs-file distinction v1 needs
+// and this operator does not — see [localConstSwap]'s doc for why file
+// alone is the right granularity here), keyed by the declaring *ast.File
+// and sorted by name within each file for a deterministic Mutate order.
+func constsByFile(info *types.Info) map[*ast.File][]*types.Const {
+	out := map[*ast.File][]*types.Const{}
+
+	for node := range info.Scopes {
+		file, ok := node.(*ast.File)
+		if !ok {
+			continue
+		}
+
+		for _, decl := range file.Decls {
+			gen, ok := decl.(*ast.GenDecl)
+			if !ok || gen.Tok != token.CONST {
+				continue
+			}
+
+			for _, spec := range gen.Specs {
+				val, ok := spec.(*ast.ValueSpec)
+				if !ok {
+					continue
+				}
+
+				for _, name := range val.Names {
+					if c, ok := info.Defs[name].(*types.Const); ok {
+						out[file] = append(out[file], c)
+					}
+				}
+			}
+		}
+	}
+
+	for file := range out {
+		sort.Slice(out[file], func(i, j int) bool {
+			return out[file][i].Name() < out[file][j].Name()
+		})
+	}
+
+	return out
+}
+
+// fileOf returns the *ast.File whose source range contains pos, resolved
+// from info.Scopes' *ast.File keys' own [ast.File.Pos]/[ast.File.End]
+// ranges rather than a *token.FileSet — this operator is never handed one
+// directly (TypedMutator.WithScope's signature deliberately keeps to type
+// information only), and a FileSet's positions never overlap between
+// files, so bounding pos against each candidate file's own range is
+// sufficient to identify the right one. Returns nil if pos falls outside
+// every known file (should not happen for a position obtained from an
+// identifier this same info actually resolved, but Applies/Mutate treat
+// nil as "no eligible candidates" rather than panicking).
+func fileOf(info *types.Info, pos token.Pos) *ast.File {
+	for node := range info.Scopes {
+		file, ok := node.(*ast.File)
+		if ok && file.Pos() <= pos && pos < file.End() {
+			return file
+		}
+	}
+
+	return nil
+}
+
+// typeMatches reports whether c is a viable swap-in for a variable of type
+// varType. An explicitly-typed constant must match exactly
+// ([types.Identical]), the same standard [constSwap] holds package-level
+// const-for-const swaps to. An untyped constant — which has no fixed
+// declared type to compare identically against — is instead checked for
+// [representable]ility against varType's underlying basic kind, which is
+// the closest available proxy for "would the compiler accept this constant
+// where this variable currently is."
+func typeMatches(varType types.Type, c *types.Const) bool {
+	constType := c.Type()
+
+	basic, untyped := constType.(*types.Basic)
+	if untyped && basic.Info()&types.IsUntyped != 0 {
+		varBasic, ok := varType.Underlying().(*types.Basic)
+
+		return ok && representable(c.Val(), varBasic)
+	}
+
+	return types.Identical(varType, constType)
+}
+
+// representable reports whether val — an untyped constant's value — fits in
+// basic without the compiler rejecting the assignment as a constant
+// overflow, replicating (a deliberately narrow slice of) go/types' own
+// constant-conversion rules well enough for the integer case this operator
+// cares about.
+//
+// Only integer constants (constant.Int) are handled. Floats, complexes,
+// strings, bools, and any basic kind this switch does not list are
+// conservatively reported as not representable — this operator simply never
+// offers those pairings, rather than risking a mutation that turns out to be
+// a guaranteed compile failure. The strconv ParseUint case study this whole
+// operator is modelled on is itself all-integer (`maxVal`, `maxUint64` are
+// both integer-kinded), so this scope covers the motivating case without
+// reimplementing go/types' full, much larger constant-conversion surface.
+//
+// Int and Uint are assumed to be 64-bit. This matches every mainstream
+// build target Go currently ships for, but is not universally true (Go has,
+// historically, supported 32-bit-int platforms) — on such a platform this
+// heuristic could offer a swap that overflows there but not on the
+// (assumed) 64-bit platform it was evaluated against. The engine's existing
+// fail-soft NotViable classification (a mutant that doesn't compile is
+// recorded, not fatal) is exactly the safety net this residual imprecision
+// relies on, the same way v1 relies on it for the cases its own
+// exact-type-match rule doesn't fully preempt.
+func representable(val constant.Value, basic *types.Basic) bool {
+	if val.Kind() != constant.Int {
+		return false
+	}
+
+	switch basic.Kind() {
+	case types.Int, types.Int64:
+		return inSignedRange(val, math.MinInt64, math.MaxInt64)
+	case types.Int8:
+		return inSignedRange(val, math.MinInt8, math.MaxInt8)
+	case types.Int16:
+		return inSignedRange(val, math.MinInt16, math.MaxInt16)
+	case types.Int32:
+		return inSignedRange(val, math.MinInt32, math.MaxInt32)
+	case types.Uint, types.Uint64, types.Uintptr:
+		return inUnsignedRange(val, math.MaxUint64)
+	case types.Uint8:
+		return inUnsignedRange(val, math.MaxUint8)
+	case types.Uint16:
+		return inUnsignedRange(val, math.MaxUint16)
+	case types.Uint32:
+		return inUnsignedRange(val, math.MaxUint32)
+	default:
+		return false
+	}
+}
+
+// inSignedRange reports whether val fits in a signed integer type whose
+// range is [minimum, maximum]. It exists to keep [representable]'s switch to
+// one call per case instead of an inline "convert, then bounds-check" pair
+// per case, which is what tipped gocyclo over this codebase's complexity
+// budget the first time this was written.
+func inSignedRange(val constant.Value, minimum, maximum int64) bool {
+	v, ok := constant.Int64Val(val)
+
+	return ok && v >= minimum && v <= maximum
+}
+
+// inUnsignedRange is [inSignedRange] for unsigned integer types, whose range
+// is always [0, maximum] — constant.Uint64Val itself already reports false
+// for a negative val, so there is no lower bound to check here.
+func inUnsignedRange(val constant.Value, maximum uint64) bool {
+	v, ok := constant.Uint64Val(val)
+
+	return ok && v <= maximum
 }

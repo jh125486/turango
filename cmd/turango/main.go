@@ -63,6 +63,7 @@ const (
 	flagMutant    = "mutatemutant"
 	flagTCE       = "mutatetce"
 	flagWorkspace = "mutateworkspace"
+	flagEstimate  = "mutateestimate"
 )
 
 // flagArgsSeparator is go test's own "-args" boundary: everything after it
@@ -73,7 +74,7 @@ const flagArgsSeparator = "-args"
 // mutateFlags is the recognised set, in the order they are documented.
 var mutateFlags = []string{
 	flagMutate, flagScope, flagOperators, flagParallel, flagTimeout, flagOutput, flagMin, flagMutant, flagTCE,
-	flagWorkspace,
+	flagWorkspace, flagEstimate,
 }
 
 // reportFile is the name of the JSON report written into -mutateoutput.
@@ -122,6 +123,10 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		}
 
 		if found {
+			if cfg.estimate {
+				return estimateRun(ctx, &cfg, stdout, stderr)
+			}
+
 			return mutateRun(ctx, &cfg, stdout, stderr)
 		}
 	}
@@ -180,6 +185,27 @@ func mutateRun(ctx context.Context, cfg *mutateConfig, stdout, stderr io.Writer)
 	}
 
 	return gate(stderr, cfg, result)
+}
+
+// estimateRun executes mutate.Estimate and reports its preview, entirely
+// short-circuiting the real mutation run: no mutation is ever applied to
+// disk, and no `go test` subprocess is ever spawned to classify one (a
+// per-package baseline timing sample is still spawned — see
+// mutate.Estimate's own doc comment — but that runs the *unmutated* suite,
+// same as the real run's own baseline-timeout derivation already does).
+// -mutateoutput/-mutatemin were already rejected at parse time
+// (parseMutateFlags) rather than silently doing nothing here.
+func estimateRun(ctx context.Context, cfg *mutateConfig, stdout, stderr io.Writer) int {
+	result, err := mutate.Estimate(ctx, cfg.options)
+	if err != nil {
+		fmt.Fprintf(stderr, "turango: %v\n", err)
+
+		return exitFailure
+	}
+
+	result.WriteEstimate(stdout)
+
+	return exitOK
 }
 
 // gate applies -mutatemin.
@@ -308,6 +334,12 @@ type mutateConfig struct {
 	// flag being absent.
 	min    float64
 	hasMin bool
+
+	// estimate is -mutateestimate: short-circuits to mutate.Estimate instead
+	// of mutate.Run, and exits before any real mutation is ever applied. See
+	// ROADMAP.md gap 11e for why "-mutateestimate", not "-mutatedryrun", was
+	// chosen.
+	estimate bool
 }
 
 // parseMutateFlags scans the arguments that follow `test` for turango's own
@@ -370,6 +402,21 @@ func parseMutateFlags(args []string) (cfg mutateConfig, found bool, err error) {
 	// requested.
 	if !found {
 		return mutateConfig{}, false, nil
+	}
+
+	// -mutateoutput/-mutatemin are rejected outright rather than silently
+	// becoming no-ops: estimate mode classifies nothing, so there is no
+	// report for -mutateoutput to write and no score for -mutatemin to gate
+	// on. Erroring here matches this project's standing convention of
+	// rejecting a flag combination that cannot do what it looks like it
+	// does (see, e.g., an unrecognised go test flag just below, or an
+	// unknown -mutateoperators name) rather than letting it quietly
+	// misbehave — see ROADMAP.md gap 11's "Files/functions touched" note on
+	// main.go.
+	if cfg.estimate && (cfg.output != "" || cfg.hasMin) {
+		return mutateConfig{}, false, fmt.Errorf(
+			"turango: -%s and -%s have no effect on -%s=true: nothing is classified in estimate mode, so there is no report to write and no score to gate on",
+			flagOutput, flagMin, flagEstimate)
 	}
 
 	var packages []string
@@ -464,6 +511,8 @@ func (c *mutateConfig) set(name, value string) error {
 		return c.setTCE(value)
 	case flagWorkspace:
 		return c.setWorkspace(value)
+	case flagEstimate:
+		return c.setEstimate(value)
 	}
 
 	return nil
@@ -600,6 +649,21 @@ func (c *mutateConfig) setWorkspace(value string) error {
 	}
 
 	c.options.Workspace = workspace
+
+	return nil
+}
+
+// setEstimate validates and stores -mutateestimate: whether to preview a
+// run (mutate.Estimate) instead of performing it (mutate.Run). Off by
+// default, matching every other boolean turango flag's zero-value
+// convention (see setTCE).
+func (c *mutateConfig) setEstimate(value string) error {
+	estimate, err := strconv.ParseBool(value)
+	if err != nil {
+		return fmt.Errorf("turango: -%s=%q: want true or false", flagEstimate, value)
+	}
+
+	c.estimate = estimate
 
 	return nil
 }

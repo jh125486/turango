@@ -210,8 +210,9 @@ scalar mutations. Two operators were added since this set was first drafted:
 classic off-by-one mutant, distinct from `operator/binary`'s negation swap
 (`<`↔`>=`) and named to match PIT's "Conditionals Boundary Mutator" (PIT is
 cited in Related Work, below); and a pair of literal operators,
-`literal/number` (shifts an int/float literal by ±1, e.g. `x < 0` →
-`x < 1`) and `literal/boolean` (swaps `true`↔`false`).
+`literal/number` (shifts an integer literal by ±1, e.g. `x < 0` →
+`x < 1`, or a float literal by a small relative nudge in each direction)
+and `literal/boolean` (swaps `true`↔`false`).
 
 **Known gap, found during validation, worth stating up front — now
 partially closed**: this operator set proves "this code path is
@@ -302,6 +303,11 @@ score threshold are all now implemented, none of them present in 2018.
   some scope of the suite. Mitigated by `-mutatescope=package|impact`,
   `-mutateparallel`, and the expectation (same as fuzzing) that this runs
   on demand or in a separate CI stage, not on every `go test` invocation.
+  See `BENCHMARKS.md` for the mutation-multiplier measurement methodology
+  and (once run — deliberately deferred to just before submission, on a
+  plugged-in machine rather than mid-development on battery) real
+  `go test -bench` numbers backing this claim, rather than an unverified
+  qualitative estimate.
 - **False positives / equivalent mutants.** A mutation that's semantically
   a no-op (e.g. `i*1` compiling to the same result as `i`) reports as a
   survivor without being a real gap. The reference implementation already
@@ -332,8 +338,20 @@ score threshold are all now implemented, none of them present in 2018.
   implementation is free to adopt any of them later without revisiting
   this proposal's mechanism — this prototype's job is proving the
   mechanism is worth having, not being the fastest possible realization of
-  it. (No cost numbers exist yet either way — see ROADMAP.md gap 8,
-  benchmarking, not yet started.)
+  it. (Benchmark harness built, real overnight run in progress as of this
+  writing — see ROADMAP.md gap 8 and `BENCHMARKS.md`; not yet finalized
+  into numbers this document cites.)
+- **Concurrency bugs are not reliably tested for.** Every mutant runs with
+  `go test -parallel=1` (deliberate — it prevents `GOMAXPROCS x
+  -mutateparallel` worker multiplication from misclassifying slow-but-fine
+  mutants as timeout-killed) and turango never adds `-race` itself. A
+  mutation that only breaks under real concurrent execution (e.g. deleting
+  a `mutex.Lock()`) can survive a default run: `-parallel=1` reduces the
+  scheduling pressure a `t.Parallel()`-heavy suite would otherwise use to
+  surface a race, and without `-race`, Go's own race detector never runs
+  at all. Both are available today via turango's existing flag passthrough
+  (`turango test -race -mutate=... ./...`), but are opt-in, untested by
+  default, and unbenchmarked for the cost/detection tradeoff that implies.
 
 ## Open questions
 

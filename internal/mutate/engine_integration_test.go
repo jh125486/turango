@@ -665,6 +665,91 @@ func TestRunWorkspaceWorktreeMatchesCopy(t *testing.T) {
 	}
 }
 
+// TestEstimateMatchesRun is ROADMAP.md gap 11's required end-to-end proof:
+// Estimate's walk-only count must exactly match a real Run's
+// len(Result.Mutants) + len(Result.Equivalents) for the same [mutate.Options]
+// — Equivalents count too, since an estimate deliberately ignores TCE (gap
+// 11d) and reports every matching mutation as if it will run.
+//
+// fixtureModule is deliberately two packages (app, mathx), not one — this is
+// exactly what exercises gap 11b's per-package-not-whole-module baseline
+// design: a single-package fixture would not catch a bug where every
+// package's timing was accidentally computed once, module-wide, instead of
+// per package.
+func TestEstimateMatchesRun(t *testing.T) {
+	t.Parallel()
+
+	root := fixtureModule(t)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Minute)
+	defer cancel()
+
+	opts := mutate.Options{
+		Packages:    []string{"./..."},
+		Dir:         root,
+		Scope:       mutate.ScopePackage,
+		TestTimeout: 30 * time.Second,
+	}
+
+	result, err := mutate.Run(ctx, opts)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	estimate, err := mutate.Estimate(ctx, opts)
+	if err != nil {
+		t.Fatalf("Estimate() error = %v", err)
+	}
+
+	wantTotal := len(result.Mutants) + len(result.Equivalents)
+	if estimate.Total != wantTotal {
+		t.Errorf("Estimate().Total = %d, want %d (= len(Result.Mutants)+len(Result.Equivalents))", estimate.Total, wantTotal)
+	}
+
+	if len(estimate.Packages) < 2 {
+		t.Fatalf("Estimate().Packages has %d entries, want at least 2 (fixtureModule has app and mathx)", len(estimate.Packages))
+	}
+
+	var summedMutants int
+
+	for _, p := range estimate.Packages {
+		summedMutants += p.Mutants
+
+		if p.Mutants <= 0 {
+			t.Errorf("PackageEstimate{Package: %q}.Mutants = %d, want > 0 (packages with zero mutants should not be listed at all)", p.Package, p.Mutants)
+		}
+
+		// Under ScopePackage each package's baseline must be its own
+		// sample, not a shared whole-module one — gap 11b's own point. This
+		// does not directly prove the two samples differ (nothing stops a
+		// coincidental tie), but every package having its own positive
+		// sample at all is the mechanical evidence that packageBaseline,
+		// not a single module-wide value, ran once per package.
+		if p.Baseline <= 0 {
+			t.Errorf("PackageEstimate{Package: %q}.Baseline = %v, want > 0", p.Package, p.Baseline)
+		}
+	}
+
+	if summedMutants != estimate.Total {
+		t.Errorf("sum of PackageEstimate.Mutants = %d, want Total = %d", summedMutants, estimate.Total)
+	}
+
+	// opts.Parallel is left unset (zero) above, which Options.parallel()
+	// clamps to 1 — the same zero-value convention TestOptionsParallel
+	// (engine_internal_test.go) already pins directly.
+	if estimate.Workers != 1 {
+		t.Errorf("Estimate().Workers = %d, want 1 (opts.Parallel was left unset)", estimate.Workers)
+	}
+
+	if estimate.SerialEstimate <= 0 {
+		t.Errorf("Estimate().SerialEstimate = %v, want > 0", estimate.SerialEstimate)
+	}
+
+	if estimate.ParallelEstimate <= 0 || estimate.ParallelEstimate > estimate.SerialEstimate {
+		t.Errorf("Estimate().ParallelEstimate = %v, want in (0, %v]", estimate.ParallelEstimate, estimate.SerialEstimate)
+	}
+}
+
 // gitCommitFixture turns root — an already-populated fixture module
 // directory — into a real, committed git repository, so
 // [mutate.WorkspaceWorktree] (which requires one, see runner.go's

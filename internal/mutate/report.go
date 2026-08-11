@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"time"
 )
 
 // Status is the verdict for a single mutant.
@@ -451,5 +452,134 @@ func (r *Result) writeSurvivors(w io.Writer, base string) {
 
 	for _, r := range rows {
 		fmt.Fprintf(w, "  %-*s  %-*s  %-*s  %s\n", idWidth, r.id, locWidth, r.location, opWidth, r.operator, r.description)
+	}
+}
+
+// PackageEstimate is one package's contribution to an [EstimateResult] —
+// how many mutants [Estimate]'s walk found in it, and one rough timing
+// sample of its own tests.
+type PackageEstimate struct {
+	// Package is the package's import path, e.g.
+	// "example.com/fixture/mathx" — not a file path, since one package's
+	// mutants are always reported together regardless of which of its
+	// files they came from.
+	Package string
+
+	// Mutants is how many mutants a real [Run] would produce for this
+	// package — the same walk that would populate [Result.Mutants], just
+	// never executed. Equivalent to how many of them Trivial Compiler
+	// Equivalence might filter (see [EstimateResult.TCE]): this count is
+	// the raw total regardless of TCE, deliberately — see ROADMAP.md gap
+	// 11d.
+	Mutants int
+
+	// Baseline is one sample of how long this package's own tests take to
+	// run, under the scope the estimate was asked about: under
+	// [ScopePackage]/[ScopeImpact], this package's own `go test` pattern;
+	// under [ScopeFull], the whole module's baseline (identical across
+	// every package, since every mutant really does run `go test ./...`
+	// under that scope — see ROADMAP.md gap 11b). A single sample, not
+	// [baselineRuns]' three-run average, so treat it as rough, not
+	// authoritative — see [EstimateResult]'s own doc comment.
+	Baseline time.Duration
+}
+
+// EstimateResult is the outcome of a walk-only, execution-free [Estimate]
+// run: how many mutants a real [Run] would produce, and a rough,
+// intentionally-hedged prediction of how long running them would take.
+//
+// It is deliberately not a *[Result]: an estimate never classifies
+// anything (no `go test` ever runs against a real mutant), so
+// Status/Output — and every score/suppression/equivalent computation built
+// on them — would be fields nobody ever set, on mutants that never actually
+// ran. See ROADMAP.md gap 11a.
+//
+// Every duration here comes from a single timing sample per package, not
+// [baselineRuns]' three-run average a real run uses to derive its timeout:
+// cold-cache variance alone was measured at roughly 5x for an identical
+// invocation (0.75s warm vs. 3.95s cold GOCACHE) during this gap's own
+// validation. Treat every number on this type as a rough estimate to decide
+// whether to commit to a real run, not a promise about what that run will
+// actually measure.
+type EstimateResult struct {
+	// Total is the mutant count the walk found — the same number
+	// len(Result.Mutants) + len(Result.Equivalents) would report from a
+	// real Run with the same Options, since this estimate deliberately
+	// ignores TCE (see TCE below) and counts every matching mutation as if
+	// it will run.
+	Total int
+
+	// Packages holds one entry per package the walk found at least one
+	// mutant in, in the order the walk encountered them. A package with
+	// zero matching mutants (every node suppressed, or none matched
+	// -mutate's FuncPattern) is not listed: there is nothing to time or
+	// extrapolate for it.
+	Packages []PackageEstimate
+
+	// TCE reports whether the run this estimate previews would have
+	// Trivial Compiler Equivalence enabled ([Options.TCE]). It has no
+	// effect on Total or any Baseline — this estimate does not run TCE's
+	// compile-and-compare step, since that would cost real time per
+	// mutant, working directly against being a fast preview (ROADMAP.md
+	// gap 11d) — it exists only so the console/JSON output can print the
+	// "the real run may filter some of these and finish faster" caveat
+	// when, and only when, it is actually relevant.
+	TCE bool
+
+	// SerialEstimate is Σ over Packages of (mutant count × baseline time):
+	// the naive lower bound if every mutant ran one after another, on one
+	// worker.
+	SerialEstimate time.Duration
+
+	// Workers is the worker count ParallelEstimate was divided by — the
+	// run's [Options.Parallel] as resolved by Options.parallel(), recorded
+	// so the output can state the assumption plainly rather than leaving
+	// the reader to guess where the divisor came from.
+	Workers int
+
+	// ParallelEstimate is SerialEstimate divided by Workers. It is
+	// explicitly an optimistic lower bound, not a promise: real wall-clock
+	// speedup under -mutateparallel is sub-linear once CPU contention and
+	// shared GOCACHE pressure kick in — this project directly measured
+	// roughly 8 mutants/minute against a raw per-mutant cost that should
+	// have supported far more (ROADMAP.md gap 11c). Always report both
+	// numbers together; never present ParallelEstimate alone as if it were
+	// a confident prediction.
+	ParallelEstimate time.Duration
+}
+
+// WriteEstimate prints the human-readable preview a -mutateestimate run
+// produces: how many mutants a real run would generate, per package, and
+// two honestly-hedged time predictions.
+//
+// Unlike [Result.WriteSummary], there is no score, no suppression ratio, and
+// no survivor listing — none of those exist until mutants actually run
+// (see [EstimateResult]'s own doc comment for why this is a different type
+// entirely, not a partially-filled *Result).
+func (e *EstimateResult) WriteEstimate(w io.Writer) {
+	fmt.Fprintf(w, "estimated mutants: %d\n", e.Total)
+
+	if len(e.Packages) > 0 {
+		fmt.Fprintln(w)
+
+		var pkgWidth int
+		for _, p := range e.Packages {
+			pkgWidth = max(pkgWidth, len(p.Package))
+		}
+
+		for _, p := range e.Packages {
+			fmt.Fprintf(w, "  %-*s  %5d mutants  ~%s per test run\n", pkgWidth, p.Package, p.Mutants, p.Baseline)
+		}
+	}
+
+	fmt.Fprintln(w)
+	fmt.Fprintf(w, "serial estimate   (naive, one mutant at a time):  %s\n", e.SerialEstimate)
+	fmt.Fprintf(w, "parallel estimate (optimistic, /%d workers):      %s\n", e.Workers, e.ParallelEstimate)
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "these are rough numbers from a single, walk-only timing sample per package, not a promise:")
+	fmt.Fprintln(w, "  - the parallel estimate is a lower bound; real wall-clock speedup is sub-linear under CPU/GOCACHE contention")
+
+	if e.TCE {
+		fmt.Fprintln(w, "  - -mutatetce=true is set, but this estimate ignores TCE and counts every mutant; the real run may filter some and finish faster")
 	}
 }

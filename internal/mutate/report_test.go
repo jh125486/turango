@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jh125486/turango/internal/mutate"
 )
@@ -415,5 +416,84 @@ func TestWriteSummaryEmpty(t *testing.T) {
 
 	if strings.Contains(buf.String(), "Surviving mutants") {
 		t.Errorf("summary = %q, want no survivor list on a clean run", buf.String())
+	}
+}
+
+// TestWriteEstimate covers the estimate console printer end to end: the
+// total, the per-package breakdown, both time predictions labeled
+// distinctly (ROADMAP.md gap 11c's "never a single confident number"
+// requirement), and the TCE caveat's conditional presence (gap 11d).
+func TestWriteEstimate(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		result  mutate.EstimateResult
+		want    []string
+		wantNot []string
+	}{
+		"multi-package estimate": {
+			result: mutate.EstimateResult{
+				Total: 7,
+				Packages: []mutate.PackageEstimate{
+					{Package: "example.com/fixture/app", Mutants: 2, Baseline: 500 * time.Millisecond},
+					{Package: "example.com/fixture/mathx", Mutants: 5, Baseline: 750 * time.Millisecond},
+				},
+				SerialEstimate:   4750 * time.Millisecond,
+				Workers:          4,
+				ParallelEstimate: 1187500 * time.Microsecond,
+			},
+			want: []string{
+				"estimated mutants: 7",
+				"example.com/fixture/app",
+				"2 mutants",
+				"example.com/fixture/mathx",
+				"5 mutants",
+				"serial estimate",
+				"parallel estimate",
+				"/4 workers",
+				"rough numbers",
+				"sub-linear under CPU/GOCACHE contention",
+			},
+			// TCE is off (the zero value) in this case: no caveat about it
+			// should print at all.
+			wantNot: []string{"mutatetce"},
+		},
+		"TCE requested surfaces its own caveat": {
+			result: mutate.EstimateResult{
+				Total:   1,
+				TCE:     true,
+				Workers: 1,
+			},
+			want: []string{"mutatetce=true is set", "may filter some and finish faster"},
+		},
+		"zero mutants lists no packages": {
+			result:  mutate.EstimateResult{Workers: 1},
+			want:    []string{"estimated mutants: 0"},
+			wantNot: []string{"mutants  ~"},
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			var buf bytes.Buffer
+
+			tt.result.WriteEstimate(&buf)
+
+			got := buf.String()
+
+			for _, want := range tt.want {
+				if !strings.Contains(got, want) {
+					t.Errorf("WriteEstimate() missing %q:\n%s", want, got)
+				}
+			}
+
+			for _, notWant := range tt.wantNot {
+				if strings.Contains(got, notWant) {
+					t.Errorf("WriteEstimate() unexpectedly contains %q:\n%s", notWant, got)
+				}
+			}
+		})
 	}
 }

@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/mod/modfile"
@@ -122,6 +123,21 @@ const allPackages = "./..."
 
 // goModFile is the file every Go module is rooted by.
 const goModFile = "go.mod"
+
+// execCalls counts every subprocess turango spawns to actually build or
+// run the target module's code — [runner.goTest] (a mutant's test run),
+// [goTestSuite] (a baseline timing sample, real or [Estimate]'s
+// per-package one) and [compileDisassembly] (a TCE compile) — as opposed
+// to go/packages' own `go list` metadata queries, which are comparatively
+// cheap and not what this counter is about.
+//
+// It exists so a test can prove [walkForEstimate]'s counting phase spawns
+// none of these — the concrete, checkable form of ROADMAP.md gap 11a's
+// claim that estimate mode's walk costs "an AST walk with no go test
+// subprocess anywhere" — the same call-counter technique [loadTypedCalls]
+// (engine.go) already established to prove loadTyped is skipped when
+// unneeded.
+var execCalls atomic.Int64
 
 // run executes a single mutation end to end and reports the verdict.
 //
@@ -344,6 +360,8 @@ func packagePattern(moduleDir, pkgDir string) (string, error) {
 // opposed to the parent context being cancelled — the caller must distinguish
 // "this mutant hung" from "the user pressed Ctrl+C".
 func (r *runner) goTest(ctx context.Context, dir string, args []string) (stdout, stderr []byte, timedOut bool, err error) {
+	execCalls.Add(1)
+
 	runCtx, cancel := context.WithTimeout(ctx, r.testTimeout+timeoutGrace)
 	defer cancel()
 
@@ -424,6 +442,8 @@ var positionComment = regexp.MustCompile(`\([^)]*\.go:\d+\)`)
 // multi-million-line dump. Plain -gcflags scopes the -S output to pattern
 // itself.
 func compileDisassembly(ctx context.Context, goBin, dir, pattern string) ([]byte, error) {
+	execCalls.Add(1)
+
 	//nolint:gosec // compiling a package of the module under mutation for TCE is turango's core function, not attacker-controlled input
 	cmd := exec.CommandContext(ctx, goBin,
 		"build",
@@ -489,6 +509,8 @@ func isTCEEquivalent(ctx context.Context, goBin, moduleDir string, m mutant) boo
 // would be a third of the truth.
 func goTestSuite(goBin, dir string, patterns []string) suiteTimer {
 	return func(ctx context.Context) (time.Duration, error) {
+		execCalls.Add(1)
+
 		args := append([]string{"test", "-count=1", "-vet=off"}, patterns...)
 
 		cmd := exec.CommandContext(ctx, goBin, args...)
