@@ -183,14 +183,15 @@ func TestMutateFileStopsWhenCancelled(t *testing.T) {
 // TestMutantID pins mutantID's two load-bearing properties: identical inputs
 // always hash to the same ID (needed for cross-run stability), and changing
 // any single coordinate of the tuple changes the ID (needed so two distinct
-// mutations, e.g. expression/remove's two operand removals on one node,
-// never collide).
+// mutations, e.g. expression/remove's two operand removals on one node, or
+// ROADMAP.md gap 13's colliding binary-chain siblings via rank, never
+// collide).
 func TestMutantID(t *testing.T) {
 	t.Parallel()
 
-	base := mutantID("pkg/file.go", 10, 4, "operator/binary", 0)
+	base := mutantID("pkg/file.go", 10, 4, "operator/binary", 0, 0)
 
-	if got := mutantID("pkg/file.go", 10, 4, "operator/binary", 0); got != base {
+	if got := mutantID("pkg/file.go", 10, 4, "operator/binary", 0, 0); got != base {
 		t.Errorf("mutantID() = %q, %q on identical inputs, want equal", base, got)
 	}
 
@@ -199,11 +200,12 @@ func TestMutantID(t *testing.T) {
 	}
 
 	tests := map[string]string{
-		"path":     mutantID("pkg/other.go", 10, 4, "operator/binary", 0),
-		"line":     mutantID("pkg/file.go", 11, 4, "operator/binary", 0),
-		"column":   mutantID("pkg/file.go", 10, 5, "operator/binary", 0),
-		"operator": mutantID("pkg/file.go", 10, 4, "operator/boundary", 0),
-		"index":    mutantID("pkg/file.go", 10, 4, "operator/binary", 1),
+		"path":     mutantID("pkg/other.go", 10, 4, "operator/binary", 0, 0),
+		"line":     mutantID("pkg/file.go", 11, 4, "operator/binary", 0, 0),
+		"column":   mutantID("pkg/file.go", 10, 5, "operator/binary", 0, 0),
+		"operator": mutantID("pkg/file.go", 10, 4, "operator/boundary", 0, 0),
+		"index":    mutantID("pkg/file.go", 10, 4, "operator/binary", 1, 0),
+		"rank":     mutantID("pkg/file.go", 10, 4, "operator/binary", 0, 1),
 	}
 
 	for name, got := range tests {
@@ -214,6 +216,28 @@ func TestMutantID(t *testing.T) {
 				t.Errorf("mutantID() unchanged when only %s varied: both = %q", name, got)
 			}
 		})
+	}
+}
+
+// TestMutantIDRankZeroMatchesPreGap13Hash locks in ROADMAP.md gap 13's
+// backward-compatibility promise: rank 0 — every mutation that never
+// collided with a same-position sibling, i.e. the overwhelming majority of
+// real code, including every *ast.BinaryExpr that is not itself nested
+// inside another one starting at the same position — must hash to exactly
+// the same bytes mutantID produced before rank existed. This is asserted
+// against a hardcoded pre-gap-13 SHA-256 (truncated to 12 hex characters,
+// same as mutantID's own output), not merely against mutantID's current
+// rank==0 branch, so a refactor that accidentally starts hashing rank
+// unconditionally would fail this test even though TestMutantID's "rank"
+// case above would not catch it (that case only proves rank changes the
+// ID when non-zero, not that rank zero leaves it alone).
+func TestMutantIDRankZeroMatchesPreGap13Hash(t *testing.T) {
+	t.Parallel()
+
+	const wantPreGap13ID = "cf9966da6fdf" // sha256("pkg/file.go\x0010\x004\x00operator/binary\x000")[:12], hex
+
+	if got := mutantID("pkg/file.go", 10, 4, "operator/binary", 0, 0); got != wantPreGap13ID {
+		t.Errorf("mutantID(rank=0) = %q, want %q (the pre-gap-13 hash for this tuple)", got, wantPreGap13ID)
 	}
 }
 

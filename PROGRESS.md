@@ -608,3 +608,279 @@ code bugs:**
 6. ROADMAP.md's 7 gaps, current state: (1) identifier-swap **done** (v1 only — v2, local-var-to-const, closes the real strconv shape, still open); (2) TCE **done** (opt-in, `-mutatetce=true`); (3) before/after snippets **done**; (4) deterministic mutant IDs **done**; (5) dependency-closure workspace copy — **components built and tested; an independent (fable) review found two real bugs; a second fable pass was fixing them as of the pause, see #2 above — status unconfirmed until verified**; (6) git-worktree execution — **done** (`-mutateworkspace=worktree`, see #3); (7) channel-based collector **done**.
 7. Ask the user before committing anything new — this doc records what's already committed, not a standing permission to keep committing. Also: never retry a blocked `git commit` unattended/in a loop when it's failing on a physical-presence signing requirement (1Password Touch ID/fingerprint) — attempt once, report, stop; that was explicit user feedback earlier this session after a long unattended retry loop.
 8. If asked "does X exist / is X implemented," verify against the actual current source (`grep`/`Read`) before answering — this project has repeatedly caught assumptions stated from memory instead of verified code. Don't repeat that.
+
+## 2026-08-11/12 overnight: benchmark matrix complete, base64 verified, aes found a real 1-mutant discrepancy
+
+User went to bed asking for the benchmark run done by morning, with explicit
+permission to work autonomously through the night. Summary of what
+happened, for a cold read in the morning:
+
+**`BenchmarkMutate`'s full `-count=1` matrix is done.** Both targets
+(`op-control-if`, `stdlib-strconv-parseuint`) x all 3 scopes x both TCE
+settings x all 3 parallel levels — every subtest has a real captured
+number now. `BENCHMARKS.md` has been fully rewritten with the complete
+transcript, a methodology section, and two "Data quality notes" being
+upfront about real issues in how this specific run was captured (see
+below) rather than presenting the numbers as cleaner than they are.
+**Uncommitted — ask before committing**, per the standing rule.
+
+**Real bug found and fixed along the way: `-bench` regex alternation
+across `/`-levels silently drops matches.** Two consecutive attempts to
+resume the interrupted benchmark used a pattern like
+`(full/tce=true/parallel=8|package|impact)` to target several remaining
+subtests in one invocation — each time, Go's benchmark matcher (which
+splits the `-bench` pattern on literal `/` and matches each segment
+positionally against the corresponding subtest-name level) shredded the
+alternation across levels instead of treating it as a whole-path
+alternative, silently causing entire subtests (`full/tce=true/parallel=8`
+first, then everything except `impact` on the second attempt) to never
+run at all — no error, just missing data. Fixed by chaining separate,
+single-subtest `-bench` invocations (`/tmp/bench-remaining.sh`), each
+pattern a clean `/`-level-literal string with no cross-level alternation.
+This is now documented in `BENCHMARKS.md`'s methodology section so it
+doesn't get rediscovered the hard way again.
+
+**Real bug found: `-timeout=1h` on a manual `TestCorpus` verification
+was too short**, inconsistent with `corpusRunTimeout`'s already-raised 2h
+value — base64's first verification attempt hit `go test`'s own
+process-wide `-timeout` (not `corpusRunTimeout`) and panicked mid-run at
+exactly 3600s, while running concurrently with the whole bench chain the
+entire time (real contention, confirmed via `ps`/`uptime`, not asserted).
+Relaunched with `-timeout=3h` and it passed cleanly (4303.82s,
+`stdlib-encoding-base64/golden.json` confirmed real).
+
+**`stdlib-crypto-aes`'s `TestCorpus` verification FAILED — a real
+1-mutant discrepancy, unresolved, needs a human decision.** Ran to
+completion (4715.73s, not a timeout) with:
+```
+killed: got 5210, want 5211
+survived: got 2306, want 2305
+```
+Total mutant count (7746) matched exactly — this is not the earlier
+"blowup" class of bug. One specific mutant that the golden.json says was
+killed came back survived instead, everything else agreeing. This ran
+concurrently with the tail end of the benchmark matrix, which is the
+most likely explanation (a timing-sensitive test flipping outcome under
+load) but that is a plausible read of the numbers, not a verified root
+cause — nobody has actually identified *which* mutant flipped or why.
+**Did not retry** — a second run either reproducing or not reproducing
+the same flip is diagnostic information the user should decide whether to
+spend the ~1.3 hours on, and if it doesn't reproduce clean, the
+golden.json's `killed`/`survived` counts may need a 5210/2306 update
+rather than assuming the environment was just noisy. `/tmp/aes-verify.txt`
+has the full transcript if needed.
+
+**Update, later the same morning: aes discrepancy resolved, root-caused, fixed.**
+A third solo retry (no concurrent load) reproduced the exact same
+`killed: got 5210, want 5211` / `survived: got 2306, want 2305` result —
+ruling out contention as *this run's* explanation and confirming 5210/2306
+is the real, reproducible steady state. User asked for a fable investigation
+into which specific mutant flips and why. Findings:
+
+- The flipping mutant: `internal/fips140/aes/aes_generic.go:112`,
+  `operator/binary`, `^` → `&`
+  (`xk[k+3] ^ td0[...] ^ td1[...]` → `(xk[k+3] ^ td0[...]) & td1[...]`).
+- **Root cause: the original golden capture's single run hit the fixed
+  30s `-mutatetimeout` on this one mutant**, almost certainly from CPU
+  contention under `-mutateparallel=10` on this 10-core machine during
+  that specific capture — `runner.go`'s `classify()` correctly counts a
+  timeout as `Killed` (working as designed, not a bug). Every other
+  observed run of this exact mutant — the fable investigation's own fresh
+  capture, plus both of tonight's independent `TestCorpus` re-verifications
+  — has `go test` for this package finish in well under a second (0.765s
+  measured) and correctly `Survive`. This is a one-off scheduling blip
+  against a fixed per-mutant timeout, not a turango logic bug.
+- `corpus/stdlib-crypto-aes/golden.json` updated: `killed: 5210,
+  survived: 2306` (was 5211/2305), with a description note explaining the
+  correction and why, so a future reader doesn't need to re-derive this.
+- **Real secondary bug surfaced as a side effect, not the thing being
+  investigated**: `mutantID`'s hash tuple (file/line/col/operator/index)
+  collides across multiple distinct mutations on a left-associative
+  binary-expression chain (`a^b^c^d^e`), because `ast.BinaryExpr.Pos()`
+  returns the same leftmost position for every nested sub-expression in
+  such a chain. Doesn't affect `Counts()`/`Score()`, but makes
+  `-mutatemutant=<id>` ambiguous for long chains. Logged as ROADMAP.md
+  gap 13, not started, no design decided yet.
+
+**Bottom line for morning**: benchmark matrix ✅ complete and written up;
+base64 golden ✅ re-verified; aes golden ✅ corrected and root-caused (not
+a turango bug — a fixed-timeout-under-contention artifact in the original
+capture). New known gap logged (ROADMAP.md #13, mutantID collision on
+binary chains) as a side finding, not yet designed or built. Everything
+from tonight (BENCHMARKS.md, PROGRESS.md, ROADMAP.md, the CI restructure
+from earlier in the session, both corpus golden.json files) is still
+uncommitted, per the standing "ask before committing" rule.
+
+## 2026-08-12, later: gaps 13/14 dispatched to parallel worktree subagents; gap 13 landed
+
+User asked to add a badge-row ROADMAP entry (gap 14, README badges + a
+mutation-score badge, modeled on their other project `gradebot`) and then
+to start working the open gaps (9, 13, 14) via subagents in parallel
+isolated worktrees. Each agent worked from a fresh `main` checkout, which
+does **not** include this session's still-uncommitted doc edits (gap 12's
+prose, gap 13/14's own ROADMAP sections, `corpus.yml`, the corrected aes
+golden.json, etc.) — this was explicitly anticipated and each agent was
+given the real spec inline in its prompt rather than told to "read
+ROADMAP.md," so it didn't block their work, but it means their own
+final reports correctly noted "no gap 14 section exists" from their
+point of view — expected, not a bug in their setup.
+
+**Also fixed in passing**: gap 1's top-summary entry and full section
+still described v2 (local-var-to-const identifier swap) as an open
+follow-on, even though it landed and was verified earlier this session
+(commit `84fe29b`) — real ROADMAP staleness, corrected before dispatching
+subagents so they wouldn't see a wrong picture of what's already done.
+
+**Gap 13 (mutantID collision) — done, merged into main tree.** Subagent
+fix: `internal/mutate/engine.go`'s `mutantID` gained a `rank int`
+parameter; a new per-file `idDeduper` counts how many times a given
+(line, col, operator, index) tuple has already been seen during the
+`ast.Inspect` walk, and only appends the rank to the hash when it's
+nonzero — the overwhelming common case (no collision) is byte-for-byte
+identical to the pre-fix hash. Two new tests:
+`TestMutantIDRankZeroMatchesPreGap13Hash` (pins the unchanged-hash
+guarantee) and `TestRunBinaryChainMutantsHaveDistinctIDs` (builds a real
+5-operand XOR-chain fixture and proves distinct IDs) — the latter was
+verified non-vacuous by `git stash`-reverting the fix and confirming it
+fails with real collisions first. Also verified directly against the
+real bug: a scoped run against `corpus/stdlib-crypto-aes`'s
+`decryptBlockGeneric` now gives the originally-colliding ID
+(`f1dd58acbb56`) exactly once instead of 4 times. Files copied into the
+main tree (`engine.go`, `engine_internal_test.go`,
+`engine_integration_test.go`) and re-verified there: `go build`/`go vet`
+(plain and `-tags=integration`) clean, `gofmt -l` clean, the two new
+tests pass. `go test ./internal/mutate/...` has 7 pre-existing failures
+(`TestGitWorktreeClean`, `TestCopyWorktree`, and friends) — all the same
+known 1Password/Touch-ID sandbox limitation (`git commit` needs an
+interactive signing prompt this environment can't satisfy), confirmed
+pre-existing and unrelated to this change, not a regression. ROADMAP.md
+gap 13 (both the top-summary entry and its own section) flipped to Done.
+
+**Gap 14 (badges) — subagent done, merged into main tree.** Its `ci.yml`
+diff conflicted exactly as anticipated (it reverted the corpus/`-short`
+restructure from earlier tonight, since its worktree checkout predated
+those uncommitted edits) — merged by hand, layering only its genuinely
+new pieces (`fetch-depth: 0`, `-coverprofile`, Codecov upload step,
+SonarCloud step) onto the current `ci.yml`, keeping `-short` and the
+corpus.yml-based restructure intact. README.md's badge-row insertion was
+a clean, isolated diff (7 lines after the mascot caption) and copied
+directly. New files copied as-is:
+`.github/workflows/codeql-analysis.yml` (self-contained, no secrets
+needed), `sonar-project.properties`, and
+`.github/workflows/mutation-badge.yml` (weekly + manual, mirroring
+`corpus.yml`'s cadence; dogfoods turango against `cmd/turango`,
+`internal/mutate`, `internal/mutator` with `-mutatescope=package` and
+gap 12's `-mutatecache`, computes score via `jq`/`awk` from the real
+`MutantResult.Status`/`Mutants` JSON schema — spot-checked against
+`report.go` directly, field names and "killed"/"survived" string values
+match — and publishes to `gh-pages` via `peaceiris/actions-gh-pages`).
+`go build`/`go vet`/`gofmt -l` all clean in the main tree after the
+merge; all 4 touched/new YAML files parse via `ruby -ryaml`. Still needs
+the user's own action: Codecov account linking (+ possibly
+`CODECOV_TOKEN`), a SonarCloud project (+ `SONAR_TOKEN`, and double-check
+the guessed project key `jh125486_turango` against whatever SonarCloud
+actually assigns), and the mutation-badge workflow's first real run in
+Actions has never executed (needs the repo to be public) — spot-check its
+first published number before trusting it. ROADMAP.md gap 14 (top
+summary + its own section) updated to reflect "built, not fully live"
+rather than "done" outright, given those real external dependencies.
+
+**Gap 9 (comment cleanup, sub-tasks 9a/9c/9d/9e only, 9b explicitly
+excluded per the doc's own "needs separate go-ahead" note) — still
+running as of this entry.**
+
+**Gap 9 (comment cleanup) — done (9a/9c/9d/9e; 9b skipped per instructions),
+merged into main tree.** Two low-conflict files
+(`internal/mutator/literal/literal.go`, `example/README.md`) were
+untouched by this session and copied directly — `example/README.md`'s
+regeneration is real, worth calling out: its captured transcript
+pre-dated both mutant IDs and both identifier operators, so the agent
+re-ran the actual binary (with and without `//nomutant`, restoring
+source after) and replaced it with current numbers (197/144/40/13 with
+directives, 218/155/50/13 without). The other three touched files
+(`ROADMAP.md`, `PROPOSAL.md`, `README.md`) all had real overlapping edits
+from earlier tonight, resolved via `git merge-file`'s real 3-way merge
+(base = the commit both the agent's worktree and this session's edits
+diverged from) rather than a blind copy: `PROPOSAL.md` and `README.md`
+merged with zero conflicts; `ROADMAP.md` had 3 conflicting hunks,
+resolved by hand — two were "my newer info supersedes the agent's
+stale-by-comparison info" (gap 1's already-landed-v2 status, gap 8's
+already-complete benchmark status — the agent's worktree predated both),
+and one was a genuine complementary fix (the agent's own 9a work
+correctly caught "Suggested sequencing across all six" as stale now that
+there are 14 gaps, not 6 — kept that fix, combined with this session's
+new gap 13/14 sections the agent's worktree never saw). Also found and
+fixed in passing: the identifier-swap v2 framing was stale in both
+README.md and PROPOSAL.md (still said "not built" after it landed) —
+that fix carried through the merge automatically since it was the
+agent's, not this session's, edit.
+
+All three subagent gaps (9, 13, 14) are now merged, verified clean
+together: `go build`/`go vet ./...`, `gofmt -l .` (only pre-existing
+frozen `corpus/stdlib-*` fixtures flagged, as always), and the exact CI
+lint invocation (`go tool -modfile=tools/golangci-lint/go.mod
+golangci-lint run ./...`) — 0 issues. Everything from tonight remains
+uncommitted, per the standing "ask before committing" rule — this is a
+good stopping point to ask the user whether to commit before doing
+anything else.
+
+## 2026-08-12: gap 9b (verbosity trim) — explicit go-ahead given, done and merged
+
+User gave gap 9b its explicit go-ahead: "comments should be meaningful
+and reflect why architectural decisions were made." Asked to confirm a
+precise scope before dispatching, since a blanket shortening pass would
+reverse this project's own established rationale-heavy comment
+convention; user confirmed the criterion the section itself had already
+suggested: trim comments that don't cite a rejected alternative or a
+concurrency/correctness hazard, leave everything that does.
+
+Dispatched to a fresh worktree subagent with that exact criterion. The
+agent stopped its own turn twice mid-task waiting on background `go test`
+runs without actually blocking on them — each time the task-notification
+reported "completed" when the real work wasn't finished yet (same
+pattern as the fable investigation earlier in this session: a subagent
+that launches a background job and ends its turn gets a premature
+completion notification). Resumed it twice via SendMessage before getting
+the real final report.
+
+A live diagnostics view also showed real-looking compile errors
+(`EstimateResult`/`PackageEstimate` undefined, `mutantID` missing its
+gap-13 `rank` param) against files in that agent's worktree mid-run —
+raised directly with the agent rather than assumed broken. Turned out to
+be a real but resolved concern: every subagent worktree this session
+forked from a stale `Initial commit` base (git history-wise), but the
+Agent tool's worktree setup pre-stages the actual current file content
+on top of that stale history as uncommitted adds — so `git log`/
+`merge-base` on a worktree is misleading (always points at the ancient
+initial commit), but the actual file *content* is current. Confirmed this
+directly via `git diff --no-index` (which diffs real file bytes, not
+commit history) against each of the 4 files this agent touched — all 4
+were exactly the small, clean diffs reported (2-8 lines each), no hidden
+divergence. This is now the established way to verify a worktree
+subagent's diff before merging: never trust `git log`/`merge-base` inside
+one of these worktrees, always `git diff --no-index` the specific files
+against the current main-tree copies.
+
+**Result: only 5 comments qualified, across 4 files** (`internal/corpus/corpus.go`,
+`internal/mutate/engine_integration_test.go`,
+`internal/mutate/runner.go`, `internal/mutator/identifier/constswap_test.go`)
+— net 11 insertions/19 deletions. The agent read every comment of 4+
+lines across `internal/`, `cmd/`, `example/` and found the project's own
+claimed convention (long comments that actually explain *why*) genuinely
+held up in practice; the 5 trimmed were pure restatement or narration
+with nothing behind them. All 4 files copied directly into the main tree
+(byte-identical diffs, confirmed via `git diff --no-index` before and
+after copying) and re-verified there: `go build`/`go vet` (plain and
+`-tags=integration`), `gofmt -l`, the exact CI lint command (0 issues),
+`go test -short ./...` — all clean. ROADMAP.md gap 9 (top summary + its
+own section) updated to "done, all five sub-tasks."
+
+All of tonight's work — the original benchmark/aes/CI-restructure commit
+(`420ca68`) plus this gap-9b addition — is ready to commit. User has also
+asked for the resulting local-only commit history (currently 27 commits
+ahead of `origin/main`, none of it pushed yet, repo currently PRIVATE) to
+be squashed into logical chunks before anything is pushed and the repo is
+made public. That squash is the next pending action, followed by asking
+again before actually pushing/flipping visibility — both real,
+externally-visible actions this project's standing rule requires
+confirming first.

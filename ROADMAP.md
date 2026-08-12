@@ -6,10 +6,14 @@ strconv/base64/crypto case studies); gaps 4-6 surfaced later, during the
 corpus-harness and dogfooding work. In priority order, since the first two
 are the load-bearing evidence for the eventual stdlib pitch:
 
-1. **Done.** An identifier/constant-swap mutation operator (v1: const-for-const
-   only, see the "honest limitation" note below — does not yet reproduce the
-   strconv `ParseUint` bug's exact local-var-to-const shape, a flagged v2
-   follow-on) — `internal/mutator/identifier/constswap.go`.
+1. **Done, v1 and v2 both.** An identifier/constant-swap mutation operator
+   (v1: const-for-const; v2, landed 2026-08-11: local-var-to-package-const,
+   the exact strconv `ParseUint` shape) — `internal/mutator/identifier/constswap.go`.
+   v2's first version had a real 24x mutant-count blowup (no file-scoping
+   restriction), fixed by restricting candidates to package-level constants
+   in the same file as the local variable's use — verified stable (81
+   mutants) via direct binary testing, and confirmed against the real
+   strconv `ParseUint` historical source by a dedicated unit test.
 2. **Done.** Trivial Compiler Equivalence (TCE) — filtering equivalent
    mutants by normalized `-S` disassembly comparison (the spike found raw
    archive comparison, the original plan, unreliable — see below),
@@ -56,26 +60,74 @@ are the load-bearing evidence for the eventual stdlib pitch:
    mutex is invisible to a synctest bubble. Lowest priority of the seven:
    nothing in the collector is timing-dependent today, so there is nothing
    to synctest-test yet — this is a door to leave open, not a bug to fix.
-8. **Harness done (committed); real benchmark run in progress, not yet
-   finalized.** `BenchmarkMutate` (`internal/mutate/mutate_bench_test.go`)
-   is built and verified — see below. The actual `-count=1` overnight run
-   is executing as of this writing: `op-control-if`'s full 18-subtest
-   matrix completed cleanly, and `stdlib-strconv-parseuint`'s heavy
-   subtests are landing real data (e.g. `full/tce=false/parallel=1`:
-   3517 mutants, ~45.7 minutes, 6077x baseline). `BENCHMARKS.md` still
-   holds placeholder content until the full run finishes and gets written
-   up — don't treat this as done until that happens.
-9. **Not started.** Comment cleanup pass across the codebase and its docs —
-   five distinct sub-tasks (staleness audit, a verbosity-trim style
-   question, dead-code/stray-marker removal, format consistency, and
-   proper academic citations for named techniques like TCE) that should
-   not be treated as one mechanical task — see below for why.
+8. **Done.** `BenchmarkMutate` (`internal/mutate/mutate_bench_test.go`) is
+   built, verified, and its full `-count=1` overnight run is complete —
+   both targets x all 3 scopes x TCE x all 3 parallel levels, every
+   subtest has a real captured number. `BENCHMARKS.md` holds the full
+   transcript, methodology, and two honest data-quality caveats about how
+   this specific run was captured (a metric gap from process-splitting,
+   real CPU contention with concurrent corpus verification). Confirmed
+   3523 mutants (not 3517) is `stdlib-strconv-parseuint`'s stable count —
+   the earlier "3517 vs 3523" discrepancy was an artifact of an
+   interrupted capture, not a real alternate count.
+9. **Done, all five sub-tasks.** Comment cleanup pass across the codebase
+   and its docs — five distinct sub-tasks (staleness audit, a
+   verbosity-trim style question, dead-code/stray-marker removal, format
+   consistency, and proper academic citations for named techniques like
+   TCE) that should not be treated as one mechanical task — see below for
+   why. 9a/9c/9d/9e: stale ROADMAP.md line-number citations in gaps 1 and
+   3 were corrected or converted to function-name-only references,
+   several stale doc claims in
+   `README.md`/`PROPOSAL.md`/`internal/mutator/literal/literal.go` (an
+   operator count, a "known gap" that had since closed, a captured
+   example run predating mutant IDs) were fixed, no `TODO`/`FIXME`/`XXX`
+   or dead commented-out code was found, and the TCE/mutant-subsumption
+   citations now have real DOI links. 9b (verbosity trim): explicit
+   go-ahead given, scoped to the exact criterion this section's own text
+   suggested — trim comments that don't cite a rejected alternative or a
+   concurrency/correctness hazard, leave everything that does. A full
+   read of every 4+-line comment in `internal/`, `cmd/`, `example/` found
+   the codebase's rationale-heavy convention genuinely held up in
+   practice: only 5 comments (across `internal/corpus`, `internal/mutate`
+   x2, `internal/mutator/identifier`) were pure restatement/narration
+   with no rationale attached, and only those were trimmed.
 10. **Done.** `literal/number` now mutates float literals too (a relative
     0.1% nudge, not a flat ±1 — see below for why). Found via an
     independent fable-model review, built the same night.
 11. **Done.** `-mutateestimate=true` — a walk-only preview of a real run's
     mutant count and a rough, honestly-hedged time estimate, per package,
     before committing to it. See below for the full design.
+12. **Done.** A persistent mutant-verdict cache (`-mutatecache=<dir>`),
+    invalidated on real code change via a compound key
+    (`{Toolchain, Scope, TCE, Fingerprint, MutantID}`) — mutant IDs alone
+    proved unsafe as a cache key (see gap 4's own stability caveat and
+    gap 13 below for a concrete collision this surfaced), so cache
+    correctness rests on the fingerprint + scope + TCE components too, not
+    the ID in isolation.
+13. **Done.** `mutantID` collisions on left-associative binary-expression
+    chains (`a^b^c^d^e`) — Go's `ast.BinaryExpr.Pos()` returns the same
+    leftmost-operand position for every nested sub-expression in such a
+    chain, so multiple distinct mutations on one chain used to hash to the
+    same ID. Fixed via a per-file `idDeduper` that counts how many times a
+    given (line, col, operator, index) tuple has already been seen during
+    the walk, appending that rank to the hash only when it's nonzero — the
+    common, non-colliding case is byte-for-byte unchanged (pinned by a
+    regression test against the pre-fix hash). Verified non-vacuous: the
+    added `TestRunBinaryChainMutantsHaveDistinctIDs` fails with real
+    collisions when the fix is reverted, and a real run against the exact
+    `corpus/stdlib-crypto-aes` line that surfaced this bug now gives
+    `f1dd58acbb56` (the originally-colliding ID) exactly once.
+14. **Built, not fully live yet.** All 7 badges are in README.md and
+    every workflow behind them exists (`codeql-analysis.yml`,
+    Codecov/SonarCloud steps added to `ci.yml`, the new scheduled
+    `mutation-badge.yml`). `Go Reference`/`Tests`/`CodeQL` work the moment
+    the repo is public — no further action. `Codecov` and both SonarCloud
+    badges are wired but self-gated (no-op until their respective
+    external accounts exist and `CODECOV_TOKEN`/`SONAR_TOKEN` secrets are
+    set — an account-linking step only the user can do). The
+    mutation-score badge's workflow has never been run for real (it needs
+    GitHub Actions, not local `go test`) — verify its first real run once
+    the repo is public before trusting the published number.
 
 Each section below states the problem, the design decisions and their
 rationale, the exact files and functions touched, a build order, and how to
@@ -83,9 +135,12 @@ verify the result — matching the precision of the original build plan
 (`~/.claude/plans/wondrous-crunching-avalanche.md`). Genuinely open questions
 are called out as such, not resolved by assertion.
 
-All file/line references below are current as of this writing (single
-commit, `4332a9e`); re-check line numbers before implementing if the tree has
-moved on.
+Any remaining file/line references below were current only as of the
+commit each section was originally written against; re-check line numbers
+before implementing if the tree has moved on. Gaps 1, 3, and 5 have had
+their line-number citations converted to function-name-only (`[Xxx]`-style)
+references or verified/corrected as of the 9a staleness-audit pass (see gap
+9, below) — the remaining gaps have not all had the same treatment yet.
 
 ---
 
@@ -105,8 +160,8 @@ Producing "swap this identifier for a different, type-compatible, in-scope
 identifier" requires knowing what's in scope and what it's typed as, which is
 `go/types`, not `go/ast`.
 
-This is a real architectural step up. `internal/mutate/engine.go`'s `load()`
-(lines 385–422) is explicit about avoiding this today:
+This is a real architectural step up. `internal/mutate/engine.go`'s `[load]`
+is explicit about avoiding this today:
 
 ```go
 // The load mode asks only for names, files and module metadata: the engine
@@ -175,15 +230,18 @@ real-world "picked the wrong sibling constant" bugs *are* this shape),
 while being explicit that closing the strconv case study fully needs a v2
 extension:
 
-**v2 (not this plan's build order, flagged as follow-on)**: extend the
-candidate set to include local variables whose declared type exactly
-matches a package-level constant's type, restricted further to identifiers
-used as an operand of a comparison (`<`, `<=`, `>`, `>=`, `==`, `!=` — the
-same "boundary-relevant" spirit as `operator/boundary`), since that's where
-a wrong-constant substitution actually changes behavior dangerously. This
-filter is a heuristic, not a proof that it's sufficient or that it won't
-still explode on a function with many boundary comparisons; it needs its own
-validation pass against the strconv fixture before being trusted.
+**v2 — done, landed 2026-08-11 (`internal/mutator/identifier/constswap.go`,
+committed `84fe29b`).** Extends the candidate set to local variables whose
+declared type exactly matches a package-level constant's type, restricted
+to identifiers used as an operand of a comparison (`<`, `<=`, `>`, `>=`,
+`==`, `!=` — the same "boundary-relevant" spirit as `operator/boundary`).
+The heuristic below turned out insufficient on its own: the first version
+had no file-scoping restriction and produced a 24x mutant-count blowup
+against real code; fixed by further restricting candidates to
+package-level constants declared in the *same file* as the local
+variable's use. Verified stable (81 mutants, not an unbounded blowup) via
+direct binary testing against a real fixture — see PROGRESS.md's
+2026-08-11 entry.
 
 **1b. Getting type info without making every run pay for it.** Two options:
 
@@ -211,36 +269,34 @@ validation pass against the strconv fixture before being trusted.
   func loadTyped(ctx context.Context, opts Options) (map[string]*packages.Package, error)
   ```
 
-  `Run()` (engine.go, currently lines 175–207) calls `loadTyped` right after
-  the existing `load(ctx, opts)` call, only if `needsTypes(mutators)`, and
-  threads the result into `plan()`. `loadTyped` uses
+  `[Run]` (engine.go) calls `loadTyped` right after the existing
+  `load(ctx, opts)` call, only if `needsTypes(mutators)`, and threads the
+  result into `plan()`. `loadTyped` uses
   `packages.NeedTypes | packages.NeedTypesInfo | packages.NeedSyntax |
   packages.NeedImports | packages.NeedDeps` — the mode `load()`'s comment
   explicitly avoids today, now scoped to only the callers who ask for it.
 
   A package that fails to type-check under `loadTyped` is demoted for that
-  operator only — the exact fail-soft precedent `plan()` already uses for
-  `ScopeImpact` (engine.go lines 494–509: *"Demoting this one package to
-  package scope costs time and nothing else, whereas failing the run would
-  throw away every other package's work"*). Here, the demotion is "run this
-  package's mutants without the identifier/const-swap operator," not a scope
-  change.
+  operator only — the exact fail-soft precedent `[planScope]` already uses
+  for `ScopeImpact` (engine.go: *"Demoting this one package costs time and
+  nothing else, whereas failing the run would throw away every other
+  package's work"*). Here, the demotion is "run this package's mutants
+  without the identifier/const-swap operator," not a scope change.
 
-**1c. Interface shape — do not touch `Mutator`.** `mutator.Mutator`
-(mutator.go lines 61–77) is a two-method interface every one of the 11
-operators implements statelessly. Adding scope/type context to it —
-e.g. `Applies(node ast.Node, info *types.Info) bool` — would force all 11
-existing, purely-syntactic operators to accept a parameter they ignore. That
-directly contradicts the package doc's stated design goal (mutator.go lines
-1–28): keep the interface to exactly what an operator needs, materialized as
-a slice of `Mutation`, nothing more.
+**1c. Interface shape — do not touch `Mutator`.** `[Mutator]` (mutator.go) is
+a two-method interface every one of the 11 operators implements statelessly.
+Adding scope/type context to it — e.g. `Applies(node ast.Node, info
+*types.Info) bool` — would force all 11 existing, purely-syntactic operators
+to accept a parameter they ignore. That directly contradicts the package
+doc's stated design goal (mutator.go's package doc comment): keep the
+interface to exactly what an operator needs, materialized as a slice of
+`Mutation`, nothing more.
 
 There is also a concurrency hazard to solve, not just an ergonomics one. A
 single `Mutator` instance is shared and reused across the whole run
-(`mutator.All()`, mutator.go lines 139–152), and files — including multiple
-files of the *same* package — are mutated concurrently up to
-`Options.Parallel` (engine.go's `fileJob`/`execute`, lines 214–225,
-424–445). If a typed operator's scope/type info were set as a mutable field
+(`[All]`, mutator.go), and files — including multiple files of the *same*
+package — are mutated concurrently up to `Options.Parallel` (engine.go's
+`fileJob`/`[execute]`). If a typed operator's scope/type info were set as a mutable field
 on the shared instance (e.g. an `Init(info, pkg)` method called once per
 package), two files of the same package running concurrently would race on
 that field.
@@ -264,7 +320,7 @@ type TypedMutator interface {
 }
 ```
 
-In `plan()` (engine.go, lines 460–524), per package: if `needsTypes` was
+In `[plan]` (engine.go), per package: if `needsTypes` was
 true and this package resolved under `loadTyped`, build a **per-package**
 mutator slice — for each mutator in the run's shared set, if it implements
 `TypedMutator`, replace it with `.WithScope(info, pkg)`'s return value;
@@ -320,10 +376,10 @@ the same way the other operators were validated.
   the scope restriction and the TypedMutator opt-in, matching the
   explain-the-why-up-front style of `statement/remover.go`'s package doc.
 - `internal/mutate/engine.go` — `needsTypes`, `loadTyped`, wiring into
-  `Run()` (lines 175–207) and `plan()` (lines 460–524); `fileJob.mutators`
+  `[Run]` and `[plan]`; `fileJob.mutators`
   becomes per-package-derived instead of always the run-wide shared slice;
   blank import `_ "github.com/jh125486/turango/internal/mutator/identifier"`
-  added to the existing side-effect import block (lines 27–31).
+  added to the existing side-effect import block.
 - `cmd/turango/main.go` — no change needed; `-mutateoperators=` already
   forwards arbitrary names to `mutator.New`, and `mutator.List()`
   automatically includes the new registry name.
@@ -346,8 +402,8 @@ the same way the other operators were validated.
 
 - `internal/mutator/identifier/constswap_test.go`, table-driven, following
   the existing operator-test convention
-  (`internal/mutator/operator/operator_test.go`'s `parseFunc`/`render`/
-  `findNode` helpers) — except `parseFunc`'s own doc comment states
+  (`internal/mutator/operator/tokens_test.go`'s `parseFunc`/`render`
+  helpers) — except `parseFunc`'s own doc comment states
   *"snippets are never type-checked, so they need only parse"*, which is
   exactly the shortcut this operator's tests cannot take. Add a
   package-local helper, e.g.
@@ -438,10 +494,11 @@ Mutant Detection Technique," ICSE'15][tce]) is deliberately unsophisticated:
 compile both versions, compare the resulting object code, declare
 equivalent on a match. Per this project's own prior
 research pass (referenced in the task framing), it should be **always-on**,
-unlike mutant subsumption (a *selection* technique that trades completeness
-for speed and should stay opt-in) — TCE is a *filtering* technique with no
-completeness trade-off, assuming the compiled-equivalence check itself is
-correct.
+unlike mutant subsumption ([Ammann, Delamaro & Offutt, "Establishing
+Theoretical Minimal Sets of Mutants," ICST'14][subsumption]; a *selection*
+technique that trades completeness for speed and should stay opt-in) — TCE
+is a *filtering* technique with no completeness trade-off, assuming the
+compiled-equivalence check itself is correct.
 
 ### Pipeline placement
 
@@ -522,6 +579,7 @@ same source unless specific conditions are controlled for:
 [go.dev/blog/rebuild]: https://go.dev/blog/rebuild
 [filippo-repro]: https://words.filippo.io/reproducing-go-binaries-byte-by-byte/
 [tce]: https://doi.org/10.1109/ICSE.2015.103
+[subsumption]: https://doi.org/10.1109/ICST.2014.13
 
 **Genuinely unresolved — flagged, not papered over**: this project has not
 empirically verified that `go build -o` with `-trimpath` and a fixed
@@ -751,7 +809,7 @@ duplicate of `Before`.
 
 ### Problem
 
-`MutantResult.Description` (report.go lines 110–112) is a terse
+`MutantResult.Description` (report.go) is a terse
 operator-authored summary, e.g. `"== -> !="` or (from `statement/remover`'s
 `describe`) a truncated rendering of the deleted statement. It is not the
 actual before/after source text of the mutated node(s), so reconstructing
@@ -770,18 +828,18 @@ either ill-defined or would need multi-line handling anyway. The mutated
 node's own printed span is well-defined for every operator and reuses
 `go/printer`, already in use throughout this package (`mutateFile`'s
 baseline print, `run.run`'s mutated print, and — precedent for printing a
-sub-node rather than a whole file — `operator_test.go`'s `render()` test
+sub-node rather than a whole file — `tokens_test.go`'s `render()` test
 helper, which already does exactly `printer.Fprint(&buf, fset, node)` for a
 single node rather than a file).
 
-**3b. Which node to print is not always the walk's outer node.** `MutantResult
-.Before`/`.After` need to be captured around `run.run`'s existing
-`m.mutation.Apply()`/`defer m.mutation.Revert()` pair (runner.go lines
-96–101). The walk (`mutateFile`, engine.go lines 536–645) does carry a
-`node ast.Node` per iteration, but for `statement/remover` specifically,
-that outer node is the *container* (`*ast.BlockStmt`/`*ast.CaseClause`), not
-the individual statement being deleted — per that operator's own package
-doc comment (statement.go lines 1–24): `Applies`/`Mutate` are called on the
+**3b. Which node to print is not always the walk's outer node.**
+`MutantResult.Before`/`.After` need to be captured around `run.run`'s
+existing `m.mutation.Apply()`/`defer m.mutation.Revert()` pair (runner.go).
+The walk (`[mutateFile]`, engine.go) does carry a `node ast.Node` per
+iteration, but for `statement/remover` specifically, that outer node is the
+*container* (`*ast.BlockStmt`/`*ast.CaseClause`), not the individual
+statement being deleted — per that operator's own package doc comment
+(statement/remover.go's package doc): `Applies`/`Mutate` are called on the
 container because *"a walk hands a visitor the node alone — no parent, no
 slot"* to replace a single element of its parent's list. Printing the walk's
 outer `node` for this operator would render the whole block, not the
@@ -803,7 +861,7 @@ Chosen fix: add an optional field to `mutator.Mutation` itself:
 Node ast.Node
 ```
 
-`statement/remover.go`'s `Mutate` loop (lines 80–98) already has the exact
+`statement/remover.go`'s `Mutate` loop already has the exact
 right value in scope as a captured local — `stmt`, the loop variable per
 `for i, stmt := range list` — so setting `Node: stmt` there is a one-line
 addition, not a restructuring.
@@ -818,7 +876,7 @@ scope in their `Mutation{}` literal, e.g. `operator/binary`'s `expr`), and
 because a wrong/misleading snippet for one specific operator seems worse
 than the small mechanical cost of getting it right everywhere.
 
-**3c. Console vs. JSON.** `writeSurvivors` (report.go lines 331–365) is
+**3c. Console vs. JSON.** `[Result.writeSurvivors]` (report.go) is
 explicitly designed as a scannable table — its own doc comment cites a
 "ragged left edge... is what makes it hard to scan" concern. Dumping full
 before/after source into every row would break that design goal for a use
@@ -841,11 +899,11 @@ of scope here.
   returned `Mutation`.
 - `internal/mutate/report.go` — `MutantResult.Before`, `.After string`
   fields, doc comment cross-referencing `Description`.
-- `internal/mutate/engine.go` — `mutateFile` (lines 536–645) already tracks
+- `internal/mutate/engine.go` — `[mutateFile]` already tracks
   `spec.line`/`spec.operator` per node in its `ast.Inspect` callback; add
   `spec.node = node` alongside those as the fallback the runner uses when
   `Mutation.Node` is nil.
-- `internal/mutate/runner.go` — `mutant` struct (lines 31–61) gains a `node
+- `internal/mutate/runner.go` — `mutant` struct gains a `node
   ast.Node` field (the walk-level fallback, set by `mutateFile` above); a
   new small `renderNode(fset *token.FileSet, node ast.Node) (string,
   error)` helper (parallels the printer calls already inline in this file
@@ -881,8 +939,8 @@ of scope here.
   already encodes as `tt.src` — a natural, mechanical extension of the
   existing shape, not a new test pattern.
 - `internal/mutate/report_test.go`: extend the existing `MutantResult`
-  fixtures used by `TestResultJSONRoundTrip` (line 78) and `TestWriteSummary`
-  (line 212) with `Before`/`After` values; assert the JSON round-trips them
+  fixtures used by `[TestResultJSONRoundTrip]` and `[TestWriteSummary]`
+  with `Before`/`After` values; assert the JSON round-trips them
   and that `WriteSummary`'s console output is byte-for-byte unaffected (the
   3c decision: console stays `Description`-only).
 - `internal/mutate/engine_test.go`: add a small, targeted test (not
@@ -1622,6 +1680,18 @@ document.
 ---
 
 ## 9. Comment cleanup pass
+
+**Status: done, all five sub-tasks.** See PROGRESS.md's 2026-08-12 entries
+for the full fix list, including two real findings beyond pure comment
+cleanup: README.md/PROPOSAL.md still described identifier-swap v2 as
+unbuilt after it had landed, and `example/README.md`'s captured
+transcript pre-dated both mutant IDs and the two identifier operators —
+both corrected with real, re-run numbers, not just prose edits. 9b
+(verbosity trim) got its explicit go-ahead, scoped to trimming only
+comments that don't cite a rejected alternative or a concurrency/
+correctness hazard — 5 comments qualified, out of every 4+-line comment
+in the codebase read for this pass; the rest genuinely held up the
+rationale-heavy convention this section originally defended.
 
 ### Problem
 
@@ -2627,7 +2697,115 @@ so there is no verdict to cache"). `-mutatecache` combined with
 
 ---
 
-## Suggested sequencing across all six
+## 13. `mutantID` collision on left-associative binary-expression chains
+
+**Status: done.** See the top summary list's entry for the fix summary —
+found as a side effect of investigating a real `corpus/stdlib-crypto-aes`
+golden discrepancy (PROGRESS.md's 2026-08-12 entry). Fixed via a per-file
+collision-rank counter (`internal/mutate/engine.go`'s `idDeduper`) rather
+than the operand-index approach originally guessed at here — the rank
+approach generalizes to any future node type that shares this
+`Pos()`-collapsing behavior, not just `operator/binary` chains, and keeps
+every non-colliding mutant's ID byte-for-byte identical to before the fix.
+
+---
+
+## 14. README badges (build/quality status, plus a mutation-score badge)
+
+**Status: built.** See the top summary list's entry for what's live now
+vs. what still needs the user's own account/secret setup at Codecov and
+SonarCloud, and why the mutation-badge workflow's first real number
+should be spot-checked once it actually runs in Actions.
+
+### Problem
+
+turango's README has no status badges at all today — not even a build
+badge for `ci.yml`, which already exists and would cost nothing to
+surface. The user asked for a badge row modeled on another of their
+projects (`gradebot`)'s: `Go Reference` (pkg.go.dev), `Tests` (GitHub
+Actions), `CodeQL`, `Codecov`, and two SonarCloud badges (quality gate,
+coverage) — plus asked whether a badge showing the mutant/mutation-score
+count is feasible. Checked before writing this: turango has none of the
+underlying infrastructure four of those six badges assume — no
+`codeql-analysis.yml` workflow, no Codecov account/upload step, no
+SonarCloud project. Adding the badge markdown without the workflow behind
+it would just render a broken/red badge, which is worse than no badge.
+
+### Design decisions
+
+**14a. Two badges are free right now, the rest are a real decision.**
+`Go Reference` needs zero CI changes — it's pkg.go.dev's own badge for
+any tagged public Go module. `Tests` is a one-line badge pointing at
+`ci.yml`'s existing workflow. `CodeQL` needs a new
+`.github/workflows/codeql-analysis.yml` (GitHub's security-scanning
+workflow) — a real but small, self-contained addition. `Codecov` and
+both `SonarCloud` badges each need a new external account, a CI upload
+step, and (depending on the account's tier/repo visibility) a secret
+token to manage — a genuine new operational dependency, not something to
+add reflexively just because `gradebot` has it. Whether that overhead is
+worth it for a not-yet-1.0 tool mid-way through a Go proposal is a call
+for the user, not an engineering one.
+
+**14b. A mutation-score badge is possible, but needs a live data
+pipeline, not a static badge.** Rejected outright: hand-typing a number
+into a static badge URL — it rots the moment a mutant is added or fixed,
+and a badge nobody re-checks is worse than no badge (same reasoning as
+14a's "don't add a broken badge"). Two real options, both needing turango
+to mutation-test *itself* in CI and publish the result somewhere a badge
+service can read:
+- **shields.io endpoint badge**: CI runs turango against its own module
+  (this project already dogfoods this way — see
+  `TestRunAgainstRealModule`), computes a score from the JSON report, and
+  publishes a small JSON file in shields.io's endpoint schema
+  (`{"schemaVersion":1,"label":"mutation score","message":"92%","color":"green"}`)
+  to somewhere stable and public — a dedicated `gh-pages`/badges branch
+  this repo's own CI pushes to.
+- **GitHub Gist + shields.io's gist endpoint badge**: lower setup cost (no
+  Pages/branch config) but couples the badge to an external gist ID
+  staying in sync, and needs its own write-token secret.
+Either way, this needs its own scheduled workflow, not a per-PR one — see
+14c.
+
+**14c. Rejected: running self-mutation-testing on every PR to drive the
+badge.** Same reasoning `corpus.yml` already established for this
+project's own regression corpus (see that file's comment): a real
+mutation sweep is too slow to gate every push. A scheduled +
+`workflow_dispatch` cadence, mirroring `corpus.yml`'s own pattern, keeps
+the badge fresh without becoming a bottleneck on ordinary PRs.
+
+### Files touched
+
+`README.md` (badge row under the title); `.github/workflows/codeql-analysis.yml`
+(new, if CodeQL is pursued); a new `.github/workflows/mutation-badge.yml`
+(self-mutation run + badge-JSON publish, scheduled like `corpus.yml`, if
+the mutation-score badge is pursued); possibly a `gh-pages` branch.
+
+### Build order
+
+1. Add the two free badges (`Go Reference`, `Tests`) — zero new
+   infrastructure, safe to do immediately.
+2. Decide with the user whether CodeQL/Codecov/SonarCloud are worth their
+   external-account overhead at this project's current stage — a scope
+   decision, not a code one.
+3. If pursuing the mutation-score badge: build the self-mutation-testing
+   workflow on `corpus.yml`'s schedule/`workflow_dispatch` pattern, pick a
+   badge-hosting mechanism (`gh-pages` endpoint vs. gist), wire the
+   JSON-publish step.
+
+### Verification
+
+Every badge's underlying URL reflects real, live CI/service state — no
+badge pointing at a workflow that doesn't exist or a service turango
+isn't actually wired into. The mutation-score badge's number changes
+across a run that adds or removes mutants, proving it's live data, not
+frozen at add-time.
+
+---
+
+## Suggested sequencing across gaps 1-6
+
+(Written when gaps 1-6 were this document's entire scope; gaps 7-14 were
+added later and are not covered by the sequencing notes below.)
 
 Independent enough to parallelize, but if built serially, **3 before 1
 before 2** is the lower-friction order for gaps 1–3. Gap 4 (mutant IDs) is

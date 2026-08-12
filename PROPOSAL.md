@@ -185,6 +185,11 @@ Sibling flags, mirroring how `-fuzz` has `-fuzztime`/`-fuzzminimizetime`/
 - `-mutateoutput=<dir>` — write a JSON report.
 - `-mutatemin=<float>` — non-zero exit if the resulting score falls below
   the threshold, for CI gating.
+- `-mutatetce=true|false` — Trivial Compiler Equivalence: filter a mutant
+  whose compiled output exactly matches a baseline before it reaches the
+  test suite. Off by default, and worth staying off by default for most
+  codebases — see "Costs and risks" below for a real measurement showing
+  this optimization is a net *loss* for at least one real fixture.
 
 A `//nomutant` (and `//nomutant:reason`) source comment suppresses
 mutation of the annotated statement, cascading into the body of a
@@ -199,34 +204,41 @@ documented trailing-comment edge cases ([golang/go#21755],
 [golang/go#21755]: https://github.com/golang/go/issues/21755
 [golang/go#33451]: https://github.com/golang/go/issues/33451
 
-### The 11 mutation operators (v1 set)
+### The mutation operators (14, across six packages)
 
-Ported and modernized from the 2018 prototype: `if`/`else`/`case`
+Nine were ported and modernized from the 2018 prototype: `if`/`else`/`case`
 body-removal, `&&`/`||` short-circuit-operand elimination, statement
 removal, and four token-swap operators (assignment, binary, increment/
 decrement, unary-strip) covering the classic arithmetic/relational/logical
-scalar mutations. Two operators were added since this set was first drafted:
+scalar mutations. Five more were added since this set was first drafted:
 `operator/boundary`, a relational boundary shift (`<`↔`<=`, `>`↔`>=`) — the
 classic off-by-one mutant, distinct from `operator/binary`'s negation swap
 (`<`↔`>=`) and named to match PIT's "Conditionals Boundary Mutator" (PIT is
-cited in Related Work, below); and a pair of literal operators,
-`literal/number` (shifts an integer literal by ±1, e.g. `x < 0` →
-`x < 1`, or a float literal by a small relative nudge in each direction)
-and `literal/boolean` (swaps `true`↔`false`).
+cited in Related Work, below); a pair of literal operators, `literal/number`
+(shifts an integer literal by ±1, e.g. `x < 0` → `x < 1`, or a float
+literal by a small relative nudge in each direction) and `literal/boolean`
+(swaps `true`↔`false`); and the identifier-substitution pair described in
+the "Known gap ... now closed" paragraph below, `identifier/constswap` and
+`identifier/localconstswap`.
 
 **Known gap, found during validation, worth stating up front — now
-partially closed**: this operator set proves "this code path is
+closed**: this operator set proves "this code path is
 exercised," not "this specific input shape is tested." `literal/number`
-and `literal/boolean` now cover literal-value mutations like `x < 0` →
-`x < 1`, but they do not reproduce the historical
+and `literal/boolean` cover literal-value mutations like `x < 0` →
+`x < 1`, but on their own do not reproduce the historical
 [strconv#21278](https://github.com/golang/go/issues/21278) `ParseUint`
 overflow bug, whose actual shape was a wrong-*identifier* substitution —
-the existing named constant `maxVal` was swapped for a different,
-same-type, in-scope identifier (`maxUint64`), not a literal value change.
-Producing that mutation requires knowing which in-scope identifiers are
-type-compatible substitutes, which needs `go/types`, not just `go/ast`;
-none of the 11 operators above do this. An identifier-swap operator
-remains a natural, scoped follow-up, not a blocker for this proposal.
+the local variable `maxVal` was used where the package-level constant
+`maxUint64` should have been. Producing that mutation requires knowing
+which in-scope identifiers are type-compatible substitutes, which needs
+`go/types`, not just `go/ast`. Two operators now do this:
+`identifier/constswap` (package-level const-for-const, same `const(...)`
+block or file) and `identifier/localconstswap` (a function-local variable,
+restricted to comparison operands, swapped for a type-compatible
+package-level constant declared in the same file) — the latter reproduces
+this exact bug shape, confirmed by a unit test that type-checks the frozen
+historical `strconv` source and asserts `Mutate` offers `maxVal ->
+maxUint64` on the real `n1 > maxVal` comparison.
 
 ## Rationale
 
@@ -252,7 +264,7 @@ remains a natural, scoped follow-up, not a blocker for this proposal.
 - **No major language ships this in its official toolchain today.** Every
   mutation tester surveyed for this proposal — [PIT] (Java), [mutmut]
   (Python), [cargo-mutants] (Rust), [MutFlow] (Kotlin), [Mull] (C/C++,
-  LLVM-based), Stryker (JavaScript/TypeScript, .NET) — is a third-party
+  LLVM-based), [Stryker] (JavaScript/TypeScript, .NET) — is a third-party
   tool maintained outside its language's own toolchain, none blessed as an
   official, in-the-box feature. Landing `-mutate` would make Go the first
   mainstream language to ship mutation testing as a first-class part of
@@ -264,6 +276,7 @@ remains a natural, scoped follow-up, not a blocker for this proposal.
 [cargo-mutants]: https://github.com/sourcefrog/cargo-mutants
 [MutFlow]: https://github.com/anschnapp/mutflow
 [Mull]: https://arxiv.org/pdf/1908.01540
+[Stryker]: https://stryker-mutator.io/
 
 ## Compatibility
 
@@ -314,11 +327,16 @@ score threshold are all now implemented, none of them present in 2018.
   filters *syntactic* no-ops (byte-identical printed output), and
   `//nomutant` handles the remaining semantic cases, matching how every
   mature mutation tester handles this class of noise.
-- **Operator coverage is incomplete**, as documented above: literal-value
-  mutation is covered (`literal/number`, `literal/boolean`), but the
-  wrong-identifier-substitution shape (as in `strconv#21278`) requires
-  `go/types` and has no operator yet — stated as a known limitation, not a
-  blocker.
+- **Operator coverage is necessarily non-exhaustive**, as any finite
+  operator set is: 14 operators across `control`, `expression`, `literal`,
+  `operator`, `statement`, and `identifier` (the last two requiring
+  `go/types`, not just `go/ast`) cover the mutation shapes validated
+  against this proposal's own case studies, including the
+  wrong-identifier-substitution shape from `strconv#21278` (see "Known
+  gap ... now closed," above) — but mature mutation testers in other
+  languages (e.g. PIT's ~30-mutator set) cover more shapes than turango
+  does today. Extending coverage further is ordinary follow-on work, not a
+  blocker for this proposal's core claim.
 - **Turango is a working example with mild optimizations, not a
   state-of-the-art mutation-testing engine — deliberately.** Everything it
   does to control cost today is a well-understood, conservative technique:
@@ -341,6 +359,29 @@ score threshold are all now implemented, none of them present in 2018.
   it. (Benchmark harness built, real overnight run in progress as of this
   writing — see ROADMAP.md gap 8 and `BENCHMARKS.md`; not yet finalized
   into numbers this document cites.)
+- **TCE's payoff is real but codebase-dependent — it is not a free
+  optimization, and this proposal has a real measurement showing it can be
+  a net loss.** Against `corpus/stdlib-strconv-parseuint` (a real, frozen
+  stdlib fixture), enabling `-mutatetce=true` filtered 77 of 3523 mutants
+  (2.2%) as compiler-equivalent — genuine signal, not noise. But TCE's
+  compile-and-compare check (`go build -gcflags=-S`, measured directly:
+  0.414s, warm cache) runs *unconditionally* for every mutant, not just the
+  ones that turn out equivalent, in exchange for skipping the `go test` run
+  (0.605s, same fixture) only on that 2.2%. The arithmetic for N mutants:
+  without TCE, `N × 0.605s`; with TCE, `N × 0.414s + N × 0.978 × 0.605s =
+  N × 1.006s` — **TCE was about 66% slower overall for this specific
+  fixture**, because the per-mutant tax on 100% of mutants outweighs the
+  savings on the 2.2% it actually filters. This is exactly why turango
+  ships TCE opt-in, not opt-out (ROADMAP.md gap 2's own reasoning was about
+  correctness risk; this is the independent cost-side reason arriving at
+  the same default). The general lesson, not specific to TCE: turango's
+  knobs (`-mutatescope`, `-mutateparallel`, `-mutatetce`, and any future
+  ones) are levers whose right setting depends on the target codebase's own
+  shape — equivalent-mutant rate, test suite cost, cross-package coupling —
+  not a single universally-correct configuration. `BENCHMARKS.md` documents
+  this specific measurement in full; a stdlib implementation should expect
+  to publish similar guidance rather than a single recommended default for
+  every knob.
 - **Concurrency bugs are not reliably tested for.** Every mutant runs with
   `go test -parallel=1` (deliberate — it prevents `GOMAXPROCS x
   -mutateparallel` worker multiplication from misclassifying slow-but-fine

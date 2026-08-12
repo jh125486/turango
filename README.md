@@ -4,6 +4,14 @@
 
 *Mascot derived from the Go gopher, designed by [Renee French](https://go.dev/blog/gopher), licensed under [Creative Commons Attribution 4.0](https://creativecommons.org/licenses/by/4.0/).*
 
+[![Go Reference](https://pkg.go.dev/badge/github.com/jh125486/turango)](https://pkg.go.dev/github.com/jh125486/turango)
+[![Tests](https://github.com/jh125486/turango/actions/workflows/ci.yml/badge.svg)](https://github.com/jh125486/turango/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/jh125486/turango/actions/workflows/codeql-analysis.yml/badge.svg)](https://github.com/jh125486/turango/actions/workflows/codeql-analysis.yml)
+[![Codecov](https://codecov.io/gh/jh125486/turango/branch/main/graph/badge.svg)](https://codecov.io/gh/jh125486/turango)
+[![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=jh125486_turango&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=jh125486_turango)
+[![Sonar Coverage](https://sonarcloud.io/api/project_badges/measure?project=jh125486_turango&metric=coverage)](https://sonarcloud.io/summary/overall?id=jh125486_turango)
+[![Mutation score](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/jh125486/turango/gh-pages/mutation-score.json)](https://github.com/jh125486/turango/actions/workflows/mutation-badge.yml)
+
 Mutation testing for `go test`, added the same way fuzzing was: not a
 separate tool bolted onto the ecosystem, but a `go`-compatible drop-in that
 adds one new test mode.
@@ -195,7 +203,7 @@ example, including how it affects the reported score.
 
 ## Mutation operators
 
-Thirteen operators, across six packages:
+Fourteen operators, across six packages:
 
 - **`control`** — `control/if`, `control/else`, `control/case`: remove a
   conditional body.
@@ -209,14 +217,13 @@ Thirteen operators, across six packages:
   float literal by a small relative nudge in each direction),
   `literal/boolean` (`true`↔`false`).
 - **`identifier`** — `identifier/constswap`: swaps a package-level const
-  reference for a same-type sibling in the same `const(...)` block — the
-  only operator built on `go/types` rather than `go/ast` alone.
-
-Known gap (documented in `PROPOSAL.md`): `identifier/constswap` only swaps
-const-for-const, so it still can't reproduce a *local-variable*-to-constant
-substitution — the exact shape of the historical strconv `ParseUint`
-overflow bug (`#21278`). That extension is design-sketched in `ROADMAP.md`
-but not built.
+  reference for a same-type sibling in the same `const(...)` block;
+  `identifier/localconstswap`: swaps a function-local variable used as a
+  comparison operand (`<`, `<=`, `>`, `>=`, `==`, `!=`) for a type-compatible
+  package-level constant declared in the same file — the pair that reproduces
+  the historical strconv `ParseUint` overflow bug (`#21278`), which was a
+  local-var-to-constant substitution. Both are built on `go/types` rather
+  than `go/ast` alone, the only operators in this codebase that are.
 
 ## Architecture
 

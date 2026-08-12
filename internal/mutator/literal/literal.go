@@ -12,11 +12,13 @@
 // strconv.ParseUint had a real, shipped bug of almost this shape (a wrong
 // constant substituted for the correct one), which none of turango's
 // token-swap operators can reproduce; literal/number narrows that gap for
-// the case where the fix is a numeric shift. A true identifier-swap operator
-// (substituting one same-type named constant for another, as the real
-// ParseUint bug actually was) is a separate, larger undertaking — it needs
-// go/types, not just go/ast, to know which identifiers are substitutable —
-// and is not implemented here.
+// the case where the fix is a numeric shift. An identifier-swap operator
+// (substituting one same-type named constant for another, or a type-
+// compatible local variable for a constant, as the real ParseUint bug
+// actually was) needs go/types, not just go/ast, to know which identifiers
+// are substitutable, and is not implemented here: see the identifier
+// package's identifier/constswap and identifier/localconstswap operators
+// instead.
 //
 // Importing the package registers "literal/number" and "literal/boolean"
 // with the [mutator] registry.

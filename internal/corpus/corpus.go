@@ -93,10 +93,8 @@ type Entry struct {
 	Timeout string `json:"timeout"`
 
 	// TCE enables Trivial Compiler Equivalence (internal/mutate.Options.TCE)
-	// for this entry. False (the zero value, and every entry's implicit
-	// default before this field existed) matches every other entry's
-	// existing behavior exactly. Only a fixture built specifically to
-	// demonstrate TCE actually filtering a mutant (see
+	// for this entry. False is the default; only a fixture built
+	// specifically to demonstrate TCE actually filtering a mutant (see
 	// corpus/op-tce-equivalent) needs this set.
 	TCE bool `json:"tce,omitempty"`
 

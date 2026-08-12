@@ -38,69 +38,79 @@ the right one: it is the only scope that catches a mutant killed by a
 Real output, unedited:
 
 ```
-mutants:    166
-killed:     121
-survived:   33
-not-viable: 12
+mutants:    197
+killed:     144
+survived:   40
+not-viable: 13
 
-score:      78.6% (121 killed of 154 viable)
-suppressed: 2 of 156 nodes (1.3% excluded from the score by //nomutant)
+score:      78.3% (144 killed of 184 viable)
+suppressed: 2 of 186 nodes (1.1% excluded from the score by //nomutant)
 
-Surviving mutants (33):
-  example/pricing.go:9    literal/number        5000 -> 4999
-  example/pricing.go:9    literal/number        5000 -> 5001
-  example/pricing.go:54   literal/number        0 -> -1
-  example/pricing.go:54   literal/number        0 -> 1
-  example/pricing.go:54   operator/boundary     <= -> <
-  example/pricing.go:74   literal/number        1000 -> 1001
-  example/pricing.go:74   operator/boundary     < -> <=
-  example/pricing.go:81   control/if            remove if body
-  example/pricing.go:82   literal/number        0 -> -1
-  example/pricing.go:82   literal/number        0 -> 1
-  example/pricing.go:97   operator/boundary     >= -> >
-  example/pricing.go:116  control/if            remove if body
-  example/pricing.go:116  operator/boundary     > -> >=
-  example/pricing.go:116  statement/remover     remove statement: discount = subtotal
-  example/pricing.go:128  literal/number        0 -> -1
-  example/pricing.go:128  literal/number        0 -> 1
-  example/pricing.go:128  operator/boundary     <= -> <
-  example/stats.go:6      literal/number        1 -> 2
-  example/stats.go:6      literal/number        40 -> 39
-  example/stats.go:6      literal/number        40 -> 41
-  example/stats.go:61     literal/number        1 -> 0
-  example/stats.go:62     control/if            remove if body
-  example/stats.go:62     operator/boundary     < -> <=
-  example/stats.go:62     statement/remover     remove statement: low = value
-  example/stats.go:64     operator/boundary     > -> >=
-  example/stats.go:86     literal/number        1 -> 2
-  example/stats.go:90     control/case          remove case body
-  example/stats.go:90     literal/number        1 -> 0
-  example/stats.go:90     statement/remover     remove statement: down++
-  example/stats.go:91     operator/inc_dec      ++ -> --
-  example/stats.go:99     control/if            remove if body
-  example/stats.go:100    identifier/constswap  TrendFalling -> TrendFlat
-  example/stats.go:100    identifier/constswap  TrendFalling -> TrendRising
+Surviving mutants (40):
+  0b5b7cc3061b  example/pricing.go:9    literal/number             5000 -> 4999
+  63f5430e8c03  example/pricing.go:9    literal/number             5000 -> 5001
+  983b6a64d303  example/pricing.go:54   literal/number             0 -> -1
+  04f3d8ba7fc5  example/pricing.go:54   literal/number             0 -> 1
+  b7845c7a68ad  example/pricing.go:54   operator/boundary          <= -> <
+  265f9701cdc6  example/pricing.go:74   literal/number             1000 -> 1001
+  db13758d0873  example/pricing.go:74   operator/boundary          < -> <=
+  3d8204453987  example/pricing.go:81   control/if                 remove if body
+  45665faa5423  example/pricing.go:82   literal/number             0 -> -1
+  0da641aff1cc  example/pricing.go:82   literal/number             0 -> 1
+  584e0fd73fe1  example/pricing.go:97   operator/boundary          >= -> >
+  231d5d93b248  example/pricing.go:116  control/if                 remove if body
+  7c1f728ca35e  example/pricing.go:116  identifier/localconstswap  discount -> expeditedSurchargeCents
+  93f11246c004  example/pricing.go:116  identifier/localconstswap  discount -> freeShippingCents
+  433865f29289  example/pricing.go:116  identifier/localconstswap  discount -> restockingFeePercent
+  507a886d1251  example/pricing.go:116  identifier/localconstswap  discount -> standardShippingCents
+  bc6db5820c80  example/pricing.go:116  identifier/localconstswap  subtotal -> freeShippingCents
+  4979c1438f04  example/pricing.go:116  operator/boundary          > -> >=
+  0eb817c6aace  example/pricing.go:116  statement/remover          remove statement: discount = subtotal
+  ce375fb68906  example/pricing.go:128  literal/number             0 -> -1
+  6aac755ee5bb  example/pricing.go:128  literal/number             0 -> 1
+  75072c30c97a  example/pricing.go:128  operator/boundary          <= -> <
+  a30d11dbb9bd  example/stats.go:6      literal/number             1 -> 2
+  5204d96f8f05  example/stats.go:6      literal/number             40 -> 39
+  615922a2beec  example/stats.go:6      literal/number             40 -> 41
+  2dcf383d58fc  example/stats.go:61     literal/number             1 -> 0
+  0649693698dc  example/stats.go:62     control/if                 remove if body
+  416d7b1dd928  example/stats.go:62     identifier/localconstswap  value -> maxSafeTotal
+  5e2ba056cb5e  example/stats.go:62     operator/boundary          < -> <=
+  38604501f172  example/stats.go:62     statement/remover          remove statement: low = value
+  0b82070b125f  example/stats.go:64     operator/boundary          > -> >=
+  e7871e70947a  example/stats.go:86     literal/number             1 -> 2
+  a11490b4af0c  example/stats.go:90     control/case               remove case body
+  e4f071faf731  example/stats.go:90     literal/number             1 -> 0
+  e3f7b0204c2e  example/stats.go:90     statement/remover          remove statement: down++
+  dcab9b515e13  example/stats.go:91     operator/inc_dec           ++ -> --
+  8fef4d093cbb  example/stats.go:99     control/if                 remove if body
+  d598ec3be6ab  example/stats.go:99     identifier/localconstswap  up -> maxSafeTotal
+  7c9e7c75e671  example/stats.go:100    identifier/constswap       TrendFalling -> TrendFlat
+  f3907e7d2e33  example/stats.go:100    identifier/constswap       TrendFalling -> TrendRising
 ```
 
 Only survivors are listed, because they are the only actionable result. A killed
 mutant is the suite doing its job, and a not-viable one is an operator producing
-code that does not compile, which says nothing about the tests either way.
+code that does not compile, which says nothing about the tests either way. Each
+row's leading hex string is the mutant's stable, content-hashed ID — reproduce
+one exactly with `-mutatemutant=<ID>`.
 
 The survivor list has grown since operators were added beyond the original
 nine (`operator/boundary`'s off-by-one shifts, `literal/number`'s ±1 literal
-shifts, and `identifier/constswap`'s const-for-const swap account for most of
-the new entries above) — the shape of the finding is the same either way: each
+shifts, and the `identifier/constswap`/`identifier/localconstswap` pair's
+const-for-const and local-var-for-const swaps account for most of the new
+entries above) — the shape of the finding is the same either way: each
 survivor is a boundary, branch, or constant choice nothing asserts on. A
 representative sample, each fixable with a single test case:
 
 | Survivor | The missing test |
 | --- | --- |
 | `pricing.go:81` | `DiscountCents` with `CouponMember` and `member == false` — the non-member path is never exercised, so deleting it changes nothing. |
-| `pricing.go:116` | `Total`'s defensive clamp of a discount larger than the subtotal. No coupon can currently produce one, so the guard is unreachable — arguably the mutant is telling the truth and the guard should go. |
+| `pricing.go:116` | `Total`'s defensive clamp of a discount larger than the subtotal. No coupon can currently produce one, so the guard is unreachable — arguably the mutant is telling the truth and the guard should go. `identifier/localconstswap` finds the same gap five different ways, swapping `discount` for each sibling cents/percent constant in scope. |
 | `pricing.go:54`, `:74`, `:97`, `:128` | Boundary values (`<=` vs `<`, `>=` vs `>`) at the exact threshold are never tested — every fixture picks a value clearly on one side. |
-| `stats.go:62` | `Bounds` with a value *below* the first one. Every fixture rises, so `low` is never updated. |
+| `stats.go:62` | `Bounds` with a value *below* the first one. Every fixture rises, so `low` is never updated; `identifier/localconstswap` also offers `value -> maxSafeTotal` at the same comparison. |
 | `stats.go:90`, `:91` | `Trend` on a falling series. Nothing counts down-steps, so the `down++` case can be deleted, or turned into `down--`, unnoticed. |
-| `stats.go:99`, `:100` | ... and therefore the `TrendFalling` branch, and its constant, are dead in the tests too. |
+| `stats.go:99`, `:100` | ... and therefore the `TrendFalling` branch, and its constant, are dead in the tests too — `identifier/localconstswap` (`up -> maxSafeTotal`) and `identifier/constswap` (`TrendFalling -> TrendFlat`/`TrendRising`) both land here. |
 
 ## What the `//nomutant` directives demonstrate
 
@@ -147,25 +157,27 @@ mutating and running, so a suppressed node costs nothing and proves nothing.
 Delete both `//nomutant` lines and run again:
 
 ```
-mutants:    185
-killed:     131
-survived:   42
-not-viable: 12
+mutants:    218
+killed:     155
+survived:   50
+not-viable: 13
 
-score:      75.7% (131 killed of 173 viable)
-suppressed: 0 of 173 nodes (0.0% excluded from the score by //nomutant)
+score:      75.6% (155 killed of 205 viable)
+suppressed: 0 of 205 nodes (0.0% excluded from the score by //nomutant)
 ```
 
-Nineteen more mutants: two from the single suppressed `return`
-(`RestockingFeeCents`'s arithmetic), and seventeen from the cascade on
-`Sum`'s saturating-overflow guard — every operator that can touch an `if`
-condition, a comparison, a compound-assignment, or the body's own removal or
-individual statements now gets a shot at that one `if` block, since the
-directive that used to skip the whole subtree is gone.
+Twenty-one more mutants: seven from the single suppressed `return`
+(`RestockingFeeCents`'s arithmetic — `identifier/constswap` alone now offers
+three sibling-constant swaps there, on top of the literal and token-swap
+mutations the original two-mutant estimate accounted for), and fourteen from
+the cascade on `Sum`'s saturating-overflow guard — every operator that can
+touch an `if` condition, a comparison, a compound-assignment, or the body's
+own removal or individual statements now gets a shot at that one `if` block,
+since the directive that used to skip the whole subtree is gone.
 
-And the score goes **up** with the directives in place, 75.7% → 78.6%,
+And the score goes **up** with the directives in place, 75.6% → 78.3%,
 without one line of the package or its tests changing. That is the whole
 reason the summary prints the suppression ratio next to the score: suppressed
 nodes leave the score's denominator, so a liberal `//nomutant` habit inflates
 the number the same way a `// nocoverage` pragma games a coverage report.
-1.3% is a rounding error and the 78.6% means something; at 30% it would not.
+1.1% is a rounding error and the 78.3% means something; at 30% it would not.

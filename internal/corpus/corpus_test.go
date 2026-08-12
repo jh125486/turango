@@ -4,11 +4,20 @@
 // against the counts the golden file pins.
 //
 // This is a slow, real end-to-end suite — every entry compiles and tests its
-// target once per mutant — so it follows the same testing.Short() skip
-// idiom as internal/mutate's own real-module integration tests
-// (TestRunAgainstRealModule in internal/mutate/engine_test.go): skipped by
-// default, run explicitly (see .github/workflows/ci.yml's dedicated corpus
-// step).
+// target once per mutant, and the slowest single entry alone can run over an
+// hour (see corpusRunTimeout's own doc comment for real, observed numbers) —
+// so it is skipped under -short. This is the one deliberate exception to
+// this project's usual "integration" build-tag convention: unlike
+// internal/mutate's own real-module integration tests (TestRunAgainstRealModule,
+// internal/mutate/engine_integration_test.go), which moved to a build tag
+// specifically so `go test ./...` never even compiles them in, TestCorpus
+// stays reachable via a plain `go test ./internal/corpus/...` (no tag
+// needed) for a quick local check — it's the -short flag, not compilation,
+// that keeps it out of the fast path. Run explicitly via
+// `go test -run TestCorpus ./internal/corpus/...`, or see
+// .github/workflows/corpus.yml for how CI runs it — deliberately not on
+// every push/PR the way the rest of the suite is (see that file's own
+// comment for why).
 package corpus_test
 
 import (
@@ -27,18 +36,30 @@ import (
 // corpusRunTimeout is the overall safety-net context timeout for one entry's
 // mutate.Run call. It is deliberately generous and distinct from the
 // per-mutant -mutatetimeout that comes from the golden file itself: this
-// bound only exists to keep a hung or pathologically large entry (the
-// aes-full fixture runs hundreds of mutants) from stalling the whole test
+// bound only exists to keep a hung entry from stalling the whole test
 // binary forever, not to constrain any single mutant.
+//
+// 2 hours, not the 30 minutes this constant originally shipped with — that
+// number was a guess ("the aes-full fixture runs hundreds of mutants"),
+// made before any real capture existed. It was wrong by more than an order
+// of magnitude: stdlib-crypto-aes's real, captured golden is 7746 mutants
+// (dominated by internal/fips140/aes alone), and a real run against it, at
+// -mutateparallel=GOMAXPROCS, took just over an hour on real hardware — see
+// PROGRESS.md's corpus-capture notes for the actual numbers this bound is
+// now sized against, not a re-guess. This is also why TestCorpus moved out
+// of ci.yml's per-PR steps and into corpus.yml's own schedule/
+// workflow_dispatch-triggered workflow (see that file's own comment): a
+// bound sized for a 1-hour-plus entry has no business gating every PR.
 //
 // It is also distinct from -- and does not raise -- `go test`'s own
 // process-wide -timeout (a default 10m applies unless a caller overrides it,
-// e.g. the CI corpus step's explicit -timeout flag): a per-entry context
-// timeout only ever produces a clean ctx.Err() from mutate.Run and a
-// readable t.Fatalf for that one subtest, whereas the process-wide -timeout
-// firing panics the whole binary, mid-run, with no per-entry attribution.
-// Both need to be generous; only the first is this package's to set.
-const corpusRunTimeout = 30 * time.Minute
+// e.g. corpus.yml's explicit -timeout flag, kept in sync with this
+// constant): a per-entry context timeout only ever produces a clean
+// ctx.Err() from mutate.Run and a readable t.Fatalf for that one subtest,
+// whereas the process-wide -timeout firing panics the whole binary, mid-run,
+// with no per-entry attribution. Both need to be generous; only the first is
+// this package's to set.
+const corpusRunTimeout = 2 * time.Hour
 
 // TestCorpus runs every discovered corpus entry as its own subtest.
 //

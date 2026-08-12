@@ -655,10 +655,7 @@ func F() bool {
 }
 
 // TestLocalApplies covers Applies() for localConstSwap across every scoping
-// scenario in localScopeCases: the strconv shape itself, exact-type and
-// representability matching, the negative-constant safety check, a type
-// mismatch, the local-variable-only restriction, the comparison-operand
-// restriction, and the no-package-constants case.
+// scenario in localScopeCases.
 func TestLocalApplies(t *testing.T) {
 	t.Parallel()
 

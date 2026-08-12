@@ -218,10 +218,10 @@ func TestRunReplaysOneMutantByID(t *testing.T) {
 	}
 }
 
-// TestRunWithImpactScope exercises the coverage-directed path end to end: the
-// per-test coverage map is built, mutants on covered lines are judged by the
-// tests that cover them, and mutants on uncovered lines are reported as
-// survivors without a test run at all.
+// TestRunWithImpactScope exercises the coverage-directed path end to end:
+// mutants on covered lines are judged by the tests that cover them, and
+// mutants on uncovered lines are reported as survivors without a test run
+// at all.
 func TestRunWithImpactScope(t *testing.T) {
 	t.Parallel()
 
@@ -304,9 +304,8 @@ func describeLine(t *testing.T, path string) int {
 
 // TestRunConstSwapOperator is the engine-level check for gap 1
 // (identifier/constswap): selecting the operator against a real module
-// produces the expected swap, on the expected line, and the swap is
-// compilable and behaviourally different enough that the fixture's own test
-// kills it.
+// produces the expected swap, and the swap is killed by the fixture's own
+// test.
 func TestRunConstSwapOperator(t *testing.T) {
 	t.Parallel()
 
@@ -747,6 +746,122 @@ func TestEstimateMatchesRun(t *testing.T) {
 
 	if estimate.ParallelEstimate <= 0 || estimate.ParallelEstimate > estimate.SerialEstimate {
 		t.Errorf("Estimate().ParallelEstimate = %v, want in (0, %v]", estimate.ParallelEstimate, estimate.SerialEstimate)
+	}
+}
+
+// chainFixtureModule writes a minimal, single-package module containing one
+// function whose body is a left-associative five-operand XOR chain,
+// `a ^ b ^ c ^ d ^ e`. Go has no right-associative binary operators, so this
+// parses as `((((a^b)^c)^d)^e)` — four nested *ast.BinaryExpr nodes sharing
+// one left spine, the exact shape ROADMAP.md gap 13 is about, and the same
+// shape as corpus/stdlib-crypto-aes's real aes_generic.go decryption round
+// where the mutantID collision was first found empirically.
+//
+// It is its own tiny module rather than an addition to fixtureModule above:
+// fixtureModule's mathx/app packages exist to cover the general
+// two-package/dependency shape most tests need, and adding a chain-shaped
+// function to it would tie every one of those tests' `go test` runs to this
+// fixture's specific AST shape for no shared benefit.
+func chainFixtureModule(t *testing.T) string {
+	t.Helper()
+
+	root := t.TempDir()
+
+	files := map[string]string{
+		"go.mod": "module example.com/chainfixture\n\ngo 1.23\n",
+
+		"chain/chain.go": `package chain
+
+// XorAll XORs five inputs left-associatively, mirroring the shape of a real
+// XOR chain in corpus/stdlib-crypto-aes's aes_generic.go.
+func XorAll(a, b, c, d, e byte) byte {
+	return a ^ b ^ c ^ d ^ e
+}
+`,
+
+		"chain/chain_test.go": `package chain
+
+import "testing"
+
+func TestXorAll(t *testing.T) {
+	if got, want := XorAll(1, 2, 4, 8, 16), byte(1^2^4^8^16); got != want {
+		t.Fatalf("XorAll() = %d, want %d", got, want)
+	}
+}
+`,
+	}
+
+	for rel, content := range files {
+		path := filepath.Join(root, filepath.FromSlash(rel))
+
+		if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+			t.Fatalf("MkdirAll(%s) error = %v", filepath.Dir(path), err)
+		}
+
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatalf("WriteFile(%s) error = %v", path, err)
+		}
+	}
+
+	return root
+}
+
+// TestRunBinaryChainMutantsHaveDistinctIDs is ROADMAP.md gap 13's regression
+// test.
+//
+// Before the fix: go/ast's BinaryExpr.Pos() delegates to its left operand's
+// Pos() recursively, so every nested BinaryExpr on a left-associative
+// chain's left spine reports the exact same (line, column) as the
+// leftmost operand. operator/binary's four distinct mutations on XorAll's
+// four-operator XOR chain — one swap per `^`, at four different nesting
+// depths — therefore all hashed to the identical mutantID, a real collision
+// found empirically against corpus/stdlib-crypto-aes's aes_generic.go (see
+// PROGRESS.md), where several genuinely different mutants collapsed onto
+// one ID and made -mutatemutant=<id> ambiguous for all of them.
+//
+// This exercises the real end-to-end path (mutate.Run, a real `go test`
+// per surviving mutant) rather than calling mutantID directly with
+// hand-picked arguments, deliberately: the bug was never in mutantID's own
+// hashing, it was in every caller passing it the identical tuple for
+// distinct AST nodes. A unit test of mutantID alone, however thorough,
+// cannot exercise that — it would need to already know the colliding
+// tuple, which is exactly the thing this bug hid. See
+// TestMutantIDRankZeroMatchesPreGap13Hash (engine_internal_test.go) for the
+// complementary unit-level guarantee that the fix left non-colliding IDs
+// byte-for-byte unchanged.
+func TestRunBinaryChainMutantsHaveDistinctIDs(t *testing.T) {
+	t.Parallel()
+
+	root := chainFixtureModule(t)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Minute)
+	defer cancel()
+
+	result, err := mutate.Run(ctx, mutate.Options{
+		Packages:  []string{"./..."},
+		Dir:       root,
+		Operators: []string{"operator/binary"},
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	// binarySwaps offers exactly one swap for ^ (see
+	// internal/mutator/operator/tokens.go), and swapping the operator's
+	// token always changes the printed source, so all four nodes in the
+	// chain produce a real mutant — never fewer, which would make the
+	// uniqueness assertion below vacuously easy to pass by accident.
+	if len(result.Mutants) != 4 {
+		t.Fatalf("Run() produced %d operator/binary mutants on a 5-operand XOR chain, want exactly 4: %+v", len(result.Mutants), result.Mutants)
+	}
+
+	seen := make(map[string]mutate.MutantResult, len(result.Mutants))
+	for _, m := range result.Mutants {
+		if prior, collided := seen[m.ID]; collided {
+			t.Errorf("mutantID collision (ROADMAP.md gap 13): ID %q shared by mutants %q and %q", m.ID, prior.Description, m.Description)
+		}
+
+		seen[m.ID] = m
 	}
 }
 

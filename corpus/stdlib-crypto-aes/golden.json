@@ -1,0 +1,13 @@
+{
+  "description": "crypto/aes (Go stdlib, frozen copy): the FIPS-140 module reorganization moved the real implementation to internal/fips140/aes, dwarfing the rest of the module (6426 of 7746 mutants live there alone -- see PROPOSAL.md's Evidence section for the layer-story writeup this fixture backs). Captured directly against the built binary, package scope, default operator set, -mutatetimeout=30s. This module was checked via commit archaeology (PROGRESS.md's corpus-provenance thread) as far as a spot-check went before being deprioritized; not confirmed as an exact upstream commit pin the way stdlib-strconv-parseuint is. killed/survived were corrected from an original 5211/2305 to 5210/2306 after two independent TestCorpus re-verifications reproducibly disagreed with the original capture on exactly one mutant (internal/fips140/aes/aes_generic.go:112, operator/binary ^->&) -- investigated and root-caused (see PROGRESS.md): the original capture's single run hit the fixed 30s -mutatetimeout on that mutant under -mutateparallel=10 CPU contention, and classify() correctly counted the timeout as Killed; every other observed run (including this correction) finds that mutant's go test completes in well under a second and Survives cleanly. Not a turango bug -- a one-off scheduling blip against a fixed per-mutant timeout during the original capture.",
+  "modulePath": "corpus/stdlib-crypto-aes/module",
+  "scope": "package",
+  "operators": null,
+  "timeout": "30s",
+  "expect": {
+    "mutants": 7746,
+    "killed": 5210,
+    "survived": 2306,
+    "notViable": 230
+  }
+}

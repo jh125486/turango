@@ -375,10 +375,8 @@ func (r *runner) cacheLookup(m mutant, result MutantResult) (out MutantResult, o
 }
 
 // cacheWrite appends rec through r.store when caching is active, a no-op
-// otherwise — the single guard every one of run's write call sites shares,
-// factored out purely to keep run's own branching manageable (ROADMAP.md
-// gap 12e's two write call sites plus the equivalent-branch one), not a
-// behavioural change from writing r.store.record(rec) inline at each site.
+// otherwise — the single guard every one of run's write call sites shares
+// (ROADMAP.md gap 12e's two write call sites plus the equivalent-branch one).
 func (r *runner) cacheWrite(rec cacheRecord) {
 	if r.store != nil {
 		r.store.record(rec)

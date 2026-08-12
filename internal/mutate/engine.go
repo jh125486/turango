@@ -1646,6 +1646,12 @@ func mutateFile(ctx context.Context, run *runner, job *fileJob, sink *collector,
 		relPath = path
 	}
 
+	// dedup is this file's own [idDeduper] (ROADMAP.md gap 13): fresh per
+	// mutateFile call, so it needs no synchronisation even though execute
+	// runs one mutateFile goroutine per file concurrently — each walk only
+	// ever needs to disambiguate collisions against itself.
+	dedup := make(idDeduper)
+
 	var walkErr error
 
 	ast.Inspect(file, func(node ast.Node) bool {
@@ -1659,7 +1665,7 @@ func mutateFile(ctx context.Context, run *runner, job *fileJob, sink *collector,
 			return false
 		}
 
-		visit, err := visitNode(ctx, run, job, relPath, suppressed, sink, tally, &spec, node)
+		visit, err := visitNode(ctx, run, job, relPath, suppressed, sink, tally, &spec, dedup, node)
 		if err != nil {
 			walkErr = err
 
@@ -1672,6 +1678,45 @@ func mutateFile(ctx context.Context, run *runner, job *fileJob, sink *collector,
 	return walkErr
 }
 
+// idDeduper is mutateFile's own per-walk collision guard for ROADMAP.md gap
+// 13: a left-associative binary chain like `a ^ b ^ c ^ d ^ e` parses as
+// `((((a^b)^c)^d)^e)`, and go/ast's BinaryExpr.Pos() delegates to X.Pos()
+// recursively — so every nested BinaryExpr on the chain's left spine reports
+// the exact same (line, column) as the leftmost operand `a`. Real code hits
+// this on chains as short as three operands (`a + b + c` already nests one
+// BinaryExpr inside another at the same position), and a real 5-operand XOR
+// chain in corpus/stdlib-crypto-aes's aes_generic.go is what surfaced it —
+// operator/binary's distinct mutations at each nesting depth otherwise
+// collide on mutantID's (relPath, line, col, operator, index) tuple, since
+// that tuple has no field that varies with nesting depth.
+//
+// idDeduper counts how many times each pre-collision tuple has already been
+// seen during this file's walk, keyed on everything but relPath (a single
+// idDeduper is already scoped to one file). rank's first call for a given
+// key returns 0 — by construction the *only* call for the overwhelming
+// majority of binary expressions, which never nest at all — and mutantID
+// hashes rank 0 exactly as it always has (see mutantID's own rank==0 fast
+// path), so a lone `a < b` keeps the identical ID it always got. Only a
+// genuine collision, discovered by the walk actually visiting a second node
+// with the same tuple, produces rank > 0 and a disambiguated ID.
+//
+// ast.Inspect's traversal order is a pure function of the AST — parent
+// before child, no map iteration anywhere in it — so which node "wins" rank
+// 0 on a chain is deterministic and reproduces identically across re-runs of
+// unchanged source, preserving mutantID's existing stability guarantee.
+type idDeduper map[string]int
+
+// rank reports how many times this exact (line, col, operator, index) tuple
+// has already been seen in this walk, then records the current sighting for
+// next time.
+func (d idDeduper) rank(line, col int, operator string, index int) int {
+	key := fmt.Sprintf("%d\x00%d\x00%s\x00%d", line, col, operator, index)
+	r := d[key]
+	d[key]++
+
+	return r
+}
+
 // mutantID computes a mutation's stable, content-hashed identifier: the tuple
 // of the mutated file's path relative to its module root, the mutated node's
 // line and column, the operator's registry name, and the mutation's index
@@ -1680,14 +1725,26 @@ func mutateFile(ctx context.Context, run *runner, job *fileJob, sink *collector,
 // operand — and those need distinct IDs despite sharing every other
 // coordinate).
 //
+// rank disambiguates the collision [idDeduper] exists for: 0 (the case for
+// every mutation that isn't nested inside a same-position sibling, i.e.
+// nearly everything) hashes the same four-field tuple this function has
+// always hashed, so existing IDs for non-chain mutations are unchanged by
+// its addition. rank > 0 appends it as a fifth hashed field, giving a
+// distinct ID to each additional colliding sibling a binary chain produces.
+//
 // Stable across re-runs of unchanged source, matching -fuzz's corpus-hash
 // precedent — but not across edits to the file above the mutated line, since
 // what's hashed is a position in a specific AST, not self-contained bytes the
 // way -fuzz's input hashing is. Truncated to 12 hex characters, the length of
 // a git short SHA: enough to be practically collision-free within one run,
 // short enough to read in a report or paste into a comment.
-func mutantID(relPath string, line, col int, operator string, index int) string {
-	sum := sha256.Sum256(fmt.Appendf(nil, "%s\x00%d\x00%d\x00%s\x00%d", relPath, line, col, operator, index))
+func mutantID(relPath string, line, col int, operator string, index, rank int) string {
+	buf := fmt.Appendf(nil, "%s\x00%d\x00%d\x00%s\x00%d", relPath, line, col, operator, index)
+	if rank > 0 {
+		buf = fmt.Appendf(buf, "\x00%d", rank)
+	}
+
+	sum := sha256.Sum256(buf)
 
 	return hex.EncodeToString(sum[:])[:12]
 }
@@ -1701,7 +1758,8 @@ func mutantID(relPath string, line, col int, operator string, index int) string 
 // (fset, file, path, baseline, moduleDir, pkgDir, scope) are already set; this
 // function only fills in the per-node/per-mutation fields before handing a
 // copy to run.run. relPath is path relative to its module root, computed once
-// per file by the caller — see [mutantID].
+// per file by the caller — see [mutantID]. dedup is that same caller's
+// [idDeduper], threaded through unchanged — see its own doc comment.
 //
 // Exactly one of sink/tally is non-nil (see [execute]'s doc comment). sink
 // is nil-checked before every use, since a suppression can be found — and
@@ -1709,7 +1767,7 @@ func mutantID(relPath string, line, col int, operator string, index int) string 
 // non-nil is what actually makes this an [Estimate] walk rather than a real
 // one: the branch just above run.run below tallies the mutation and moves
 // on, never touching run (which the estimate path never even constructs).
-func visitNode(ctx context.Context, run *runner, job *fileJob, relPath string, suppressed suppressions, sink *collector, tally *estimateTally, spec *mutant, node ast.Node) (bool, error) {
+func visitNode(ctx context.Context, run *runner, job *fileJob, relPath string, suppressed suppressions, sink *collector, tally *estimateTally, spec *mutant, dedup idDeduper, node ast.Node) (bool, error) {
 	// Returning false here skips this function's body entirely, the same
 	// cascade mechanism suppression uses below — a function whose name does
 	// not match FuncPattern (and everything nested inside it) is simply
@@ -1747,7 +1805,7 @@ func visitNode(ctx context.Context, run *runner, job *fileJob, relPath string, s
 			continue
 		}
 
-		if err := visitMutations(ctx, run, job, relPath, sink, tally, spec, m, node); err != nil {
+		if err := visitMutations(ctx, run, job, relPath, sink, tally, spec, dedup, m, node); err != nil {
 			return false, err
 		}
 	}
@@ -1760,8 +1818,11 @@ func visitNode(ctx context.Context, run *runner, job *fileJob, relPath string, s
 // run.run (a real run) — recording the per-node bookkeeping (operator,
 // line, covering) every one of m's mutations shares. Split out of
 // [visitNode] purely to keep that function's own branching manageable; the
-// split changes nothing about behaviour, only where it's written.
-func visitMutations(ctx context.Context, run *runner, job *fileJob, relPath string, sink *collector, tally *estimateTally, spec *mutant, m mutator.Mutator, node ast.Node) error {
+// split changes nothing about behaviour, only where it's written. dedup is
+// [visitNode]'s own [idDeduper], threaded through to disambiguate a mutantID
+// collision on a left-associative binary chain (ROADMAP.md gap 13) — see
+// idDeduper's doc comment.
+func visitMutations(ctx context.Context, run *runner, job *fileJob, relPath string, sink *collector, tally *estimateTally, spec *mutant, dedup idDeduper, m mutator.Mutator, node ast.Node) error {
 	pos := spec.fset.Position(node.Pos())
 
 	spec.operator = m.Name()
@@ -1780,7 +1841,7 @@ func visitMutations(ctx context.Context, run *runner, job *fileJob, relPath stri
 		}
 
 		spec.mutation = mutation
-		spec.id = mutantID(relPath, pos.Line, pos.Column, spec.operator, i)
+		spec.id = mutantID(relPath, pos.Line, pos.Column, spec.operator, i, dedup.rank(pos.Line, pos.Column, spec.operator, i))
 
 		// job.mutantID replays exactly one mutant (see [Options.MutantID]):
 		// the walk still reaches every node and computes every ID — that

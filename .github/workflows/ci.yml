@@ -12,6 +12,12 @@ jobs:
     steps:
       - name: Check out code
         uses: actions/checkout@v4
+        with:
+          # Full history, not just the checked-out commit: SonarCloud's
+          # scan step below uses it for blame/new-code-period analysis
+          # (e.g. "new code since" comparisons), which a shallow clone
+          # can't answer.
+          fetch-depth: 0
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -40,10 +46,33 @@ jobs:
         run: go tool -modfile=tools/golangci-lint/go.mod golangci-lint run ./...
 
       - name: Test
-        run: go test ./...
+        # -short skips internal/corpus's own TestCorpus (its only consumer
+        # of testing.Short() in this whole repo — see corpus.yml for why
+        # that lives in its own, differently-triggered workflow instead of
+        # every one of these per-PR steps). Nothing else in this codebase
+        # checks testing.Short(), so -short here narrows exactly one test,
+        # not a broader "skip anything slow" switch. -coverprofile feeds
+        # both the Codecov upload and SonarCloud's Go coverage import
+        # below; it's added to this step rather than a separate run so
+        # coverage doesn't cost a second full test pass.
+        run: go test -short -coverprofile=coverage.out ./...
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: ./coverage.out
+          # Codecov's own current policy is that public open-source repos on
+          # codecov.io don't need a token; this is passed anyway (empty
+          # until the secret is created) so a private-repo period, or a
+          # policy change, doesn't silently stop uploads. fail_ci_if_error
+          # keeps a missing/invalid token from failing the whole CI run —
+          # CODECOV_TOKEN is an account-linking step done at codecov.io, not
+          # something this workflow can set up on its own.
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
 
       - name: Test (race)
-        run: go test -race ./...
+        run: go test -short -race ./...
 
       - name: Test (integration)
         # Integration tests — the ones that shell out to the real Go
@@ -53,32 +82,22 @@ jobs:
         # above never even compile them in. This step is what actually runs
         # them in CI; -tags=integration also re-includes every fast test
         # (untagged files always compile), so this is a superset, not a
-        # narrower run.
-        run: go test -tags=integration ./...
+        # narrower run. -short still applies here for the same reason as
+        # above — this step's job is the *other* integration tests, not
+        # internal/corpus's own, much slower, TestCorpus.
+        run: go test -short -tags=integration ./...
         timeout-minutes: 20
 
-      - name: Corpus regression
-        # The corpus package's own TestCorpus skips under -short and none of
-        # the three steps above pass -short, so this step technically re-runs
-        # work those steps already did. It stays as its own step anyway: a
-        # distinct, clearly-named
-        # step keeps the corpus run's pass/fail and wall-clock time
-        # independently visible in the CI UI, separate from the rest of the
-        # suite, and easy to re-run or tune (e.g. -run) without touching the
-        # general test steps.
-        #
-        # -timeout is explicit and generous for a reason verified the hard
-        # way while building this: `go test` applies its own default 10m
-        # process-wide timeout regardless of any context timeout inside the
-        # test, and that default panics the whole binary (no per-entry
-        # attribution, no clean failure) rather than failing one slow
-        # subtest. TestCorpus runs its entries sequentially, not in
-        # parallel, specifically so each entry's time is attributable; a
-        # single entry (crypto/aes, full-module scope) alone can run
-        # hundreds of mutants, each compiling and `go test`-ing its own
-        # module copy, so the corpus as a whole needs real headroom. The
-        # step's own timeout-minutes sits comfortably above -timeout so a
-        # hang shows up as a `go test` timeout with output, not a bare
-        # runner cancellation.
-        run: go test -run TestCorpus -v -timeout=45m ./internal/corpus/...
-        timeout-minutes: 60
+      - name: SonarCloud Scan
+        # Guarded on the secret's presence (not just left to fail) so this
+        # step is a no-op — not a broken CI run — until a SonarCloud account
+        # is linked to this repo and SONAR_TOKEN is created there; see
+        # sonar-project.properties. SonarCloud's Go analyzer reads
+        # coverage.out directly via sonar.go.coverage.reportPaths (see
+        # sonar-project.properties), so this step must run after the Test
+        # step above, not standalone.
+        if: ${{ secrets.SONAR_TOKEN != '' }}
+        uses: SonarSource/sonarcloud-github-action@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}

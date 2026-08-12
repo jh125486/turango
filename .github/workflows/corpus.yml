@@ -1,0 +1,43 @@
+name: Corpus regression
+
+# Deliberately NOT triggered by push/pull_request, unlike ci.yml. The corpus
+# (internal/corpus's TestCorpus, corpus/*/golden*.json) exists to measure
+# the real historical bugs and testing gaps turango is designed to catch,
+# not to gate every PR — running it on every push would make ordinary CI as
+# slow as its single slowest fixture. As of this writing that fixture is
+# stdlib-crypto-aes: 7746 mutants, over an hour by itself even at
+# -mutateparallel=GOMAXPROCS, next to every other entry combined taking a
+# few minutes. schedule + workflow_dispatch keeps this real and automated
+# (so a genuine regression in mutant generation still gets caught, not
+# nothing) without being on the critical path of every contributor's PR.
+on:
+  schedule:
+    # Once a week is enough to catch a regression without burning CI
+    # minutes on a mostly-static frozen corpus daily; -run/workflow_dispatch
+    # below covers "I want this sooner" on demand.
+    - cron: '0 6 * * 1'
+  workflow_dispatch: {}
+
+jobs:
+  corpus:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+
+      - name: Corpus regression
+        # -timeout and timeout-minutes are both real, observed numbers, not
+        # guesses — corpus_test.go's own corpusRunTimeout constant sets the
+        # equivalent per-entry safety net for local/manual runs; keep the
+        # two in sync if either changes. TestCorpus runs its entries
+        # sequentially, not in parallel, specifically so each entry's own
+        # time stays attributable in the output (see corpus_test.go's own
+        # doc comment) — the total budget here is the sum of every entry's
+        # worst observed time plus real headroom, not a single entry's.
+        run: go test -run TestCorpus -v -timeout=3h ./internal/corpus/...
+        timeout-minutes: 210
