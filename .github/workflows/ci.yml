@@ -44,8 +44,14 @@ jobs:
         run: go vet ./...
 
       - name: Check formatting
+        # corpus/stdlib-*/module/** are frozen copies of real Go stdlib
+        # source, preserved byte-for-byte as historical bug-reproduction
+        # fixtures -- their formatting is upstream's, not this project's to
+        # fix, and gofmt has always flagged a handful of them (verified
+        # locally throughout this repo's development). Excluded the same
+        # way every local gofmt check in this project's history has been.
         run: |
-          fmt_out="$(gofmt -l .)"
+          fmt_out="$(gofmt -l . | grep -v '^corpus/stdlib-.*/module/' || true)"
           if [ -n "$fmt_out" ]; then
             echo "The following files are not gofmt-formatted:"
             echo "$fmt_out"
