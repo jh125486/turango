@@ -25,7 +25,7 @@ func TestNumberMutate(t *testing.T) {
 		// (see number.go's shiftFloat doc for why), so the expected values
 		// below are the literal's own value ± 0.1% of itself, rendered by
 		// go/constant's Value.String (confirmed empirically valid, minimal
-		// Go float syntax during the gap-10 investigation — see ROADMAP.md).
+		// Go float syntax).
 		{name: "plain decimal", src: "0.95", wantUp: "0.95095", wantDwn: "0.94905"},
 		{name: "exponent notation", src: "1.5e10", wantUp: "1.5015e+10", wantDwn: "1.4985e+10"},
 		// Float zero is a special case: a relative shift of 0 is 0, so

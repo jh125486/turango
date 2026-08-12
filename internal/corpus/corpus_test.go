@@ -44,9 +44,9 @@ import (
 // made before any real capture existed. It was wrong by more than an order
 // of magnitude: stdlib-crypto-aes's real, captured golden is 7746 mutants
 // (dominated by internal/fips140/aes alone), and a real run against it, at
-// -mutateparallel=GOMAXPROCS, took just over an hour on real hardware — see
-// PROGRESS.md's corpus-capture notes for the actual numbers this bound is
-// now sized against, not a re-guess. This is also why TestCorpus moved out
+// -mutateparallel=GOMAXPROCS, took just over an hour on real hardware —
+// the actual numbers this bound is now sized against, not a re-guess.
+// This is also why TestCorpus moved out
 // of ci.yml's per-PR steps and into corpus.yml's own schedule/
 // workflow_dispatch-triggered workflow (see that file's own comment): a
 // bound sized for a 1-hour-plus entry has no business gating every PR.

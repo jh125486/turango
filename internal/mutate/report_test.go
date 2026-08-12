@@ -421,8 +421,8 @@ func TestWriteSummaryEmpty(t *testing.T) {
 
 // TestWriteEstimate covers the estimate console printer end to end: the
 // total, the per-package breakdown, both time predictions labeled
-// distinctly (ROADMAP.md gap 11c's "never a single confident number"
-// requirement), and the TCE caveat's conditional presence (gap 11d).
+// distinctly (never as a single confident number), and the TCE caveat's
+// conditional presence.
 func TestWriteEstimate(t *testing.T) {
 	t.Parallel()
 

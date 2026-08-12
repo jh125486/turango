@@ -8,11 +8,10 @@
 // This exists because PROPOSAL.md's "Costs and risks" section asserted the
 // runtime cost qualitatively ("potentially orders of magnitude") without a
 // single measured number behind it, and every timing data point elsewhere in
-// this repo is incidental and non-comparable (PROGRESS.md's "17+ minutes"
-// ScopeFull dogfooding note is explicitly a nested-`go test ./...` artifact,
-// not a representative figure; the stdlib-crypto-aes sweep was never even
-// successfully captured — see PROGRESS.md's corpus-provenance thread). See
-// ROADMAP.md gap 8 for the full design this file implements.
+// this repo is incidental and non-comparable (a "17+ minutes" ScopeFull
+// dogfooding note recorded elsewhere is explicitly a nested-`go test ./...`
+// artifact, not a representative figure; the stdlib-crypto-aes sweep was
+// never even successfully captured).
 //
 // It uses Go's own testing.B/`go test -bench`/benchstat pipeline rather than
 // a bespoke shell script — deliberately, since turango itself *is* a `go
@@ -33,7 +32,7 @@
 // (mutate.Run itself, which shells out per mutant) the real Go toolchain
 // against real package sources — exactly the reason that tag exists.
 //
-// Target selection (ROADMAP.md gap 8c) is explicitly left as an open, human
+// Target selection is explicitly left as an open, human
 // decision there, not resolved by this file: benchTargets below is a
 // deliberately small, easily-extended table populated *for now* with
 // self-contained fixtures already checked into corpus/ purely to prove the
@@ -51,9 +50,8 @@
 // the whole turango module and run its whole `go test ./...` suite,
 // multi-second per mutant even before mutation, and pathologically slow
 // under [mutate.ScopeFull] specifically (see corpus/example/golden.json's
-// own "full scope has a known pathological self-reference issue" note,
-// and PROGRESS.md's paused corpus/aes/base64 thread for what that failure
-// mode looks like in practice). A self-contained fixture module keeps every
+// own "full scope has a known pathological self-reference issue" note).
+// A self-contained fixture module keeps every
 // scope mode — including full — cheap regardless of target size.
 package mutate_test
 
@@ -82,7 +80,7 @@ import (
 // See this file's own doc comment for why every entry today is a
 // self-contained corpus/ fixture module (its own go.mod) rather than
 // turango's own example/ package, and PLACEHOLDER TARGETS below for why
-// none of this is the real small/medium/large spread gap 8c still owes.
+// none of this is the real small/medium/large spread still owed.
 type benchTarget struct {
 	// name is the subtest label. Kept short and free of "/" so it composes
 	// cleanly with the scope/TCE/parallelism segments BenchmarkMutate
@@ -95,8 +93,8 @@ type benchTarget struct {
 	dir string
 }
 
-// benchTargets is PLACEHOLDER TARGETS ONLY (see the file doc comment and
-// ROADMAP.md gap 8c): a small, easily-extended table, not the realistic
+// benchTargets is PLACEHOLDER TARGETS ONLY (see the file doc comment): a
+// small, easily-extended table, not the realistic
 // small/~500-LOC/medium/~5K-LOC/large/~20K+-LOC production-package spread
 // the design calls for. Picking those real targets is an open human
 // decision this file does not resolve.
@@ -140,8 +138,8 @@ var benchScopes = []mutate.Scope{mutate.ScopeFull, mutate.ScopePackage, mutate.S
 // wherever an entry would exceed it (so a smaller CI runner or laptop still
 // gets a meaningful, duplicate-free sweep instead of three identical
 // parallel=NumCPU rows). 1 is always included — the serial baseline every
-// other level is compared against, matching ROADMAP.md gap 8a's "a
-// serial-vs-parallel comparison is worth one extra data point" framing.
+// other level is compared against, since a serial-vs-parallel comparison
+// is worth one extra data point.
 func benchParallelLevels() []int {
 	n := runtime.NumCPU()
 
@@ -168,9 +166,9 @@ func benchParallelLevels() []int {
 	return out
 }
 
-// BenchmarkMutate is the harness ROADMAP.md gap 8 asks for: one subtest per
-// target x scope x TCE x parallelism combination, each running mutate.Run
-// in-process against a real target package, plus one baseline subtest per
+// BenchmarkMutate is the harness for measuring turango's overhead: one
+// subtest per target x scope x TCE x parallelism combination, each
+// running mutate.Run in-process against a real target package, plus one baseline subtest per
 // target timing a single plain `go test` run the same way.
 //
 // -benchtime=1x is required (see the file doc comment): with it, b.N is 1
@@ -208,19 +206,18 @@ func BenchmarkMutate(b *testing.B) {
 }
 
 // benchBaseline times one plain `go test` run against dir — the "one
-// baseline go test run" half of the mutation multiplier (ROADMAP.md gap
-// 8a/8b) — and returns it for benchMutateOnce's later subtests to divide
+// baseline go test run" half of the mutation multiplier — and returns it
+// for benchMutateOnce's later subtests to divide
 // by.
 //
 // This is a sibling subtest that shells out directly, rather than reading
-// the average [Result] already carries: it doesn't, today (see the file's
-// companion ROADMAP.md gap 8 "Build order" step 1 — checked against
-// report.go before writing this file, and the 3-run average
+// the average [Result] already carries: it doesn't, today (checked
+// against report.go before writing this file, and the 3-run average
 // [resolveTimeout]/goTestSuite computes internally is not exposed on
 // [mutate.Result] or [mutate.MutantResult] anywhere). Adding a field for it
 // would mean threading a new return value through resolveTimeout,
 // baselineTimeout and Run for a number only this benchmark consumes;
-// ROADMAP.md gap 8b explicitly allows either approach, and this is the
+// either approach is reasonable, and this is the
 // smaller, lower-risk one for a first pass that leaves report.go's public
 // API untouched. The command mirrors goTestSuite's own args (`-count=1
 // -vet=off`) for an apples-to-apples comparison against what the engine
@@ -292,9 +289,9 @@ func benchMutateOnce(b *testing.B, targetName, dir string, scope mutate.Scope, t
 		b.ReportMetric(float64(testLOC), "test-loc")
 		b.ReportMetric(float64(len(result.Mutants)), "mutants")
 
-		// The mutation multiplier itself — the number ROADMAP.md gap 8's
-		// Problem section says is missing from PROPOSAL.md entirely: how
-		// many multiples of one `go test` run this combination cost.
+		// The mutation multiplier itself — the number missing from
+		// PROPOSAL.md entirely: how many multiples of one `go test` run
+		// this combination cost.
 		// Guarded against a zero baseline only for safety (benchBaseline
 		// always runs first and Fatalfs on a failing baseline, so baseline
 		// is never legitimately zero by the time this line runs); reporting
@@ -308,15 +305,14 @@ func benchMutateOnce(b *testing.B, targetName, dir string, scope mutate.Scope, t
 
 // sourceLines counts real lines of Go source under dir, split into
 // production (non-_test.go) and test (_test.go) files — the KLOC/test-KLOC
-// halves of ROADMAP.md gap 8a's per-target metadata.
+// halves of this benchmark's per-target metadata.
 //
 // This is a plain newline count, not a gocloc-style code/comment/blank
 // breakdown: gap 8a's actual requirement is "a go build/go vet-clean count,
 // not a hand estimate" — i.e. a number computed from the real files a run
 // actually mutates, not typed into this file by hand — which a line count
 // already satisfies without adding a gocloc-equivalent dependency this
-// project's stdlib-plus-x/-only policy (see PROGRESS.md's dependency
-// cleanup note) would need to justify.
+// project's stdlib-plus-x/-only policy would need to justify.
 func sourceLines(dir string) (prodLOC, testLOC int, err error) {
 	walkErr := filepath.WalkDir(dir, func(path string, entry fs.DirEntry, err error) error {
 		if err != nil {

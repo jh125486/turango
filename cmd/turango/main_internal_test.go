@@ -107,10 +107,10 @@ func TestParseMutateFlagsValues(t *testing.T) {
 	t.Run("every flag set", func(t *testing.T) {
 		t.Parallel()
 
-		// -mutatecache is combined here with -mutatemutant deliberately: per
-		// ROADMAP.md gap 12f/12h, that combination is accepted, not
-		// rejected (a replay still benefits from, and contributes to, the
-		// cache) — ok, err == nil below already proves acceptance; this is
+		// -mutatecache is combined here with -mutatemutant deliberately:
+		// that combination is accepted, not rejected (a replay still
+		// benefits from, and contributes to, the cache) — ok, err == nil
+		// below already proves acceptance; this is
 		// the negative-of-a-negative case TestParseMutateFlagsErrors' own
 		// "accepted" note calls for, guarding against someone "fixing" this
 		// by copying the -mutateestimate rejection too broadly.

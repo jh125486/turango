@@ -2,9 +2,9 @@
 
 This document holds a captured transcript of `BenchmarkMutate`
 (`internal/mutate/mutate_bench_test.go`) — Go's own `testing.B`/`go test
--bench` pipeline, run in-process against real target packages, exactly the
-way ROADMAP.md gap 8 specifies — plus a methodology section (machine spec,
-Go version, `-mutateparallel` levels swept, date, exact command).
+-bench` pipeline, run in-process against real target packages — plus a
+methodology section (machine spec, Go version, `-mutateparallel` levels
+swept, date, exact command).
 
 **Status: the real `-count=1` run is complete.** Both targets
 (`corpus/op-control-if/module`, `corpus/stdlib-strconv-parseuint/module`)
@@ -22,8 +22,8 @@ root cause, not hand-waved.
 fixture, and `corpus/stdlib-strconv-parseuint/module`, one real stdlib
 function) is a proof-that-the-harness-works set, not the realistic small
 (~500 LOC) / medium (~5K LOC) / large (~20K+ LOC) production-package
-spread ROADMAP.md gap 8c calls for. Selecting those three real targets is
-a separate, still-open, human decision — this run validates the
+spread a definitive benchmark would need. Selecting those three real
+targets is a separate, still-open, human decision — this run validates the
 measurement pipeline itself (timing, metrics, scope/TCE/parallel sweep),
 not a final performance claim about turango against representative
 codebases.
@@ -87,11 +87,11 @@ result inconsistent with more workers helping, most plausibly explained
 by contention from a concurrently-running `TestCorpus/stdlib-crypto-aes`
 pass rather than a real turango regression at parallel=8. Anything
 captured after ~00:21 in the transcript overlapped with that aes
-verification. This is flagged, not silently absorbed into the numbers,
-because this project's own standing lesson (see PROGRESS.md) is to
-attribute slowdowns to a verified cause, not a guessed one — and here the
-cause (a second heavy `go test` process, confirmed via `ps`/`uptime`
-during the run) is verified, not guessed.
+verification. This is flagged, not silently absorbed into the numbers —
+attributing a slowdown to a verified cause, not a guessed one, matters
+more than a clean-looking table; the cause here (a second heavy `go test`
+process, confirmed via `ps`/`uptime` during the run) is verified, not
+guessed.
 
 ## Full transcript
 
@@ -211,8 +211,9 @@ For N mutants at this fixture's 2.2% equivalent rate:
 **TCE was ~66% *slower* overall for this fixture** — the per-mutant tax on
 100% of mutants outweighs the savings on the 2.2% it actually filters, by
 a wide margin. This is the concrete cost-side justification (independent
-of ROADMAP.md gap 2's own correctness-risk reasoning) for why turango
-ships `-mutatetce` opt-in, not opt-out.
+of TCE's own correctness-risk reasoning — a false positive would silently
+discard a real mutant, which is why it's opt-in regardless of cost) for
+why turango ships `-mutatetce` opt-in, not opt-out.
 
 **The general lesson is broader than TCE specifically**: turango's knobs
 (`-mutatescope`, `-mutateparallel`, `-mutatetce`, and any future ones) are
@@ -231,9 +232,9 @@ go test -tags=integration -bench=BenchmarkMutate -benchtime=1x -count=1 ./intern
 ```
 
 Start with `-count=1` to sanity-check output shape before committing to a
-`-count=6`+ `benchstat`-ready run (per ROADMAP.md gap 8b's
-external-repeat convention). `golang.org/x/perf/cmd/benchstat` is the
-recommended tool for a rigorous statistical comparison once `-count=6`+
-samples exist; it is deliberately not wired in as a module dependency for
-this pass (see ROADMAP.md gap 8's own instruction not to add it unless code
-here actually imports its API).
+`-count=6`+ `benchstat`-ready run — `go test -bench`'s own convention for
+a statistically meaningful comparison is external repeats via `-count`,
+not anything built into the benchmark itself. `golang.org/x/perf/cmd/benchstat`
+is the recommended tool for a rigorous statistical comparison once
+`-count=6`+ samples exist; it is deliberately not wired in as a module
+dependency for this pass, since nothing here actually imports its API yet.

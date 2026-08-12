@@ -184,8 +184,7 @@ func TestMutateFileStopsWhenCancelled(t *testing.T) {
 // always hash to the same ID (needed for cross-run stability), and changing
 // any single coordinate of the tuple changes the ID (needed so two distinct
 // mutations, e.g. expression/remove's two operand removals on one node, or
-// ROADMAP.md gap 13's colliding binary-chain siblings via rank, never
-// collide).
+// colliding binary-chain siblings disambiguated via rank, never collide).
 func TestMutantID(t *testing.T) {
 	t.Parallel()
 
@@ -219,12 +218,12 @@ func TestMutantID(t *testing.T) {
 	}
 }
 
-// TestMutantIDRankZeroMatchesPreGap13Hash locks in ROADMAP.md gap 13's
-// backward-compatibility promise: rank 0 — every mutation that never
-// collided with a same-position sibling, i.e. the overwhelming majority of
-// real code, including every *ast.BinaryExpr that is not itself nested
-// inside another one starting at the same position — must hash to exactly
-// the same bytes mutantID produced before rank existed. This is asserted
+// TestMutantIDRankZeroMatchesPreGap13Hash locks in the binary-chain
+// collision fix's backward-compatibility promise: rank 0 — every mutation
+// that never collided with a same-position sibling, i.e. the overwhelming
+// majority of real code, including every *ast.BinaryExpr that is not itself
+// nested inside another one starting at the same position — must hash to
+// exactly the same bytes mutantID produced before rank existed. This is asserted
 // against a hardcoded pre-gap-13 SHA-256 (truncated to 12 hex characters,
 // same as mutantID's own output), not merely against mutantID's current
 // rank==0 branch, so a refactor that accidentally starts hashing rank
@@ -481,8 +480,8 @@ func TestResolveTimeout(t *testing.T) {
 }
 
 // TestWalkForEstimateSpawnsNoSubprocess is the concrete, checkable form of
-// ROADMAP.md gap 11a's claim that Estimate's counting phase costs "an AST
-// walk with no go test subprocess anywhere": it asserts execCalls (see
+// the claim that Estimate's counting phase costs "an AST walk with no go
+// test subprocess anywhere": it asserts execCalls (see
 // runner.go) never increments while walkForEstimate runs, the same
 // call-counter technique TestRunWithoutConstSwapNeverLoadsTypes
 // (engine_integration_internal_test.go) uses to prove loadTyped is skipped

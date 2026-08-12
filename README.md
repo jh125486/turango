@@ -129,13 +129,28 @@ listing) and compares it — with source line-number annotations stripped —
 against a once-per-package baseline built from the unmutated source. A match
 means the mutant never reaches `go test` at all; it's reported under the
 JSON report's `Equivalents` array (and a summary `equivalent: N` line) rather
-than as a `MutantResult`.
+than as a `MutantResult`. Comparing normalized `-S` disassembly rather than
+raw compiled archive bytes was a deliberate choice, not the first thing
+tried — a spike comparing raw archives directly found it unreliable,
+tripping on build-metadata differences (embedded paths, timestamps) that
+have nothing to do with whether the mutant actually changed behavior.
 
 Off by default. Unlike `-mutatescope`, where a conservative choice only
 under-reports kills, a false positive here would silently discard a real
-mutant — so this stays opt-in until it has more real-world runs behind it
-(see `ROADMAP.md` gap 2 for the validated design and the spike that ruled
-out the simpler raw-archive-comparison approach).
+mutant — so this stays opt-in until it has more real-world runs behind it.
+It's also not a free optimization even when correct: the compile-and-compare
+check runs for *every* mutant, not just the ones that turn out equivalent
+(there's no way to know in advance which ones will), so its cost is a
+per-mutant tax on 100% of mutants in exchange for skipping `go test` on
+whatever fraction actually is equivalent. Measured directly against a real
+stdlib fixture, that fraction needed to be higher than it was to pay for
+itself — TCE was ~66% *slower* overall for that run, because the tax on
+every mutant outweighed the savings on the ~2% it filtered. The general
+lesson generalizes past TCE specifically: turango's knobs
+(`-mutatescope`, `-mutateparallel`, `-mutatetce`) are levers whose correct
+setting depends on the target codebase's own shape, not a single
+universally-right configuration — measure before enabling one against a
+different codebase.
 
 ### Before/after source in the JSON report
 
@@ -157,6 +172,16 @@ operator's offered mutations, truncated to 12 hex characters (the length of a
 git short SHA). It's stable across re-runs of unchanged source — the whole
 point — but *not* across edits to the file above the mutated line, since
 what's hashed is a position in a specific AST, not self-contained bytes.
+
+That position alone isn't always enough to be unique, either: on a
+left-associative binary-expression chain (`a ^ b ^ c ^ d ^ e`), Go's
+`ast.BinaryExpr.Pos()` returns the same leftmost-operand position for every
+nested sub-expression in the chain, so several distinct `operator/binary`
+mutations at different nesting depths could otherwise hash to the same ID.
+A per-file collision counter (rank, based on how many times a given
+position/operator/index tuple has already been seen during the walk) is
+folded into the hash only when it's actually needed, so this doesn't change
+any ID in the overwhelmingly common, non-colliding case.
 
 A CI failure or a `//nomutant`-adjacent comment can point at one exactly:
 
@@ -188,6 +213,39 @@ target with any uncommitted change anywhere in the repository (not just
 under the mutated package) — or against a target that isn't a git
 repository at all — falls back to `copy` on its own, silently and safely,
 so it's never wrong to ask for it; it just doesn't always help.
+
+### Scope trade-offs: `-mutatescope`
+
+`full` (the default) reruns `go test ./...` for the whole module against
+every mutant — the only scope that can't miss a kill, since a package's
+behavior is frequently only asserted on by its *callers'* tests, which live
+in other packages entirely. `package` and `impact` are real speed/coverage
+trade-offs against that: `package` reruns only the mutated file's own
+package, missing a kill from a neighboring package's integration-style test;
+`impact` goes further, building a per-test coverage map once and rerunning
+only the tests that actually cover the mutated line, so a mutant on an
+uncovered line is reported as a survivor without a test run at all. Neither
+narrower scope is a strictly-safe default — that's why `full` stays the
+default rather than the fastest option winning by default, the same
+reasoning `go test` itself applies by never skipping a package's tests
+based on a coverage guess.
+
+Each mutant still needs its own throwaway copy of the target module to run
+against, and how much gets copied is scope-dependent for a hard reason, not
+just a performance tuning knob: under `package`/`impact` scope, turango
+resolves the mutated package's actual forward import closure (via
+`golang.org/x/tools/go/packages`) and copies only that — the target
+package's own directory, every same-module package it imports
+transitively, `go.mod`/`go.sum`, `vendor/` if present, and any
+`//go:embed`-referenced paths. Under `full` scope this optimization is
+provably wrong to apply: `full`'s entire reason to exist depends on the
+*reverse* closure (every package that could call into the target), which a
+forward-closure copy says nothing about — a workspace built that way, run
+under `go test ./...`, would silently only contain (and therefore only run)
+the target package's own tests, indistinguishable in outcome from
+`package` scope but still labeled `full`. So `full` always falls back to a
+full recursive module copy, unconditionally, no closure computation
+attempted — a correctness boundary, not a missed optimization.
 
 ### Suppressing a mutant: `//nomutant`
 
@@ -223,18 +281,35 @@ Fourteen operators, across six packages:
   package-level constant declared in the same file — the pair that reproduces
   the historical strconv `ParseUint` overflow bug (`#21278`), which was a
   local-var-to-constant substitution. Both are built on `go/types` rather
-  than `go/ast` alone, the only operators in this codebase that are.
+  than `go/ast` alone, the only operators in this codebase that are — every
+  other operator only ever looks at a node's own syntax, deliberately, so a
+  run that doesn't select an identifier operator never pays for type
+  checking a module that may not even type-check cleanly.
+
+  Both operators are scoped hard on purpose, not just tuned: an unrestricted
+  version — matching every identifier reference against every same-type
+  identifier visible at that point per Go's scoping rules — would offer one
+  mutation per same-type sibling in scope for nearly every identifier use in
+  a typical file, dwarfing what every other operator combined produces on
+  the same code. `identifier/localconstswap`'s first version, restricted
+  only to type and comparison-operand matching, hit exactly this in
+  practice — a real 24x mutant-count blowup against actual code — and was
+  fixed by further restricting candidates to constants declared in the
+  *same file* as the local variable's use, verified stable afterward
+  against a real fixture.
 
 ## Architecture
 
 Mutant generation and collection, end to end. Results are collected into one
 `*Result` by a single consumer goroutine draining three channels (mutants,
-suppressions, TCE-filtered equivalents) — not a mutex — so the pipeline
-stays `testing/synctest`-visible for future scheduling tests (see
-`ROADMAP.md` gap 7); the worker pool itself is file-level (`errgroup`,
-bounded by `-mutateparallel`), and each file's walk is strictly sequential
-internally since a file's mutants share one AST that is mutated in place
-and reverted between mutants.
+suppressions, TCE-filtered equivalents), not a mutex — `testing/synctest`'s
+"durably blocked" detection covers channel send/recv but not
+`sync.Mutex.Lock`, so a channel-based collector stays testable against
+future scheduling changes in a way a mutex-guarded one wouldn't, even
+though nothing in it is timing-dependent today; the worker pool itself is
+file-level (`errgroup`, bounded by `-mutateparallel`), and each file's walk
+is strictly sequential internally since a file's mutants share one AST that
+is mutated in place and reverted between mutants.
 
 ```mermaid
 flowchart TD
@@ -296,8 +371,10 @@ instead.
 - [`PROPOSAL.md`](PROPOSAL.md) — the case for adding `-mutate` to `go test`
   itself, modeled on the real `-fuzz` design draft, with crypto-package
   evidence and a historical-bug validation case study.
-- [`PROGRESS.md`](PROGRESS.md) — build and development history for this
-  project.
+- [`BENCHMARKS.md`](BENCHMARKS.md) — a real, captured `go test -bench`
+  transcript of `-mutatescope`/`-mutatetce`/`-mutateparallel`'s actual
+  cost, including the full data behind the TCE cost-tradeoff numbers cited
+  above.
 
 ## License
 

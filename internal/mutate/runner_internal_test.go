@@ -296,7 +296,7 @@ func TestMutantTestArgs(t *testing.T) {
 	}
 }
 
-// TestMutantCacheKey pins ROADMAP.md gap 12a's compound key assembly: every
+// TestMutantCacheKey pins the compound cache key's assembly: every
 // field mutant.cacheKey draws from (scope, TCE, fingerprint, mutant ID) plus
 // the caller-supplied toolchain string must actually vary the resulting
 // cacheKey, or two genuinely different mutants/runs could collide on the
@@ -658,8 +658,8 @@ func writeFiles(t *testing.T, files map[string]string) {
 	}
 }
 
-// The tests below cover ROADMAP.md gap 5's not-yet-wired components
-// (closureDirs, hasEmbedDirective, resolveClosure, copyClosure,
+// The tests below cover the dependency-closure workspace copy's
+// components (closureDirs, hasEmbedDirective, resolveClosure, copyClosure,
 // copyDirFiles) in isolation. Nothing in the engine calls these yet — see
 // closureDirs' own doc comment for why activating them is a deliberately
 // separate step — but they're real, reachable code, tested the same as
@@ -1200,7 +1200,7 @@ func TestCopyClosure(t *testing.T) {
 	}
 }
 
-// The tests below cover ROADMAP.md gap 6: gitRepoRoot, gitWorktreeClean,
+// The tests below cover git-worktree execution: gitRepoRoot, gitWorktreeClean,
 // copyWorktree and workspaceFor. Unlike copyModule's tests, these need a
 // real git repository, not just a plain directory — runGit builds one.
 
@@ -1448,9 +1448,9 @@ func TestWorkspaceForUsesWorktreeWhenRequested(t *testing.T) {
 	}
 }
 
-// TestWorkspaceForPrefersClosureOverWorktree covers ROADMAP.md gap 5's
-// activation: a non-nil dirs must win even when r.workspace requests a
-// worktree and the module is a real, clean git repo — a worktree always
+// TestWorkspaceForPrefersClosureOverWorktree covers the dependency-closure
+// workspace copy's activation: a non-nil dirs must win even when
+// r.workspace requests a worktree and the module is a real, clean git repo — a worktree always
 // checks out the whole repository at HEAD, which is never a narrower
 // alternative to a pre-resolved closure copy (see workspaceFor's own doc
 // comment). Proven the same way TestWorkspaceForFallsBackWithoutGit proves

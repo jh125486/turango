@@ -599,8 +599,8 @@ func F() bool {
 			// The local-variable-only restriction: a package-level
 			// variable of a matching type must never be offered a swap,
 			// even though it satisfies the type check — only function-local
-			// variables are in scope for this operator, per ROADMAP.md's v2
-			// sketch ("local variables", not "variables").
+			// variables are in scope for this operator ("local variables",
+			// not "variables").
 			name: "package-level variable excluded",
 			src: `package p
 
@@ -711,7 +711,7 @@ func TestLocalMutate(t *testing.T) {
 }
 
 // TestLocalMutateReproducesStrconvShape is the required acceptance proof for
-// ROADMAP.md gap 1's v2 extension: it type-checks the actual frozen
+// the v2 extension: it type-checks the actual frozen
 // corpus/stdlib-strconv-parseuint/module fixture — the pre-fix copy of Go's
 // real strconv package, golang/go#21278 — and asserts that Mutate(), called
 // on the exact comparison the historical bug lives at (`n1 > maxVal` in

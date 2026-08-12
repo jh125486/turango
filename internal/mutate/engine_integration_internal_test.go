@@ -51,13 +51,13 @@ func TestRunWithoutConstSwapNeverLoadsTypes(t *testing.T) {
 	}
 }
 
-// TestRunCacheResumeIsFree is ROADMAP.md gap 12's load-bearing end-to-end
-// test: two Run calls against the same unmodified fixture module with the
-// same CacheDir. The second must reuse every verdict the first computed —
-// zero additional go test/go build subprocesses — and produce a
-// byte-for-byte identical Result, the concrete proof of "resumes
-// near-instantly" this whole gap exists to deliver, not an assertion in
-// prose.
+// TestRunCacheResumeIsFree is the persistent cache's load-bearing
+// end-to-end test: two Run calls against the same unmodified fixture
+// module with the same CacheDir. The second must reuse every verdict the
+// first computed — zero additional go test/go build subprocesses — and
+// produce a byte-for-byte identical Result, the concrete proof of
+// "resumes near-instantly" the feature exists to deliver, not an
+// assertion in prose.
 //
 // Deliberately not t.Parallel(): execCalls is a process-wide counter shared
 // by every test in this compiled binary, and this is the one test in this
@@ -117,7 +117,7 @@ func TestRunCacheResumeIsFree(t *testing.T) {
 	}
 }
 
-// TestRunCacheScopeInteraction covers ROADMAP.md gap 12a's Scope field:
+// TestRunCacheScopeInteraction covers the cache key's Scope field:
 // the identical mutant, unchanged source, must not be served from a cache
 // entry written under a different Scope — Scope is documented to change a
 // mutant's real verdict (a neighbouring package's test can kill it under
@@ -159,7 +159,7 @@ func TestRunCacheScopeInteraction(t *testing.T) {
 	}
 }
 
-// TestRunCacheTCEInteraction covers ROADMAP.md gap 12a/12e/12f's TCE field:
+// TestRunCacheTCEInteraction covers the cache key's TCE field:
 // a mutation cached as Equivalent under TCE=true must never be
 // short-circuited as equivalent again when a later run has TCE=false —
 // that mutation was never actually run against the suite the first time,
@@ -212,7 +212,7 @@ func TestRunCacheTCEInteraction(t *testing.T) {
 	}
 }
 
-// TestRunCacheMutantReplayInteraction covers ROADMAP.md gap 12f's
+// TestRunCacheMutantReplayInteraction covers the cache's
 // -mutatemutant interaction: a replay must always bypass a cache *read*
 // (it exists specifically to reproduce one mutant against a real go test
 // run, so serving it a cached verdict would defeat its whole purpose), but

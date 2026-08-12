@@ -499,7 +499,7 @@ func TestRunSuppressesCompoundStatement(t *testing.T) {
 // mutant that deletes the fixture's dead store below. Matched by
 // Description, not Line: statement/remover's reported Line is the walk's
 // outer node — the containing block — not the individual statement (a
-// documented gap-3 limitation, see ROADMAP.md), so every removable
+// documented limitation), so every removable
 // statement in Sum's body shares one Line and only Description tells them
 // apart.
 const tceDeadStoreDescription = "remove statement: total = 999"
@@ -507,7 +507,7 @@ const tceDeadStoreDescription = "remove statement: total = 999"
 // tceModule writes a one-package module with a genuine dead store: total's
 // first write is immediately overwritten before ever being read, so the
 // statement/remover mutant deleting it is textbook compiler-equivalent — the
-// same fixture shape ROADMAP.md gap 2's spike validated by hand. Kept
+// same fixture shape validated by hand during TCE's own development. Kept
 // separate from fixtureModule so this test's Operators/TCE options never
 // have to account for any of that fixture's own mutants.
 func tceModule(t *testing.T) string {
@@ -543,8 +543,8 @@ func TestSum(t *testing.T) {
 	return root
 }
 
-// TestRunWithTCEFiltersEquivalentMutant is the dual-mode check ROADMAP.md
-// gap 2's Verification section calls for: with TCE enabled, the dead
+// TestRunWithTCEFiltersEquivalentMutant is the dual-mode check TCE's own
+// design calls for: with TCE enabled, the dead
 // store's removal is filtered into Result.Equivalents and never reaches
 // Result.Mutants at all; with TCE disabled (the default), the identical
 // mutation shows up as an ordinary Survived MutantResult — proving the
@@ -616,8 +616,8 @@ func TestRunWithTCEFiltersEquivalentMutant(t *testing.T) {
 	}
 }
 
-// TestRunWorkspaceWorktreeMatchesCopy is ROADMAP.md gap 6's end-to-end
-// proof: the same fixture, mutated once with the default [mutate.WorkspaceCopy]
+// TestRunWorkspaceWorktreeMatchesCopy is -mutateworkspace=worktree's
+// end-to-end proof: the same fixture, mutated once with the default [mutate.WorkspaceCopy]
 // and once with [mutate.WorkspaceWorktree], must classify every mutant
 // identically. A git worktree is a different mechanism for building the
 // same execution copy, not a different scope or classification rule, so
@@ -664,7 +664,7 @@ func TestRunWorkspaceWorktreeMatchesCopy(t *testing.T) {
 	}
 }
 
-// TestEstimateMatchesRun is ROADMAP.md gap 11's required end-to-end proof:
+// TestEstimateMatchesRun is -mutateestimate's required end-to-end proof:
 // Estimate's walk-only count must exactly match a real Run's
 // len(Result.Mutants) + len(Result.Equivalents) for the same [mutate.Options]
 // — Equivalents count too, since an estimate deliberately ignores TCE (gap
@@ -753,8 +753,8 @@ func TestEstimateMatchesRun(t *testing.T) {
 // function whose body is a left-associative five-operand XOR chain,
 // `a ^ b ^ c ^ d ^ e`. Go has no right-associative binary operators, so this
 // parses as `((((a^b)^c)^d)^e)` — four nested *ast.BinaryExpr nodes sharing
-// one left spine, the exact shape ROADMAP.md gap 13 is about, and the same
-// shape as corpus/stdlib-crypto-aes's real aes_generic.go decryption round
+// one left spine, the exact shape mutantID's collision-rank guard exists
+// for, and the same shape as corpus/stdlib-crypto-aes's real aes_generic.go decryption round
 // where the mutantID collision was first found empirically.
 //
 // It is its own tiny module rather than an addition to fixtureModule above:
@@ -806,8 +806,8 @@ func TestXorAll(t *testing.T) {
 	return root
 }
 
-// TestRunBinaryChainMutantsHaveDistinctIDs is ROADMAP.md gap 13's regression
-// test.
+// TestRunBinaryChainMutantsHaveDistinctIDs is the mutantID collision-rank
+// fix's regression test.
 //
 // Before the fix: go/ast's BinaryExpr.Pos() delegates to its left operand's
 // Pos() recursively, so every nested BinaryExpr on a left-associative
@@ -815,9 +815,9 @@ func TestXorAll(t *testing.T) {
 // leftmost operand. operator/binary's four distinct mutations on XorAll's
 // four-operator XOR chain — one swap per `^`, at four different nesting
 // depths — therefore all hashed to the identical mutantID, a real collision
-// found empirically against corpus/stdlib-crypto-aes's aes_generic.go (see
-// PROGRESS.md), where several genuinely different mutants collapsed onto
-// one ID and made -mutatemutant=<id> ambiguous for all of them.
+// found empirically against corpus/stdlib-crypto-aes's aes_generic.go,
+// where several genuinely different mutants collapsed onto one ID and made
+// -mutatemutant=<id> ambiguous for all of them.
 //
 // This exercises the real end-to-end path (mutate.Run, a real `go test`
 // per surviving mutant) rather than calling mutantID directly with
@@ -858,7 +858,7 @@ func TestRunBinaryChainMutantsHaveDistinctIDs(t *testing.T) {
 	seen := make(map[string]mutate.MutantResult, len(result.Mutants))
 	for _, m := range result.Mutants {
 		if prior, collided := seen[m.ID]; collided {
-			t.Errorf("mutantID collision (ROADMAP.md gap 13): ID %q shared by mutants %q and %q", m.ID, prior.Description, m.Description)
+			t.Errorf("mutantID collision: ID %q shared by mutants %q and %q", m.ID, prior.Description, m.Description)
 		}
 
 		seen[m.ID] = m

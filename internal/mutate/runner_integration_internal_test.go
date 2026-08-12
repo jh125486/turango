@@ -24,7 +24,8 @@ import (
 // tceFixture is a package with a genuine dead store: total's first write is
 // immediately overwritten before ever being read, so a statement/remover
 // mutant deleting it is textbook compiler-equivalent — the same fixture
-// shape ROADMAP.md gap 2's spike validated by hand.
+// shape an early spike validated by hand before TCE's compile-and-compare
+// check was wired into the engine.
 const tceFixture = `package deadstore
 
 func Sum(vs []int) (total int) {
@@ -96,8 +97,7 @@ func TestCompileDisassemblyReproducible(t *testing.T) {
 
 // TestIsTCEEquivalent covers the actual filter, both directions: a genuine
 // dead-store removal must compare equal to the baseline, and a genuine
-// behavioral change must not — the dual-mode assertion ROADMAP.md gap 2's
-// Verification section calls for.
+// behavioral change must not.
 func TestIsTCEEquivalent(t *testing.T) {
 	t.Parallel()
 
@@ -243,12 +243,12 @@ func literalMutationModule(t *testing.T, literal int, withTest bool) literalFixt
 	return literalFixture{root: root, path: path, fset: fset, file: file, baseline: baseline, mutation: mutation}
 }
 
-// TestRunClosesSameMutantIDDifferentContentCollision is ROADMAP.md gap
-// 12's single most important test: it directly disproves "mutantID alone
-// is a safe cache key" by constructing exactly the dangerous case 12a's
-// design reasoning describes — two mutations sharing an identical
-// mutantID (here, forced directly onto the mutant value, the same way a
-// same-position same-width literal edit would produce it via the real
+// TestRunClosesSameMutantIDDifferentContentCollision is the persistent
+// cache's single most important test: it directly disproves "mutantID
+// alone is a safe cache key" by constructing exactly the dangerous case
+// the compound-key design guards against — two mutations sharing an
+// identical mutantID (here, forced directly onto the mutant value, the
+// same way a same-position same-width literal edit would produce it via the real
 // walk) but genuinely different content and genuinely different real
 // verdicts — and asserts the second is never served the first's cached
 // verdict.

@@ -110,7 +110,7 @@ const (
 	// WorkspaceCopy recursively copies the module into a fresh temp directory
 	// per mutant. It has no dependency on git and works against any module,
 	// git-tracked or not — the default, and the only strategy available
-	// before ROADMAP.md gap 6.
+	// before git-worktree execution was added.
 	WorkspaceCopy Workspace = iota
 
 	// WorkspaceWorktree uses `git worktree add` instead of a filesystem copy.
@@ -230,13 +230,12 @@ type Options struct {
 	// the zero value matches every other Options field's "safe default"
 	// philosophy, and unlike a narrower scope (which can only under-report
 	// kills, never mis-report one), a false positive in the compiled-output
-	// comparison would silently discard a real mutant. See ROADMAP.md gap
-	// 2 for the validated design and its spike.
+	// comparison would silently discard a real mutant.
 	TCE bool
 
 	// Workspace selects how each mutant's throwaway execution copy is built.
 	// The zero value is [WorkspaceCopy] — today's existing filesystem-copy
-	// behaviour, unchanged. See ROADMAP.md gap 6.
+	// behaviour, unchanged.
 	Workspace Workspace
 
 	// CacheDir persists every mutant's verdict to a JSON-Lines file
@@ -250,10 +249,10 @@ type Options struct {
 	// The cache key is not MutantID alone: a same-position, same-width
 	// literal/identifier edit produces an identical MutantID for genuinely
 	// different code, so a scope-appropriate content fingerprint (reusing
-	// gap 5's dependency-closure machinery), Scope, TCE and a toolchain
-	// identifier are all folded in too — see ROADMAP.md gap 12a for the
-	// full reasoning and the concrete example that rules out MutantID
-	// alone.
+	// the dependency-closure machinery), Scope, TCE and a toolchain
+	// identifier are all folded in too — see [cacheKey]'s own doc comment
+	// for the full reasoning and the concrete example that rules out
+	// MutantID alone.
 	CacheDir string
 }
 
@@ -322,7 +321,7 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 		}
 	}
 
-	// Dependency-closure resolution (ROADMAP.md gap 5) is only ever
+	// Dependency-closure resolution is only ever
 	// attempted when the run's own requested scope is not [ScopeFull]: a
 	// forward import closure is provably the wrong thing to test under
 	// ScopeFull (it cannot see the reverse closure ScopeFull's cross-package
@@ -344,7 +343,7 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 		return nil, err
 	}
 
-	// Persistent verdict cache (ROADMAP.md gap 12), resolved only when
+	// Persistent verdict cache, resolved only when
 	// requested: a toolchain fingerprint, a read-only index loaded once
 	// before any worker starts (12d), and a single-consumer append-only
 	// writer opened once and closed once, right after execute() returns —
@@ -399,8 +398,7 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 // many mutants a real [Run] would generate, broken down per package, and a
 // rough, honestly-hedged prediction of how long running them would take —
 // without ever writing a mutation to disk or spawning a single `go test`
-// subprocess to classify one. See ROADMAP.md gap 11 for the full design and
-// the reasoning behind every caveat [EstimateResult] carries.
+// subprocess to classify one.
 //
 // It is a separate entry point from Run, not an [Options] flag, deliberately
 // — see gap 11a: the two results answer structurally different questions.
@@ -415,11 +413,11 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 // visitNode — via [walkForEstimate]. The only behavioural difference is one
 // branch inside visitNode's per-mutation loop (guarded by a non-nil tally)
 // that tallies a package's count instead of calling [runner.run]. Dependency-
-// closure resolution (ROADMAP.md gap 5) and per-package coverage maps
+// closure resolution and per-package coverage maps
 // (ScopeImpact) are both execution-time concerns with nothing to contribute
 // to a count, so planPackage skips building them for an estimate-only job.
 //
-// Per-package baseline timing (ROADMAP.md gap 11b) intentionally runs
+// Per-package baseline timing intentionally runs
 // *after* the count-only walk finishes, not precomputed alongside it the way
 // ScopeImpact's coverage map or TCE's baseline compile are for a real run:
 // only a package that the walk actually found at least one mutant in is
@@ -494,7 +492,7 @@ func walkForEstimate(ctx context.Context, goBin string, opts Options) (estimateC
 }
 
 // buildEstimateResult times each package the walk found a mutant in and
-// extrapolates a total, per ROADMAP.md gap 11b/11c.
+// extrapolates a total.
 //
 // Under [ScopeFull] every mutant really does run `go test ./...`
 // (mutant.testArgs), so one whole-module sample applies identically to
@@ -700,9 +698,9 @@ func execute(ctx context.Context, run *runner, jobs []fileJob, parallel int, sin
 // and time.Sleep (see `go doc testing/synctest`). sync.Mutex.Lock is not on
 // that list: a goroutine blocked acquiring a mutex is invisible to a
 // synctest bubble. This was a correctness-neutral change when made (the
-// mutex was already race-safe, verified under -race) — see ROADMAP.md gap 7
-// — made purely so a future test of -mutateparallel's scheduling behavior
-// has something to drive deterministically.
+// mutex was already race-safe, verified under -race), made purely so a
+// future test of -mutateparallel's scheduling behavior has something to
+// drive deterministically.
 //
 // Results are accumulated unordered and sorted once at the end rather than
 // being slotted into a pre-sized per-file position: how many mutants a file
@@ -1056,19 +1054,20 @@ func loadTyped(ctx context.Context, opts Options) (map[string]*packages.Package,
 	return byPath, nil
 }
 
-// loadClosures re-resolves opts.patterns() with import-graph and test-variant
-// information, for [resolveClosure] to consult (ROADMAP.md gap 5). It is
-// only ever called when the run's requested scope is not [ScopeFull] — see
+// loadClosures re-resolves opts.patterns() with import-graph and
+// test-variant information, for [resolveClosure] to consult. It is only
+// ever called when the run's requested scope is not [ScopeFull] — see
 // [Run]'s own gating.
 //
 // Tests: true is load-bearing, not incidental: without it, a black-box
 // "pkg_test" external test package's own imports are invisible to
-// [resolveClosure], which is exactly the bug an earlier review of this
-// mechanism found before it was ever wired in (see ROADMAP.md gap 5's
-// "Independent review before activation" section) — this project's own
-// test-convention cleanup made black-box tests the repo-wide default, so
-// getting this wrong here would misclassify mutants in the packages this
-// project itself just finished converting to that convention.
+// [resolveClosure], which is exactly one of two real bugs an independent
+// review of this mechanism found before it was ever wired in (the other
+// being an in-module replace target outside the closure not triggering
+// fallback to full copy) — this project's own test-convention cleanup
+// made black-box tests the repo-wide default, so getting this wrong here
+// would misclassify mutants in the packages this project itself just
+// finished converting to that convention.
 //
 // The result is keyed by absolute package directory, not PkgPath: a
 // Tests:true load returns up to three *packages.Package entries per
@@ -1161,19 +1160,19 @@ type fileJob struct {
 	// package was fail-soft demoted to running without it.
 	tceBaseline []byte
 
-	// closure is the package's pre-resolved dependency closure (ROADMAP.md
-	// gap 5), non-nil only when scope above is not [ScopeFull] and
+	// closure is the package's pre-resolved dependency closure,
+	// non-nil only when scope above is not [ScopeFull] and
 	// [resolveClosure] resolved it safely for this package. Threaded
 	// through to every [mutant] the package's mutateFile walk produces —
 	// see [runner.workspaceFor].
 	closure map[string]bool
 
 	// cacheFingerprint is the package's once-per-package content
-	// fingerprint for ROADMAP.md gap 12's persistent verdict cache (see
+	// fingerprint for the persistent verdict cache (see
 	// planCacheFingerprint), empty whenever [Options.CacheDir] is unset.
 	// Threaded through to every [mutant] the package produces, alongside
 	// tceEnabled below, so mutant.cacheKey can assemble the full compound
-	// key gap 12a describes.
+	// key.
 	cacheFingerprint string
 
 	// tceEnabled mirrors [Options.TCE] verbatim, threaded per job rather
@@ -1182,7 +1181,7 @@ type fileJob struct {
 	// narrower ("TCE requested *and* this package's baseline compile
 	// succeeded"), and a cache key built from tceBaseline!=nil would
 	// silently mix a run whose baseline compile happened to fail this time
-	// into the TCE=false bucket — see ROADMAP.md gap 12a.
+	// into the TCE=false bucket.
 	tceEnabled bool
 
 	// typedFset and typedSyntax are the FileSet and already-parsed,
@@ -1220,7 +1219,7 @@ type fileJob struct {
 //
 // closurePkgs is non-nil only when [Run] determined the run's scope is not
 // [ScopeFull]; it is used, per package, to resolve [fileJob.closure] via
-// [resolveClosure] (ROADMAP.md gap 5).
+// [resolveClosure].
 //
 // estimateOnly is true only for [walkForEstimate]'s call: it makes
 // planPackage skip every execution-time-only per-package precompute
@@ -1230,8 +1229,8 @@ type fileJob struct {
 func plan(ctx context.Context, goBin string, opts Options, pkgs []*packages.Package, mutators []mutator.Mutator, typedPkgs map[string]*packages.Package, closurePkgs map[string][]*packages.Package, funcPattern *regexp.Regexp, estimateOnly bool) ([]fileJob, error) {
 	var jobs []fileJob
 
-	// fingerprintMemo caches the whole-module cache fingerprint (ROADMAP.md
-	// gap 12a) by moduleDir, populated at most once per distinct moduleDir
+	// fingerprintMemo caches the whole-module cache fingerprint
+	// by moduleDir, populated at most once per distinct moduleDir
 	// across this whole, sequential, pre-execute() planning pass — the same
 	// amortisation concern fullBaseline already solves for
 	// buildEstimateResult. See planCacheFingerprint's own doc comment for
@@ -1251,8 +1250,8 @@ func plan(ctx context.Context, goBin string, opts Options, pkgs []*packages.Pack
 	return jobs, nil
 }
 
-// planClosure resolves this package's dependency closure (ROADMAP.md gap
-// 5), or nil if any precondition doesn't hold — scope is [ScopeFull] (where
+// planClosure resolves this package's dependency closure,
+// or nil if any precondition doesn't hold — scope is [ScopeFull] (where
 // a forward closure is provably wrong, not just unresolved — see
 // closureDirs' doc comment), closurePkgs wasn't loaded this run, no variant
 // was found for dir (a package [load] resolved but [loadClosures] somehow
@@ -1344,7 +1343,7 @@ func planTCEBaseline(ctx context.Context, goBin string, opts Options, moduleDir,
 }
 
 // planCacheFingerprint resolves the scope-appropriate content fingerprint
-// [mutant.cacheKey] needs (ROADMAP.md gap 12a), or "" immediately when
+// [mutant.cacheKey] needs, or "" immediately when
 // opts.CacheDir == "" — the same zero-cost-unless-selected shape
 // [planTCEBaseline] already establishes for [Options.TCE].
 //
@@ -1364,7 +1363,7 @@ func planTCEBaseline(ctx context.Context, goBin string, opts Options, moduleDir,
 // not re-read a file [load] already read successfully once this same
 // run — a genuine filesystem problem, not a routine case to degrade
 // gracefully around, and getting the cache key wrong is explicitly worse
-// than not caching at all (ROADMAP.md gap 12's own framing).
+// than not caching at all.
 func planCacheFingerprint(ctx context.Context, opts Options, moduleDir string, dirs map[string]bool, memo map[string]string) (string, error) {
 	if opts.CacheDir == "" {
 		return "", nil
@@ -1422,8 +1421,7 @@ func planPackage(ctx context.Context, goBin string, opts Options, pkg *packages.
 	// how a real mutant would later be tested, never which mutations the
 	// walk finds — so [Estimate]'s walk skips all three: computing them
 	// would cost real go test/go build subprocesses for a preview whose
-	// whole point is spawning none (see [walkForEstimate]'s doc comment and
-	// ROADMAP.md gap 11a).
+	// whole point is spawning none (see [walkForEstimate]'s doc comment).
 	var (
 		scope            Scope
 		cover            *impactMap
@@ -1626,13 +1624,12 @@ func mutateFile(ctx context.Context, run *runner, job *fileJob, sink *collector,
 		closureDirs:      job.closure,
 		cacheFingerprint: job.cacheFingerprint,
 		tceEnabled:       job.tceEnabled,
-		// job.mutantID != "" is exactly ROADMAP.md gap 4's -mutatemutant=
+		// job.mutantID != "" is exactly a -mutatemutant=
 		// replay request: the walk still reaches every node, but only a
 		// matching mutation is ever handed to run.run (see visitMutations).
 		// A replay run's whole purpose is to actually reproduce a specific
 		// mutant against a real go test run, so it must always bypass a
-		// cache *read* — see mutant.replay's own doc comment and ROADMAP.md
-		// gap 12f.
+		// cache *read* — see mutant.replay's own doc comment.
 		replay: job.mutantID != "",
 	}
 
@@ -1646,7 +1643,7 @@ func mutateFile(ctx context.Context, run *runner, job *fileJob, sink *collector,
 		relPath = path
 	}
 
-	// dedup is this file's own [idDeduper] (ROADMAP.md gap 13): fresh per
+	// dedup is this file's own [idDeduper]: fresh per
 	// mutateFile call, so it needs no synchronisation even though execute
 	// runs one mutateFile goroutine per file concurrently — each walk only
 	// ever needs to disambiguate collisions against itself.
@@ -1678,8 +1675,8 @@ func mutateFile(ctx context.Context, run *runner, job *fileJob, sink *collector,
 	return walkErr
 }
 
-// idDeduper is mutateFile's own per-walk collision guard for ROADMAP.md gap
-// 13: a left-associative binary chain like `a ^ b ^ c ^ d ^ e` parses as
+// idDeduper is mutateFile's own per-walk collision guard: a left-associative
+// binary chain like `a ^ b ^ c ^ d ^ e` parses as
 // `((((a^b)^c)^d)^e)`, and go/ast's BinaryExpr.Pos() delegates to X.Pos()
 // recursively — so every nested BinaryExpr on the chain's left spine reports
 // the exact same (line, column) as the leftmost operand `a`. Real code hits
@@ -1820,8 +1817,8 @@ func visitNode(ctx context.Context, run *runner, job *fileJob, relPath string, s
 // [visitNode] purely to keep that function's own branching manageable; the
 // split changes nothing about behaviour, only where it's written. dedup is
 // [visitNode]'s own [idDeduper], threaded through to disambiguate a mutantID
-// collision on a left-associative binary chain (ROADMAP.md gap 13) — see
-// idDeduper's doc comment.
+// collision on a left-associative binary chain — see idDeduper's doc
+// comment.
 func visitMutations(ctx context.Context, run *runner, job *fileJob, relPath string, sink *collector, tally *estimateTally, spec *mutant, dedup idDeduper, m mutator.Mutator, node ast.Node) error {
 	pos := spec.fset.Position(node.Pos())
 
@@ -1851,7 +1848,7 @@ func visitMutations(ctx context.Context, run *runner, job *fileJob, relPath stri
 			continue
 		}
 
-		// Estimate's walk-only counting mode (ROADMAP.md gap 11a): tally
+		// Estimate's walk-only counting mode: tally
 		// records that a real run would classify this mutation, without
 		// ever calling run.run — the one branch that makes this whole
 		// walk a preview rather than a run. run is never touched here;

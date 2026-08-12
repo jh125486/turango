@@ -1,5 +1,5 @@
 {
-  "description": "encoding/base64 (hand-written/heavily-adapted fixture inspired by Go stdlib's base64 package -- confirmed via commit archaeology in PROGRESS.md's corpus-provenance thread that this is not a byte-for-byte freeze of any real upstream commit, unlike stdlib-strconv-parseuint/stdlib-x509-pkix). Captured directly against the built binary, package scope, default operator set, -mutatetimeout=30s.",
+  "description": "encoding/base64 (hand-written/heavily-adapted fixture inspired by Go stdlib's base64 package -- confirmed via commit archaeology that this is not a byte-for-byte freeze of any real upstream commit, unlike stdlib-strconv-parseuint/stdlib-x509-pkix). Captured directly against the built binary, package scope, default operator set, -mutatetimeout=30s.",
   "modulePath": "corpus/stdlib-encoding-base64/module",
   "scope": "package",
   "operators": null,

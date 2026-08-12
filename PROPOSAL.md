@@ -346,19 +346,17 @@ score threshold are all now implemented, none of them present in 2018.
   several techniques the mutation-testing research literature treats as
   standard for reducing cost at scale — mutant subsumption / selective
   mutation (running a reduced, representative subset of mutants instead of
-  every one an operator offers — noted but explicitly deferred in
-  ROADMAP.md gap 2's own TCE discussion), higher-order mutation, ML-guided
-  mutant prioritization or kill prediction, or diff-scoped incremental
-  mutation testing keyed to what actually changed rather than a whole
-  package. None of these are built, and none are needed to validate this
-  proposal's core claim: that the mutate-rerun-classify mechanism itself
-  belongs in the standard toolchain the way `-fuzz` does. A stdlib
-  implementation is free to adopt any of them later without revisiting
-  this proposal's mechanism — this prototype's job is proving the
-  mechanism is worth having, not being the fastest possible realization of
-  it. (Benchmark harness built, real overnight run in progress as of this
-  writing — see ROADMAP.md gap 8 and `BENCHMARKS.md`; not yet finalized
-  into numbers this document cites.)
+  every one an operator offers, noted but explicitly deferred alongside
+  TCE), higher-order mutation, ML-guided mutant prioritization or kill
+  prediction, or diff-scoped incremental mutation testing keyed to what
+  actually changed rather than a whole package. None of these are built,
+  and none are needed to validate this proposal's core claim: that the
+  mutate-rerun-classify mechanism itself belongs in the standard toolchain
+  the way `-fuzz` does. A stdlib implementation is free to adopt any of
+  them later without revisiting this proposal's mechanism — this
+  prototype's job is proving the mechanism is worth having, not being the
+  fastest possible realization of it. (Benchmark harness built and run for
+  real — see `BENCHMARKS.md` for the full transcript and methodology.)
 - **TCE's payoff is real but codebase-dependent — it is not a free
   optimization, and this proposal has a real measurement showing it can be
   a net loss.** Against `corpus/stdlib-strconv-parseuint` (a real, frozen
@@ -372,9 +370,10 @@ score threshold are all now implemented, none of them present in 2018.
   N × 1.006s` — **TCE was about 66% slower overall for this specific
   fixture**, because the per-mutant tax on 100% of mutants outweighs the
   savings on the 2.2% it actually filters. This is exactly why turango
-  ships TCE opt-in, not opt-out (ROADMAP.md gap 2's own reasoning was about
-  correctness risk; this is the independent cost-side reason arriving at
-  the same default). The general lesson, not specific to TCE: turango's
+  ships TCE opt-in, not opt-out — a false positive would silently discard
+  a real mutant (a correctness risk), and this measurement shows it isn't
+  even a reliable win on cost grounds either, arriving at the same default
+  from an independent direction. The general lesson, not specific to TCE: turango's
   knobs (`-mutatescope`, `-mutateparallel`, `-mutatetce`, and any future
   ones) are levers whose right setting depends on the target codebase's own
   shape — equivalent-mutant rate, test suite cost, cross-package coupling —

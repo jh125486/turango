@@ -83,13 +83,13 @@ type mutant struct {
 	// — non-nil only when scope is not [ScopeFull] and the closure was
 	// resolved safely. Nil means "use the whole-module copy" ([copyModule]
 	// or [copyWorktree]), either because scope is ScopeFull (where a
-	// forward closure is provably wrong — see ROADMAP.md gap 5) or because
+	// forward closure is provably wrong) or because
 	// resolveClosure declined (a vendor/ directory, an embed directive, an
 	// unsafe replace target) and the caller must fall back.
 	closureDirs map[string]bool
 
 	// cacheFingerprint is this mutant's package's once-per-package content
-	// fingerprint for ROADMAP.md gap 12's persistent verdict cache (see
+	// fingerprint for the persistent verdict cache (see
 	// [cacheFingerprint], [engine.planCacheFingerprint]) — empty whenever
 	// [Options.CacheDir] is unset. Combined with the other cacheKey fields
 	// in [mutant.cacheKey].
@@ -103,15 +103,15 @@ type mutant struct {
 	// replay reports whether this run is replaying exactly one mutant via
 	// -mutatemutant=<id> ([Options.MutantID] set). A replay's whole purpose
 	// is to reproduce a specific mutant against a real `go test` run, so it
-	// always bypasses a cache *read* (ROADMAP.md gap 12f) — but its
+	// always bypasses a cache *read* — but its
 	// freshly-confirmed verdict is still written through afterward, same as
 	// any other mutant's, since there is no reason it shouldn't benefit a
 	// later normal run's cache hit rate.
 	replay bool
 }
 
-// cacheKey assembles m's compound cache key (ROADMAP.md gap 12a) for
-// toolchain, the run's resolved toolchain identifier (see
+// cacheKey assembles m's compound cache key for toolchain, the run's
+// resolved toolchain identifier (see
 // [resolveToolchain]). Every field here must match for a cache lookup to be
 // trusted — see [cacheKey]'s own doc comment for why each one is present.
 func (m mutant) cacheKey(toolchain string) cacheKey {
@@ -139,8 +139,8 @@ type runner struct {
 	// built — see [workspaceFor].
 	workspace Workspace
 
-	// cache is the read-only index of a prior run's cache file (ROADMAP.md
-	// gap 12), nil whenever [Options.CacheDir] is unset or loading it
+	// cache is the read-only index of a prior run's cache file, nil
+	// whenever [Options.CacheDir] is unset or loading it
 	// failed (fail-soft — see [engine.Run]'s wiring). A nil *cacheIndex's
 	// own get method already answers every lookup with ok==false, so run
 	// need only guard the fast path with cache != nil, not thread a
@@ -185,9 +185,9 @@ const goModFile = "go.mod"
 // cheap and not what this counter is about.
 //
 // It exists so a test can prove [walkForEstimate]'s counting phase spawns
-// none of these — the concrete, checkable form of ROADMAP.md gap 11a's
-// claim that estimate mode's walk costs "an AST walk with no go test
-// subprocess anywhere" — the same call-counter technique [loadTypedCalls]
+// none of these — the concrete, checkable form of the claim that estimate
+// mode's walk costs "an AST walk with no go test subprocess anywhere" —
+// the same call-counter technique [loadTypedCalls]
 // (engine.go) already established to prove loadTyped is skipped when
 // unneeded.
 var execCalls atomic.Int64
@@ -256,7 +256,7 @@ func (r *runner) run(ctx context.Context, m mutant) (result MutantResult, ok, eq
 		return result, true, false, nil
 	}
 
-	// ROADMAP.md gap 12e: strictly earlier than TCE's own insertion point
+	// The cache lookup sits strictly earlier than TCE's own insertion point
 	// below, since a cache hit must skip the workspace copy too, not just
 	// the `go test` call. m.replay bypasses the read unconditionally — see
 	// mutant.replay's own doc comment — but the ScopeImpact shortcut just
@@ -307,7 +307,7 @@ func (r *runner) run(ctx context.Context, m mutant) (result MutantResult, ok, eq
 	// mutant whose compiled output matches the baseline byte-for-byte never
 	// reaches r.goTest at all.
 	if isTCEEquivalent(ctx, r.goBin, moduleDir, m) {
-		// Written through unconditionally on m.replay (ROADMAP.md gap 12f):
+		// Written through unconditionally on m.replay:
 		// a replay run's freshly-confirmed verdict still benefits a later
 		// normal run's cache hit rate, even though replay itself never
 		// reads the cache.
@@ -341,8 +341,8 @@ func (r *runner) run(ctx context.Context, m mutant) (result MutantResult, ok, eq
 	return result, true, false, nil
 }
 
-// cacheLookup consults r.cache for m's verdict (ROADMAP.md gap 12e),
-// building on the result skeleton run has already populated
+// cacheLookup consults r.cache for m's verdict, building on the result
+// skeleton run has already populated
 // (ID/File/Line/Operator/Description/Before/After — every field a cache
 // record itself does not carry, per cacheRecord's own doc comment on why
 // it deliberately minimizes what it trusts from disk).
@@ -376,7 +376,7 @@ func (r *runner) cacheLookup(m mutant, result MutantResult) (out MutantResult, o
 
 // cacheWrite appends rec through r.store when caching is active, a no-op
 // otherwise — the single guard every one of run's write call sites shares
-// (ROADMAP.md gap 12e's two write call sites plus the equivalent-branch one).
+// (the two write call sites above plus the equivalent-branch one).
 func (r *runner) cacheWrite(rec cacheRecord) {
 	if r.store != nil {
 		r.store.record(rec)
@@ -538,7 +538,7 @@ func (r *runner) goTest(ctx context.Context, dir string, args []string) (stdout,
 // once-per-package baseline and every mutant alike — so the toolchain's own
 // content-derived build ID (which legitimately differs whenever the source
 // changed, which is not the signal TCE measures) can never itself be the
-// source of a spurious diff. See ROADMAP.md gap 2's design notes.
+// source of a spurious diff.
 const tceBuildID = "turango-tce"
 
 // positionComment matches the trailing source-position annotation `go tool
@@ -546,8 +546,8 @@ const tceBuildID = "turango-tce"
 // [compileDisassembly] strips these before comparing: position shifts
 // whenever a mutation changes the source's line count, even when the
 // generated code is byte-for-byte identical, so leaving them in would make
-// the comparison detect almost nothing — confirmed empirically in ROADMAP.md
-// gap 2's spike, where a textbook dead-store-elimination case differed only
+// the comparison detect almost nothing — confirmed empirically in an
+// early spike, where a textbook dead-store-elimination case differed only
 // in this annotation.
 var positionComment = regexp.MustCompile(`\([^)]*\.go:\d+\)`)
 
@@ -841,8 +841,8 @@ func (r *runner) workspaceFor(ctx context.Context, tmp, moduleDir string, dirs m
 // ok reports whether a worktree was actually created; false means the
 // caller must fall back to [copyModule] — moduleDir is not inside a usable
 // git working tree (not a git repo at all, e.g. any corpus fixture under
-// corpus/*/module/, which is deliberately a plain directory per ROADMAP.md
-// gap 6's own "must never become a hard git dependency" note; or one with
+// corpus/*/module/, which is deliberately a plain directory, since
+// turango must never become a hard git dependency; or one with
 // uncommitted changes, see [gitWorktreeClean]).
 //
 // `git worktree add` checks out HEAD — the last *commit* — into wt, so the
@@ -974,9 +974,11 @@ func gitWorktreeClean(ctx context.Context, repoRoot string) bool {
 // partially-resolved closure.
 //
 // Wired into the engine via [engine.planPackage]/[runner.workspaceFor],
-// gated to [ScopePackage]/[ScopeImpact] only — see ROADMAP.md gap 5 for why
-// applying this under [ScopeFull] would be provably wrong, not just a
-// missed optimisation.
+// gated to [ScopePackage]/[ScopeImpact] only: under [ScopeFull] a forward
+// closure is provably wrong to apply, not just a missed optimisation,
+// since ScopeFull's correctness depends on the *reverse* closure (every
+// package that could call into the target) — something a forward closure
+// says nothing about.
 func closureDirs(pkg *packages.Package) (dirs map[string]bool, ok bool) {
 	if pkg.Module == nil || pkg.Module.Dir == "" {
 		return nil, false
@@ -1063,9 +1065,9 @@ func hasEmbedDirective(files []string) bool {
 // actual files may not live where the import graph says they do), any local
 // `replace` directive whose target lies outside the module (re-scoping
 // replace-target copying to a partial closure, and rewriting it, is real
-// complexity this v1 does not take on — see ROADMAP.md gap 5's design
-// sketch), or an in-module local `replace` whose target directory falls
-// outside the computed closure (see the loop below). Any of the three means
+// complexity this v1 does not take on), or an in-module local `replace`
+// whose target directory falls outside the computed closure (see the loop
+// below). Any of the three means
 // "fall back to copyModule," the same as an unsafe [closureDirs] result.
 //
 // pkgs is every go/packages variant of the target package relevant to

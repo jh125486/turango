@@ -45,8 +45,8 @@ func TestCachePath(t *testing.T) {
 // writeFingerprintModule builds a minimal, real module — go.mod plus one
 // package file — under a fresh temp directory and returns its root. Used
 // by TestCacheFingerprint's whole-module (dirs == nil) cases, which need
-// two genuinely separate temp-dir copies the way ROADMAP.md gap 2's own
-// compile() reproducibility test does for the analogous TCE claim.
+// two genuinely separate temp-dir copies the way
+// TestCompileDisassemblyReproducible does for the analogous TCE claim.
 func writeFingerprintModule(t *testing.T, src string) string {
 	t.Helper()
 
@@ -79,7 +79,7 @@ func narrowFixture(t *testing.T) (root string, dirs map[string]bool) {
 	return root, map[string]bool{filepath.Join(root, "a"): true}
 }
 
-// TestCacheFingerprint covers ROADMAP.md gap 12a's central correctness
+// TestCacheFingerprint covers the persistent cache's central correctness
 // claim at the fingerprint layer: identical content hashes equal
 // regardless of which temp directory it happens to live in, any change
 // inside the relevant file set changes the digest, and — the scope
@@ -225,8 +225,7 @@ func TestCacheFingerprint(t *testing.T) {
 // through loadCacheIndex intact; and — the load-bearing recovery
 // property — a torn trailing write left behind by a killed process
 // (simulated by appending a truncated, syntactically-invalid line directly
-// to the file, bypassing cacheStore entirely, exactly as ROADMAP.md gap
-// 12's own Verification section describes) is silently dropped and the
+// to the file, bypassing cacheStore entirely) is silently dropped and the
 // file physically truncated on disk, after which a fresh cacheStore can
 // still append further records cleanly.
 func TestLoadCacheIndex(t *testing.T) {

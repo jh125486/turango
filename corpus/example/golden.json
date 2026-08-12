@@ -1,5 +1,5 @@
 {
-  "description": "turango's own example/ demo package, run in-place against turango's own module. Package-scoped only -- full scope has a known pathological self-reference issue documented in PROGRESS.md.",
+  "description": "turango's own example/ demo package, run in-place against turango's own module. Package-scoped only -- full scope has a known pathological self-reference issue (mutating and full-module-testing turango's own module simultaneously).",
   "modulePath": "",
   "target": "./example/...",
   "scope": "package",

@@ -31,14 +31,14 @@
 //
 // This does not reproduce the strconv bug exactly — that swap was local-to-
 // package-const, not const-to-const — and is a known, deliberate v1
-// limitation (see ROADMAP.md, gap 1).
+// limitation.
 //
 // # v2: local-variable-to-package-constant swap (identifier/localconstswap)
 //
-// [localConstSwap], also in this file, is the v2 extension ROADMAP.md's gap 1
-// flags as follow-on: it closes the strconv gap directly by allowing a
-// *local* variable's use — not just another package-level constant's use —
-// to be swapped for a same-type package-level constant. It is a separate
+// [localConstSwap], also in this file, is the v2 extension that closes the
+// strconv gap directly: it allows a *local* variable's use — not just
+// another package-level constant's use — to be swapped for a same-type
+// package-level constant. It is a separate
 // registered operator (a separate node shape needs a separate Applies/Mutate
 // pair, following this codebase's existing precedent of splitting related-
 // but-distinct mutation shapes into distinct operators — see how
@@ -279,7 +279,7 @@ func buildGroups(info *types.Info) map[*types.Const][]*types.Const {
 }
 
 // LocalConstSwapName is the registry name of the v2, local-variable-to-
-// package-constant swap operator (ROADMAP.md gap 1's follow-on).
+// package-constant swap operator.
 const LocalConstSwapName = "identifier/localconstswap"
 
 func init() {
@@ -288,8 +288,8 @@ func init() {
 
 // comparisonOps is the set of relational and equality operators
 // [localConstSwap] restricts its scan to: the same "boundary-relevant"
-// family operator/boundary targets (<, <=, >, >=), plus == and != per
-// ROADMAP.md's v2 sketch. This is where a wrong-constant substitution
+// family operator/boundary targets (<, <=, >, >=), plus == and !=. This
+// is where a wrong-constant substitution
 // actually changes observable behaviour — the strconv ParseUint bug this
 // operator is modelled on was exactly a boundary check, `n1 > maxVal`
 // silently becoming `n1 > maxUint64`. Restricting to comparison operands
@@ -310,10 +310,10 @@ var comparisonOps = map[token.Token]bool{
 
 // localConstSwap swaps a use of a function-local variable, when it appears
 // as an operand of a comparison, for a package-level constant whose type is
-// compatible with the variable's declared type. It is the v2 extension
-// ROADMAP.md's gap 1 documents as a follow-on to [constSwap]: v1 only swaps
-// one package-level constant for another; this operator additionally
-// reaches into the historical strconv#21278 ParseUint shape, where the bug
+// compatible with the variable's declared type. It is the v2 extension, a
+// follow-on to [constSwap]: v1 only swaps one package-level constant for
+// another; this operator additionally reaches into the historical
+// strconv#21278 ParseUint shape, where the bug
 // was a bitSize-scoped local (`maxVal`) used where the package-level
 // constant `maxUint64` should have been.
 //
@@ -357,8 +357,8 @@ var comparisonOps = map[token.Token]bool{
 // "block" to share with a package constant the way two package constants
 // might. That theory was validated against the real, frozen
 // corpus/stdlib-strconv-parseuint fixture (a 4-file slice of real strconv
-// source) during ROADMAP.md gap 1's own flagged validation pass, and it
-// failed: mutant count on that fixture went up roughly 24x, and the large
+// source), and it failed: mutant count on that fixture went up roughly
+// 24x, and the large
 // majority of the new mutants were nonsense, not "wrong identifier" bugs —
 // e.g. quote.go's loop-index locals (`r`, `i`, `j`, `rr`) being offered
 // against `intSize`/`IntSize` (declared in atoi.go) and `nSmalls` (declared

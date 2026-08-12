@@ -1,4 +1,4 @@
-// Persistent mutant verdict cache — ROADMAP.md gap 12.
+// Persistent mutant verdict cache.
 //
 // turango has no resume capability without this: a hard kill (SIGKILL, an
 // OOM reaper, a killed background job) or even a graceful Ctrl+C throws away
@@ -10,7 +10,7 @@
 // The central risk this file exists to close, not just to speed things up,
 // is a *wrong* cache hit: serving a stale verdict for a mutation that looks
 // the same by mutantID but is not, in fact, the same code. See
-// [cacheFingerprint]'s doc comment and ROADMAP.md gap 12a for the concrete
+// [cacheFingerprint]'s doc comment for the concrete
 // example (a same-width literal edit at the same file/line/column) that
 // rules out mutantID alone as a safe key.
 package mutate
@@ -45,8 +45,7 @@ func cachePath(dir string) string {
 
 // cacheKey identifies exactly which prior run a cache record answers for.
 // Every field must match the current run's own value for a lookup to be
-// trusted — see ROADMAP.md gap 12a for why each one is here, not just
-// mutantID alone:
+// trusted, not just mutantID alone:
 //
 //   - MutantID hashes a *position* in a specific AST (file, line, column,
 //     operator, mutation index), not the mutated node's own bytes. Two
@@ -72,10 +71,9 @@ func cachePath(dir string) string {
 //     is identical.
 //
 // Options.Workspace, Options.Parallel and Options.TestTimeout are
-// deliberately absent — see ROADMAP.md gap 12a for why each is safe to
-// leave out (a construction-strategy choice, a scheduling-only knob, and an
-// explicit, honestly-stated risk that only ever biases toward Killed,
-// respectively).
+// deliberately absent (a construction-strategy choice, a scheduling-only
+// knob, and an explicit, honestly-stated risk that only ever biases toward
+// Killed, respectively).
 type cacheKey struct {
 	Toolchain   string // resolveToolchain: go version + GOOS/GOARCH
 	Scope       string // Scope.String()
@@ -104,7 +102,7 @@ type cacheRecord struct {
 // actually be tested against — i.e. the same file set [runner.workspaceFor]
 // would copy to execute it — which is the only file set a cache key can
 // safely be built from. Two narrower alternatives were considered and
-// rejected (ROADMAP.md gap 12a): fingerprinting only the mutated file is
+// rejected: fingerprinting only the mutated file is
 // unsafe (a sibling package's test file can flip a verdict without the
 // mutated file changing at all), and always fingerprinting the whole module
 // is safe but needlessly coarse under a scope narrower than [ScopeFull].
@@ -362,9 +360,9 @@ func (idx *cacheIndex) get(key cacheKey) (cacheRecord, bool) {
 // complete JSON lines, never "complete lines + garbage + more complete
 // lines."
 //
-// Multiple records for the same key are expected, not an error (ROADMAP.md
-// gap 12g: nothing actively removes a now-stale record when its
-// fingerprint changes) — later records in file order simply overwrite
+// Multiple records for the same key are expected, not an error — nothing
+// actively removes a now-stale record when its fingerprint changes —
+// later records in file order simply overwrite
 // earlier ones for the same key, which appending in write order already
 // guarantees is "most recent wins."
 func loadCacheIndex(path string) (*cacheIndex, error) {

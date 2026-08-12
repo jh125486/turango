@@ -1,6 +1,9 @@
 // Package optceequivalent is a minimal, hand-built fixture demonstrating a
-// real Trivial Compiler Equivalence (TCE) filter, not just TCE's cost. See
-// ROADMAP.md gap 2's own spike, which validated exactly this shape.
+// real Trivial Compiler Equivalence (TCE) filter, not just TCE's cost. TCE
+// compares normalized `go build -gcflags=-S` disassembly rather than raw
+// compiled archive bytes -- an early spike found raw archive comparison
+// unreliable, tripping on build metadata (paths, timestamps) unrelated to
+// real behavioral difference; this fixture validates that shape by hand.
 package optceequivalent
 
 // DeadStore is a textbook dead-store-elimination case: total is assigned

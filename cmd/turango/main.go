@@ -337,9 +337,10 @@ type mutateConfig struct {
 	hasMin bool
 
 	// estimate is -mutateestimate: short-circuits to mutate.Estimate instead
-	// of mutate.Run, and exits before any real mutation is ever applied. See
-	// ROADMAP.md gap 11e for why "-mutateestimate", not "-mutatedryrun", was
-	// chosen.
+	// of mutate.Run, and exits before any real mutation is ever applied.
+	// Named "estimate" rather than "dryrun": "dry run" signals "don't
+	// actually run it" clearly but doesn't by itself promise a time
+	// estimate the way "estimate" does.
 	estimate bool
 }
 
@@ -409,12 +410,11 @@ func parseMutateFlags(args []string) (cfg mutateConfig, found bool, err error) {
 	// than silently becoming no-ops: estimate mode classifies nothing, so
 	// there is no report for -mutateoutput to write, no score for
 	// -mutatemin to gate on, and no verdict for -mutatecache to persist or
-	// reuse (ROADMAP.md gap 12h). Erroring here matches this project's
-	// standing convention of rejecting a flag combination that cannot do
-	// what it looks like it does (see, e.g., an unrecognised go test flag
-	// just below, or an unknown -mutateoperators name) rather than letting
-	// it quietly misbehave — see ROADMAP.md gap 11's "Files/functions
-	// touched" note on main.go.
+	// reuse. Erroring here matches this project's standing convention of
+	// rejecting a flag combination that cannot do what it looks like it
+	// does (see, e.g., an unrecognised go test flag just below, or an
+	// unknown -mutateoperators name) rather than letting it quietly
+	// misbehave.
 	if cfg.estimate && (cfg.output != "" || cfg.hasMin || cfg.options.CacheDir != "") {
 		return mutateConfig{}, false, fmt.Errorf(
 			"turango: -%s, -%s and -%s have no effect on -%s=true: nothing is classified in estimate mode, so there is no report to write, no score to gate on, and no verdict to cache",
@@ -639,10 +639,9 @@ func (c *mutateConfig) setTCE(value string) error {
 
 // setWorkspace validates and stores -mutateworkspace: whether a mutant's
 // throwaway execution copy is built by filesystem copy (the default) or
-// `git worktree add`. See ROADMAP.md gap 6 — worktree mode is strictly
-// opt-in and falls back to the copy strategy on its own whenever the
-// target isn't inside a clean git working tree, so requesting it is always
-// safe.
+// `git worktree add`. Worktree mode is strictly opt-in and falls back to
+// the copy strategy on its own whenever the target isn't inside a clean
+// git working tree, so requesting it is always safe.
 func (c *mutateConfig) setWorkspace(value string) error {
 	workspace, err := mutate.ParseWorkspace(value)
 	if err != nil {
@@ -673,8 +672,8 @@ func (c *mutateConfig) setEstimate(value string) error {
 }
 
 // setCache validates and stores -mutatecache: a directory holding a
-// persistent JSON-Lines cache of mutant verdicts (ROADMAP.md gap 12),
-// reused on a later run against unchanged source instead of re-executing
+// persistent JSON-Lines cache of mutant verdicts, reused on a later run
+// against unchanged source instead of re-executing
 // `go test` for every mutant that already has a trustworthy cached
 // verdict. Empty/absent means disabled, mirroring every other opt-in
 // feature's zero-value convention (see setTCE) — there is no meaningful
@@ -686,10 +685,9 @@ func (c *mutateConfig) setEstimate(value string) error {
 // rather than a separate mutateConfig field: caching must affect
 // mutate.Run's own internal execution (skip a mutant's `go test` on a
 // cache hit, write incrementally as verdicts are produced), not something
-// main.go can layer on after Run returns the way -mutateoutput does — see
-// ROADMAP.md gap 12b. -mutatecache combined with -mutatemutant is
-// deliberately accepted, not rejected — see ROADMAP.md gap 12f: a replay
-// still benefits from, and contributes to, the cache.
+// main.go can layer on after Run returns the way -mutateoutput does.
+// -mutatecache combined with -mutatemutant is deliberately accepted, not
+// rejected: a replay still benefits from, and contributes to, the cache.
 func (c *mutateConfig) setCache(value string) error {
 	if value == "" {
 		return fmt.Errorf("turango: -%s= requires a directory", flagCache)

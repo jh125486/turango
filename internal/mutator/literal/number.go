@@ -20,9 +20,9 @@ func init() {
 // of the roles described on shiftFloat: as a relative (0.1%) multiplier of
 // the literal's own value, and — when that multiplication degenerates to
 // zero, i.e. the literal itself is `0` — as the absolute fallback delta.
-// 0.1% was chosen empirically (see the gap-10 investigation in ROADMAP.md)
-// to land the shifted value's first differing digit within the ~6
-// significant digits go/constant's Value.String keeps for float rendering
+// 0.1% was chosen empirically to land the shifted value's first differing
+// digit within the ~6 significant digits go/constant's Value.String keeps
+// for float rendering
 // (see shiftFloat), so the mutant reliably differs from the original in
 // its printed form, while still being close enough to read as a boundary-
 // adjacent nudge rather than the wild swing a flat "+1" would be on a
@@ -121,8 +121,8 @@ func shiftInt(lit *ast.BasicLit, val constant.Value, op token.Token) mutator.Mut
 // the direction op names.
 //
 // Two things differ from the integer case, both confirmed empirically
-// while building this operator (see ROADMAP.md's gap-10 writeup) rather
-// than assumed from go/constant's docs alone:
+// while building this operator rather than assumed from go/constant's
+// docs alone:
 //
 //  1. Magnitude. Reusing the integer path's flat "+1" on a float produces
 //     an uninteresting mutant — `0.95` -> `1.95` is nowhere near the

@@ -469,8 +469,7 @@ type PackageEstimate struct {
 	// package — the same walk that would populate [Result.Mutants], just
 	// never executed. Equivalent to how many of them Trivial Compiler
 	// Equivalence might filter (see [EstimateResult.TCE]): this count is
-	// the raw total regardless of TCE, deliberately — see ROADMAP.md gap
-	// 11d.
+	// the raw total regardless of TCE, deliberately.
 	Mutants int
 
 	// Baseline is one sample of how long this package's own tests take to
@@ -478,7 +477,7 @@ type PackageEstimate struct {
 	// [ScopePackage]/[ScopeImpact], this package's own `go test` pattern;
 	// under [ScopeFull], the whole module's baseline (identical across
 	// every package, since every mutant really does run `go test ./...`
-	// under that scope — see ROADMAP.md gap 11b). A single sample, not
+	// under that scope). A single sample, not
 	// [baselineRuns]' three-run average, so treat it as rough, not
 	// authoritative — see [EstimateResult]'s own doc comment.
 	Baseline time.Duration
@@ -492,7 +491,7 @@ type PackageEstimate struct {
 // anything (no `go test` ever runs against a real mutant), so
 // Status/Output — and every score/suppression/equivalent computation built
 // on them — would be fields nobody ever set, on mutants that never actually
-// ran. See ROADMAP.md gap 11a.
+// ran.
 //
 // Every duration here comes from a single timing sample per package, not
 // [baselineRuns]' three-run average a real run uses to derive its timeout:
@@ -520,8 +519,8 @@ type EstimateResult struct {
 	// Trivial Compiler Equivalence enabled ([Options.TCE]). It has no
 	// effect on Total or any Baseline — this estimate does not run TCE's
 	// compile-and-compare step, since that would cost real time per
-	// mutant, working directly against being a fast preview (ROADMAP.md
-	// gap 11d) — it exists only so the console/JSON output can print the
+	// mutant, working directly against being a fast preview — it exists
+	// only so the console/JSON output can print the
 	// "the real run may filter some of these and finish faster" caveat
 	// when, and only when, it is actually relevant.
 	TCE bool
@@ -542,7 +541,7 @@ type EstimateResult struct {
 	// speedup under -mutateparallel is sub-linear once CPU contention and
 	// shared GOCACHE pressure kick in — this project directly measured
 	// roughly 8 mutants/minute against a raw per-mutant cost that should
-	// have supported far more (ROADMAP.md gap 11c). Always report both
+	// have supported far more. Always report both
 	// numbers together; never present ParallelEstimate alone as if it were
 	// a confident prediction.
 	ParallelEstimate time.Duration
