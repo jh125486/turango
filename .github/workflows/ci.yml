@@ -9,6 +9,16 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # SONAR_TOKEN is exposed at job level, not just the SonarCloud step's own
+    # env:, specifically so the SonarCloud Scan step's `if:` guard below can
+    # read it as `env.SONAR_TOKEN` — the `secrets` context is not a valid
+    # expression context inside a step/job `if:` at all (actionlint and
+    # GitHub's own context-availability docs both confirm this; referencing
+    # `secrets.SONAR_TOKEN` directly in `if:` fails the whole workflow at
+    # parse time, before any job even starts, which is exactly what broke
+    # every run of this workflow until this was found and fixed).
+    env:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
     steps:
       - name: Check out code
         uses: actions/checkout@v4
@@ -96,8 +106,7 @@ jobs:
         # coverage.out directly via sonar.go.coverage.reportPaths (see
         # sonar-project.properties), so this step must run after the Test
         # step above, not standalone.
-        if: ${{ secrets.SONAR_TOKEN != '' }}
+        if: ${{ env.SONAR_TOKEN != '' }}
         uses: SonarSource/sonarcloud-github-action@v3
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
