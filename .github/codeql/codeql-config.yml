@@ -1,0 +1,14 @@
+name: turango CodeQL config
+
+# corpus/**/module/** are frozen copies of real Go stdlib source, preserved
+# byte-for-byte as historical bug-reproduction fixtures -- not this
+# project's code. Their upstream test helpers trip go/insecure-randomness
+# (math/rand used deliberately for randomized fuzz-style test inputs, not a
+# security-sensitive use) for findings this project can't act on. Excluded
+# the same way gofmt/golangci-lint/SonarCloud already exclude these frozen
+# fixtures elsewhere. `paths-ignore` is not a valid direct input on
+# codeql-action/init itself (confirmed: passing it there is silently
+# ignored, not an error) -- it only works via this external config file,
+# referenced from codeql-analysis.yml's `config-file` input.
+paths-ignore:
+  - corpus/**
