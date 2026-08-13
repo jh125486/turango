@@ -20,5 +20,10 @@
 # Go workspace file
 go.work
 
+# goreleaser's local build/dist output (see .goreleaser.yaml) -- real
+# releases build in CI via .github/workflows/release.yml; this only shows
+# up from a local `goreleaser release --snapshot` dry run.
+dist/
+
 # Claude Code local settings
 .claude/

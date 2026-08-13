@@ -1,0 +1,73 @@
+version: 2
+
+# turango is a single shim binary (cmd/turango) -- nothing else in this repo
+# needs to ship as a release artifact. This config's whole job is producing
+# that one binary for a handful of platforms, checksummed and archived, on
+# every "v*" tag push (see .github/workflows/release.yml).
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: turango
+    main: ./cmd/turango
+    binary: turango
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      # Standard goreleaser version-stamping pattern; turango doesn't
+      # currently expose a `-version` flag that reads these, but stamping
+      # them now costs nothing and means the binary's own `go version -m`
+      # metadata carries the real release version if that flag is ever
+      # added later.
+      - -s -w -X main.version={{.Version}} -X main.commit={{.Commit}} -X main.date={{.Date}}
+
+archives:
+  - id: turango
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Os }}_{{ .Arch }}
+    files:
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: checksums.txt
+
+# Conventional-commit-ish grouping for the auto-generated release notes.
+# turango's own commit history doesn't strictly follow Conventional
+# Commits, so unmatched messages fall through to the default "Others"
+# group rather than being dropped -- see the trailing catch-all regexp.
+changelog:
+  sort: asc
+  groups:
+    - title: Features
+      regexp: '^.*?(feat|feature)(\([[:word:]]+\))??!?:.+$'
+      order: 0
+    - title: "Bug fixes"
+      regexp: '^.*?fix(\([[:word:]]+\))??!?:.+$'
+      order: 1
+    - title: Others
+      order: 999
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - Merge pull request
+
+release:
+  # Draft, not auto-published: a solo maintainer reviewing generated notes
+  # before they go live is cheap insurance against a bad changelog grouping
+  # shipping unedited. Promote to a real release manually on github.com.
+  draft: true
+  name_template: "v{{ .Version }}"
