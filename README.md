@@ -9,6 +9,7 @@
 [![Tests](https://github.com/jh125486/turango/actions/workflows/ci.yml/badge.svg)](https://github.com/jh125486/turango/actions/workflows/ci.yml)
 [![CodeQL](https://github.com/jh125486/turango/actions/workflows/codeql-analysis.yml/badge.svg)](https://github.com/jh125486/turango/actions/workflows/codeql-analysis.yml)
 [![Mutation score](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/jh125486/turango/gh-pages/mutation-score.json)](https://github.com/jh125486/turango/actions/workflows/mutation-badge.yml)
+[![Mutants](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/jh125486/turango/gh-pages/mutants-count.json)](https://github.com/jh125486/turango/actions/workflows/mutation-badge.yml)
 
 [![Codecov](https://codecov.io/gh/jh125486/turango/branch/main/graph/badge.svg)](https://codecov.io/gh/jh125486/turango)
 [![Sonar Coverage](https://sonarcloud.io/api/project_badges/measure?project=jh125486_turango&metric=coverage)](https://sonarcloud.io/summary/overall?id=jh125486_turango)
