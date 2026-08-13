@@ -21,7 +21,7 @@ on:
   workflow_dispatch: {}
 
 permissions:
-  contents: write # required to push the generated badge JSON to gh-pages
+  contents: write # required to push the generated badge JSON to gh-pages via peaceiris/actions-gh-pages; cannot be downgraded to read
 
 jobs:
   mutation-score:
