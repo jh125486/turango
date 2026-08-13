@@ -32,10 +32,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          # 1.24 is the main module's own `go` directive (go.mod); the
-          # toolchain must also satisfy tools/golangci-lint/go.mod's `go
-          # 1.25.0`, which the lint step below invokes via -modfile.
-          go-version: '1.25'
+          go-version-file: go.mod
 
       - name: Build
         run: go build ./...
