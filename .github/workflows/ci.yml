@@ -71,25 +71,10 @@ jobs:
         # that lives in its own, differently-triggered workflow instead of
         # every one of these per-PR steps). Nothing else in this codebase
         # checks testing.Short(), so -short here narrows exactly one test,
-        # not a broader "skip anything slow" switch. -coverprofile feeds
-        # both the Codecov upload and SonarCloud's Go coverage import
-        # below; it's added to this step rather than a separate run so
-        # coverage doesn't cost a second full test pass.
-        run: go test -short -coverprofile=coverage.out ./...
-
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7
-        with:
-          files: ./coverage.out
-          # Codecov's own current policy is that public open-source repos on
-          # codecov.io don't need a token; this is passed anyway (empty
-          # until the secret is created) so a private-repo period, or a
-          # policy change, doesn't silently stop uploads. fail_ci_if_error
-          # keeps a missing/invalid token from failing the whole CI run —
-          # CODECOV_TOKEN is an account-linking step done at codecov.io, not
-          # something this workflow can set up on its own.
-          token: ${{ secrets.CODECOV_TOKEN }}
-          fail_ci_if_error: false
+        # not a broader "skip anything slow" switch. No -coverprofile here
+        # deliberately — see the Test (integration) step below for why
+        # coverage is collected there instead, not on this faster pass.
+        run: go test -short ./...
 
       - name: Test (race)
         run: go test -short -race ./...
@@ -105,8 +90,32 @@ jobs:
         # narrower run. -short still applies here for the same reason as
         # above — this step's job is the *other* integration tests, not
         # internal/corpus's own, much slower, TestCorpus.
-        run: go test -short -tags=integration ./...
+        #
+        # -coverprofile lives on this step, not the plain Test step above,
+        # because it's the superset run: measured directly, this repo's
+        # real coverage is ~76% under -short alone vs ~85% including the
+        # integration-tagged tests — engine.go/runner.go/cache.go all had
+        # real, substantial coverage that a -short-only profile simply
+        # never saw, which was dragging Codecov's and SonarCloud's reported
+        # percentages down by a wide, non-representative margin (confirmed
+        # by comparing go tool cover -func output between the two runs
+        # directly, not assumed).
+        run: go test -short -tags=integration -coverprofile=coverage.out ./...
         timeout-minutes: 20
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7
+        with:
+          files: ./coverage.out
+          # Codecov's own current policy is that public open-source repos on
+          # codecov.io don't need a token; this is passed anyway (empty
+          # until the secret is created) so a private-repo period, or a
+          # policy change, doesn't silently stop uploads. fail_ci_if_error
+          # keeps a missing/invalid token from failing the whole CI run —
+          # CODECOV_TOKEN is an account-linking step done at codecov.io, not
+          # something this workflow can set up on its own.
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
 
       - name: SonarCloud Scan
         # Guarded on the secret's presence (not just left to fail) so this
@@ -115,7 +124,7 @@ jobs:
         # sonar-project.properties. SonarCloud's Go analyzer reads
         # coverage.out directly via sonar.go.coverage.reportPaths (see
         # sonar-project.properties), so this step must run after the Test
-        # step above, not standalone.
+        # (integration) step above, not standalone.
         if: ${{ env.SONAR_TOKEN != '' }}
         uses: SonarSource/sonarcloud-github-action@ffc3010689be73b8e5ae0c57ce35968afd7909e8 # v5
         env:
