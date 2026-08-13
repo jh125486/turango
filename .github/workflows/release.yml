@@ -1,0 +1,45 @@
+name: Release
+
+# Tag-triggered only -- no push/pull_request trigger. Cutting a release is
+# a deliberate act (git tag vX.Y.Z && git push origin vX.Y.Z), not
+# something that should fire on every merge to main. See .goreleaser.yaml
+# for what actually gets built (cmd/turango, 3 OS x 2 arch); this workflow
+# is just the CI wiring around it.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  goreleaser:
+    runs-on: ubuntu-latest
+    permissions:
+      # write is genuinely required here, unlike this repo's other
+      # workflows: goreleaser creates a (draft, see .goreleaser.yaml's
+      # release.draft) GitHub Release and uploads the built archives/
+      # checksums to it, which needs contents: write on this job
+      # specifically.
+      contents: write
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # goreleaser's changelog generation walks commit history back to
+          # the previous tag -- a shallow clone would truncate that.
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a # v6
+        with:
+          distribution: goreleaser
+          version: latest
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
