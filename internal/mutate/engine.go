@@ -343,38 +343,19 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 		return nil, err
 	}
 
-	// Persistent verdict cache, resolved only when
-	// requested: a toolchain fingerprint, a read-only index loaded once
-	// before any worker starts (12d), and a single-consumer append-only
-	// writer opened once and closed once, right after execute() returns —
-	// mirroring exactly how sink is opened before, and closed after, the
-	// same call, just below. All three steps are fail-soft: a load/open
-	// error here just disables caching for this run entirely, the same
-	// zero-risk-to-correctness precedent loadClosures already sets for its
-	// own load failure a few lines up — a cache is always an optional
-	// speed-up over doing the real work, never something a run depends on
-	// to be correct.
-	var (
-		cache     *cacheIndex
-		store     *cacheStore
-		toolchain string
-	)
-
-	if opts.CacheDir != "" {
-		toolchain, _ = resolveToolchain(ctx, goBin)
-
-		if idx, cacheErr := loadCacheIndex(cachePath(opts.CacheDir)); cacheErr == nil {
-			cache = idx
-		}
-
-		if s, cacheErr := newCacheStore(cachePath(opts.CacheDir)); cacheErr == nil {
-			store = s
-		}
-	}
+	cache, store, toolchain := openCache(ctx, goBin, opts)
 
 	run := &runner{goBin: goBin, testTimeout: timeout, workspace: opts.Workspace, cache: cache, store: store, toolchain: toolchain}
 
-	jobs, err := plan(ctx, goBin, opts, pkgs, mutators, typedPkgs, closurePkgs, funcPattern, false)
+	jobs, err := plan(ctx, planner{
+		goBin:        goBin,
+		opts:         opts,
+		mutators:     mutators,
+		typedPkgs:    typedPkgs,
+		closurePkgs:  closurePkgs,
+		funcPattern:  funcPattern,
+		estimateOnly: false,
+	}, pkgs)
 	if err != nil {
 		return &Result{}, err
 	}
@@ -392,6 +373,37 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 	}
 
 	return sink.close(), runErr
+}
+
+// openCache resolves the run's persistent verdict cache, if requested: a
+// toolchain fingerprint, a read-only index loaded once before any worker
+// starts (12d), and a single-consumer append-only writer opened once and
+// closed once, right after execute() returns — mirroring exactly how sink
+// is opened before, and closed after, the same call in [Run]. All three
+// steps are fail-soft: a load/open error here just disables caching for
+// this run entirely, the same zero-risk-to-correctness precedent
+// loadClosures already sets for its own load failure — a cache is always
+// an optional speed-up over doing the real work, never something a run
+// depends on to be correct.
+//
+// An empty opts.CacheDir short-circuits: caching was never requested, so
+// cache and store are both nil and toolchain is never resolved.
+func openCache(ctx context.Context, goBin string, opts Options) (cache *cacheIndex, store *cacheStore, toolchain string) {
+	if opts.CacheDir == "" {
+		return nil, nil, ""
+	}
+
+	toolchain, _ = resolveToolchain(ctx, goBin)
+
+	if idx, cacheErr := loadCacheIndex(cachePath(opts.CacheDir)); cacheErr == nil {
+		cache = idx
+	}
+
+	if s, cacheErr := newCacheStore(cachePath(opts.CacheDir)); cacheErr == nil {
+		store = s
+	}
+
+	return cache, store, toolchain
 }
 
 // Estimate performs a walk-only preview of what -mutate would produce: how
@@ -479,7 +491,15 @@ func walkForEstimate(ctx context.Context, goBin string, opts Options) (estimateC
 	// ever affects how a mutant's *execution* workspace is built
 	// (runner.workspaceFor), never which mutations the walk finds, so
 	// resolving it here would cost real time for zero effect on the count.
-	jobs, err := plan(ctx, goBin, opts, pkgs, mutators, typedPkgs, nil, funcPattern, true)
+	jobs, err := plan(ctx, planner{
+		goBin:        goBin,
+		opts:         opts,
+		mutators:     mutators,
+		typedPkgs:    typedPkgs,
+		closurePkgs:  nil,
+		funcPattern:  funcPattern,
+		estimateOnly: true,
+	}, pkgs)
 	if err != nil {
 		return estimateCounts{}, err
 	}
@@ -1196,6 +1216,48 @@ type fileJob struct {
 	typedSyntax *ast.File
 }
 
+// planner carries the values every package's planning pass shares: [plan]
+// passes every field straight through, unchanged per package, to
+// [planPackage].
+type planner struct {
+	// goBin is the resolved go toolchain, threaded through to every
+	// precompute planPackage needs (coverage maps, TCE baselines, cache
+	// fingerprints).
+	goBin string
+
+	// opts is the run's own Options, consulted directly by planPackage's
+	// precomputes (Scope, TCE, CacheDir, MutantID) and by planClosure's
+	// scope check.
+	opts Options
+
+	// mutators is the run-wide operator set; planPackage rebinds a
+	// per-package copy only when typedPkgs makes that necessary (see
+	// bindMutators).
+	mutators []mutator.Mutator
+
+	// typedPkgs is non-nil only when [needsTypes] reported true for this
+	// run; it is used, per package, to bind any [mutator.TypedMutator] in
+	// mutators via [bindMutators].
+	typedPkgs map[string]*packages.Package
+
+	// closurePkgs is non-nil only when [Run] determined the run's scope is
+	// not [ScopeFull]; it is used, per package, to resolve [fileJob.closure]
+	// via [resolveClosure].
+	closurePkgs map[string][]*packages.Package
+
+	// funcPattern is the compiled [Options.FuncPattern], set identically on
+	// every job — see [fileJob.funcPattern].
+	funcPattern *regexp.Regexp
+
+	// estimateOnly is true only for [walkForEstimate]'s call: it makes
+	// planPackage skip every execution-time-only per-package precompute
+	// (ScopeImpact's coverage map, TCE's baseline compile, gap 5's
+	// dependency closure) since none of them affect which mutations the
+	// walk finds — only how a real mutant would later be executed, which
+	// [Estimate] never does.
+	estimateOnly bool
+}
+
 // plan enumerates the files to mutate and, for [ScopeImpact], builds each
 // package's coverage map before any mutant runs.
 //
@@ -1210,23 +1272,9 @@ type fileJob struct {
 // temp-workspace strategy copies a module, so there is nothing to copy for a
 // GOPATH-style or synthetic package.
 //
-// typedPkgs is non-nil only when [needsTypes] reported true for this run; it
-// is used, per package, to bind any [mutator.TypedMutator] in mutators via
-// [bindMutators].
-//
-// funcPattern is the compiled [Options.FuncPattern], set identically on every
-// job — see [fileJob.funcPattern].
-//
-// closurePkgs is non-nil only when [Run] determined the run's scope is not
-// [ScopeFull]; it is used, per package, to resolve [fileJob.closure] via
-// [resolveClosure].
-//
-// estimateOnly is true only for [walkForEstimate]'s call: it makes
-// planPackage skip every execution-time-only per-package precompute
-// (ScopeImpact's coverage map, TCE's baseline compile, gap 5's dependency
-// closure) since none of them affect which mutations the walk finds — only
-// how a real mutant would later be executed, which [Estimate] never does.
-func plan(ctx context.Context, goBin string, opts Options, pkgs []*packages.Package, mutators []mutator.Mutator, typedPkgs map[string]*packages.Package, closurePkgs map[string][]*packages.Package, funcPattern *regexp.Regexp, estimateOnly bool) ([]fileJob, error) {
+// See [planner]'s own doc comment for what p carries through to every
+// package's planPackage call.
+func plan(ctx context.Context, p planner, pkgs []*packages.Package) ([]fileJob, error) {
 	var jobs []fileJob
 
 	// fingerprintMemo caches the whole-module cache fingerprint
@@ -1239,7 +1287,7 @@ func plan(ctx context.Context, goBin string, opts Options, pkgs []*packages.Pack
 	fingerprintMemo := map[string]string{}
 
 	for _, pkg := range pkgs {
-		pkgJobs, err := planPackage(ctx, goBin, opts, pkg, mutators, typedPkgs, closurePkgs, funcPattern, estimateOnly, fingerprintMemo)
+		pkgJobs, err := planPackage(ctx, p, pkg, fingerprintMemo)
 		if err != nil {
 			return nil, err
 		}
@@ -1391,11 +1439,60 @@ func planCacheFingerprint(ctx context.Context, opts Options, moduleDir string, d
 	return cacheFingerprint(moduleDir, dirs)
 }
 
+// planPrecomputed holds planPackage's execution-time-only per-package
+// precomputes: [ScopeImpact]'s coverage map, [Options.TCE]'s baseline
+// compile, gap 5's dependency closure, and the persistent verdict cache's
+// content fingerprint (which itself folds the closure in). None of these
+// affect which mutations the walk finds — only how a real mutant would
+// later be executed — which is exactly why [planPackage] skips computing
+// them under p.estimateOnly; see [planPrecompute]'s own doc comment.
+type planPrecomputed struct {
+	scope            Scope
+	cover            *impactMap
+	tceBaseline      []byte
+	closure          map[string]bool
+	cacheFingerprint string
+}
+
+// planPrecompute resolves pkg's execution-time-only precomputes — it changes
+// how a real mutant would later be tested, never which mutations the walk
+// finds — so [Estimate]'s walk skips it entirely: computing these would cost
+// real go test/go build subprocesses for a preview whose whole point is
+// spawning none (see [walkForEstimate]'s doc comment). fingerprintMemo is
+// [plan]'s whole-module cache fingerprint memo, threaded through to
+// [planCacheFingerprint].
+func planPrecompute(ctx context.Context, p planner, pkg *packages.Package, files []string, fingerprintMemo map[string]string) (planPrecomputed, error) {
+	scope, cover, err := planScope(ctx, p.goBin, p.opts.Scope, pkg, files)
+	if err != nil {
+		return planPrecomputed{}, err
+	}
+
+	tceBaseline, err := planTCEBaseline(ctx, p.goBin, p.opts, pkg.Module.Dir, files[0])
+	if err != nil {
+		return planPrecomputed{}, err
+	}
+
+	closure := planClosure(scope, p.closurePkgs, filepath.Dir(files[0]))
+
+	cacheFingerprint, err := planCacheFingerprint(ctx, p.opts, pkg.Module.Dir, closure, fingerprintMemo)
+	if err != nil {
+		return planPrecomputed{}, err
+	}
+
+	return planPrecomputed{
+		scope:            scope,
+		cover:            cover,
+		tceBaseline:      tceBaseline,
+		closure:          closure,
+		cacheFingerprint: cacheFingerprint,
+	}, nil
+}
+
 // planPackage builds pkg's file jobs, or nil if pkg has nothing mutable (no
-// module info, or no non-test .go files). See [plan] for the parameters,
+// module info, or no non-test .go files). See [planner] for p's fields,
 // including estimateOnly. fingerprintMemo is [plan]'s whole-module cache
-// fingerprint memo, threaded through to [planCacheFingerprint].
-func planPackage(ctx context.Context, goBin string, opts Options, pkg *packages.Package, mutators []mutator.Mutator, typedPkgs map[string]*packages.Package, closurePkgs map[string][]*packages.Package, funcPattern *regexp.Regexp, estimateOnly bool, fingerprintMemo map[string]string) ([]fileJob, error) {
+// fingerprint memo, threaded through to [planPrecompute].
+func planPackage(ctx context.Context, p planner, pkg *packages.Package, fingerprintMemo map[string]string) ([]fileJob, error) {
 	if pkg.Module == nil || pkg.Module.Dir == "" {
 		return nil, nil
 	}
@@ -1417,35 +1514,12 @@ func planPackage(ctx context.Context, goBin string, opts Options, pkg *packages.
 		return nil, nil
 	}
 
-	// Every precompute below is an execution-time-only concern — it changes
-	// how a real mutant would later be tested, never which mutations the
-	// walk finds — so [Estimate]'s walk skips all three: computing them
-	// would cost real go test/go build subprocesses for a preview whose
-	// whole point is spawning none (see [walkForEstimate]'s doc comment).
-	var (
-		scope            Scope
-		cover            *impactMap
-		tceBaseline      []byte
-		closure          map[string]bool
-		cacheFingerprint string
-	)
+	var pre planPrecomputed
 
-	if !estimateOnly {
+	if !p.estimateOnly {
 		var err error
 
-		scope, cover, err = planScope(ctx, goBin, opts.Scope, pkg, files)
-		if err != nil {
-			return nil, err
-		}
-
-		tceBaseline, err = planTCEBaseline(ctx, goBin, opts, pkg.Module.Dir, files[0])
-		if err != nil {
-			return nil, err
-		}
-
-		closure = planClosure(scope, closurePkgs, filepath.Dir(files[0]))
-
-		cacheFingerprint, err = planCacheFingerprint(ctx, opts, pkg.Module.Dir, closure, fingerprintMemo)
+		pre, err = planPrecompute(ctx, p, pkg, files, fingerprintMemo)
 		if err != nil {
 			return nil, err
 		}
@@ -1456,12 +1530,12 @@ func planPackage(ctx context.Context, goBin string, opts Options, pkg *packages.
 	// identical, run-wide shared slice), so only packages where a typed
 	// operator is both selected and successfully bound pay anything extra
 	// here.
-	pkgMutators := mutators
+	pkgMutators := p.mutators
 
 	var typedPkg *packages.Package
 
-	if typedPkgs != nil {
-		tp := typedPkgs[pkg.PkgPath]
+	if p.typedPkgs != nil {
+		tp := p.typedPkgs[pkg.PkgPath]
 
 		// Fail soft, per package — the same shape as the ScopeImpact
 		// demotion above: a package that failed to type-check under
@@ -1471,7 +1545,7 @@ func planPackage(ctx context.Context, goBin string, opts Options, pkg *packages.
 			typedPkg = tp
 		}
 
-		pkgMutators = bindMutators(mutators, typedPkg)
+		pkgMutators = bindMutators(p.mutators, typedPkg)
 	}
 
 	jobs := make([]fileJob, 0, len(files))
@@ -1481,15 +1555,15 @@ func planPackage(ctx context.Context, goBin string, opts Options, pkg *packages.
 			moduleDir:        pkg.Module.Dir,
 			pkgPath:          pkg.PkgPath,
 			path:             path,
-			scope:            scope,
-			cover:            cover,
+			scope:            pre.scope,
+			cover:            pre.cover,
 			mutators:         pkgMutators,
-			funcPattern:      funcPattern,
-			mutantID:         opts.MutantID,
-			tceBaseline:      tceBaseline,
-			closure:          closure,
-			cacheFingerprint: cacheFingerprint,
-			tceEnabled:       opts.TCE,
+			funcPattern:      p.funcPattern,
+			mutantID:         p.opts.MutantID,
+			tceBaseline:      pre.tceBaseline,
+			closure:          pre.closure,
+			cacheFingerprint: pre.cacheFingerprint,
+			tceEnabled:       p.opts.TCE,
 		}
 
 		if typedPkg != nil {
@@ -1649,6 +1723,16 @@ func mutateFile(ctx context.Context, run *runner, job *fileJob, sink *collector,
 	// ever needs to disambiguate collisions against itself.
 	dedup := make(idDeduper)
 
+	w := walkState{
+		run:        run,
+		job:        job,
+		relPath:    relPath,
+		suppressed: suppressed,
+		sink:       sink,
+		tally:      tally,
+		dedup:      dedup,
+	}
+
 	var walkErr error
 
 	ast.Inspect(file, func(node ast.Node) bool {
@@ -1662,7 +1746,7 @@ func mutateFile(ctx context.Context, run *runner, job *fileJob, sink *collector,
 			return false
 		}
 
-		visit, err := visitNode(ctx, run, job, relPath, suppressed, sink, tally, &spec, dedup, node)
+		visit, err := visitNode(ctx, w, &spec, node)
 		if err != nil {
 			walkErr = err
 
@@ -1746,25 +1830,57 @@ func mutantID(relPath string, line, col int, operator string, index, rank int) s
 	return hex.EncodeToString(sum[:])[:12]
 }
 
-// visitNode handles one node of mutateFile's walk: function-pattern
-// filtering, //nomutant suppression, and running every mutation every
-// applicable operator in job.mutators offers for node. It reports whether
-// ast.Inspect should descend into node's children.
-//
-// spec is the walk's shared mutant template — mutateFile's per-file fields
-// (fset, file, path, baseline, moduleDir, pkgDir, scope) are already set; this
-// function only fills in the per-node/per-mutation fields before handing a
-// copy to run.run. relPath is path relative to its module root, computed once
-// per file by the caller — see [mutantID]. dedup is that same caller's
-// [idDeduper], threaded through unchanged — see its own doc comment.
+// walkState carries the per-file state one AST walk threads through every
+// node: [mutateFile] builds one per file and passes it straight through,
+// unchanged, from [visitNode] to [visitMutations].
 //
 // Exactly one of sink/tally is non-nil (see [execute]'s doc comment). sink
 // is nil-checked before every use, since a suppression can be found — and
 // reported, in a real run — regardless of which mode this is; tally being
 // non-nil is what actually makes this an [Estimate] walk rather than a real
-// one: the branch just above run.run below tallies the mutation and moves
-// on, never touching run (which the estimate path never even constructs).
-func visitNode(ctx context.Context, run *runner, job *fileJob, relPath string, suppressed suppressions, sink *collector, tally *estimateTally, spec *mutant, dedup idDeduper, node ast.Node) (bool, error) {
+// one: the branch just above run.run in visitMutations tallies the mutation
+// and moves on, never touching run (which the estimate path never even
+// constructs).
+type walkState struct {
+	// run classifies a mutant via run.run in a real run; nil for an
+	// [Estimate] walk, which never touches it.
+	run *runner
+
+	// job is this file's [fileJob]: its mutators, funcPattern, mutantID and
+	// per-package precomputes are all consulted while walking.
+	job *fileJob
+
+	// relPath is job.path relative to its module root, computed once per
+	// file by [mutateFile] — see [mutantID].
+	relPath string
+
+	// suppressed is this file's //nomutant directives, scanned once per
+	// file by [mutateFile].
+	suppressed suppressions
+
+	// sink records a real run's verdicts and suppressions; nil for an
+	// [Estimate] walk.
+	sink *collector
+
+	// tally records an [Estimate] walk's per-package mutation counts; nil
+	// for a real run.
+	tally *estimateTally
+
+	// dedup is this file's own [idDeduper], threaded through unchanged —
+	// see its own doc comment.
+	dedup idDeduper
+}
+
+// visitNode handles one node of mutateFile's walk: function-pattern
+// filtering, //nomutant suppression, and running every mutation every
+// applicable operator in w.job.mutators offers for node. It reports whether
+// ast.Inspect should descend into node's children.
+//
+// spec is the walk's shared mutant template — mutateFile's per-file fields
+// (fset, file, path, baseline, moduleDir, pkgDir, scope) are already set; this
+// function only fills in the per-node/per-mutation fields before handing a
+// copy to run.run.
+func visitNode(ctx context.Context, w walkState, spec *mutant, node ast.Node) (bool, error) {
 	// Returning false here skips this function's body entirely, the same
 	// cascade mechanism suppression uses below — a function whose name does
 	// not match FuncPattern (and everything nested inside it) is simply
@@ -1773,11 +1889,11 @@ func visitNode(ctx context.Context, run *runner, job *fileJob, relPath string, s
 	// and so are never filtered by this check at all — there is no function
 	// name for the pattern to match against them.
 	//
-	// job.funcPattern is nil for any fileJob built without going through
+	// w.job.funcPattern is nil for any fileJob built without going through
 	// plan() (a directly-constructed test fixture, say); nil is treated the
 	// same as an empty, always-matching pattern rather than a panic,
 	// consistent with FuncPattern's own "empty means everything" zero value.
-	if fn, ok := node.(*ast.FuncDecl); ok && job.funcPattern != nil && !job.funcPattern.MatchString(fn.Name.Name) {
+	if fn, ok := node.(*ast.FuncDecl); ok && w.job.funcPattern != nil && !w.job.funcPattern.MatchString(fn.Name.Name) {
 		return false, nil
 	}
 
@@ -1785,9 +1901,9 @@ func visitNode(ctx context.Context, run *runner, job *fileJob, relPath string, s
 	// node's children but carries on with its siblings, so a directive on a
 	// compound statement covers everything nested inside it without the walk
 	// having to carry any "am I inside a suppressed subtree" state.
-	if reason, ok := suppressed.anchored(spec.fset, node); ok {
-		if sink != nil {
-			sink.suppression(SuppressionResult{
+	if reason, ok := w.suppressed.anchored(spec.fset, node); ok {
+		if w.sink != nil {
+			w.sink.suppression(SuppressionResult{
 				File:   spec.path,
 				Line:   spec.fset.Position(node.Pos()).Line,
 				Reason: reason,
@@ -1797,12 +1913,12 @@ func visitNode(ctx context.Context, run *runner, job *fileJob, relPath string, s
 		return false, nil
 	}
 
-	for _, m := range job.mutators {
+	for _, m := range w.job.mutators {
 		if !m.Applies(node) {
 			continue
 		}
 
-		if err := visitMutations(ctx, run, job, relPath, sink, tally, spec, dedup, m, node); err != nil {
+		if err := visitMutations(ctx, w, spec, m, node); err != nil {
 			return false, err
 		}
 	}
@@ -1811,15 +1927,12 @@ func visitNode(ctx context.Context, run *runner, job *fileJob, relPath string, s
 }
 
 // visitMutations runs every mutation m offers for node — either tallying it
-// ([Estimate]'s walk, when tally is non-nil) or classifying it via
+// ([Estimate]'s walk, when w.tally is non-nil) or classifying it via
 // run.run (a real run) — recording the per-node bookkeeping (operator,
 // line, covering) every one of m's mutations shares. Split out of
 // [visitNode] purely to keep that function's own branching manageable; the
-// split changes nothing about behaviour, only where it's written. dedup is
-// [visitNode]'s own [idDeduper], threaded through to disambiguate a mutantID
-// collision on a left-associative binary chain — see idDeduper's doc
-// comment.
-func visitMutations(ctx context.Context, run *runner, job *fileJob, relPath string, sink *collector, tally *estimateTally, spec *mutant, dedup idDeduper, m mutator.Mutator, node ast.Node) error {
+// split changes nothing about behaviour, only where it's written.
+func visitMutations(ctx context.Context, w walkState, spec *mutant, m mutator.Mutator, node ast.Node) error {
 	pos := spec.fset.Position(node.Pos())
 
 	spec.operator = m.Name()
@@ -1830,7 +1943,7 @@ func visitMutations(ctx context.Context, run *runner, job *fileJob, relPath stri
 	// Looked up per node rather than per mutant: every mutation of a node
 	// shares its line, and the map is only consulted at all under
 	// ScopeImpact (covering reports nil for a nil map).
-	spec.covering = job.cover.covering(spec.path, spec.line)
+	spec.covering = w.job.cover.covering(spec.path, spec.line)
 
 	for i, mutation := range m.Mutate(node) {
 		if err := ctx.Err(); err != nil {
@@ -1838,13 +1951,13 @@ func visitMutations(ctx context.Context, run *runner, job *fileJob, relPath stri
 		}
 
 		spec.mutation = mutation
-		spec.id = mutantID(relPath, pos.Line, pos.Column, spec.operator, i, dedup.rank(pos.Line, pos.Column, spec.operator, i))
+		spec.id = mutantID(w.relPath, pos.Line, pos.Column, spec.operator, i, w.dedup.rank(pos.Line, pos.Column, spec.operator, i))
 
-		// job.mutantID replays exactly one mutant (see [Options.MutantID]):
+		// w.job.mutantID replays exactly one mutant (see [Options.MutantID]):
 		// the walk still reaches every node and computes every ID — that
 		// part is cheap — but only a matching mutation is ever handed to
 		// the runner.
-		if job.mutantID != "" && spec.id != job.mutantID {
+		if w.job.mutantID != "" && spec.id != w.job.mutantID {
 			continue
 		}
 
@@ -1853,22 +1966,22 @@ func visitMutations(ctx context.Context, run *runner, job *fileJob, relPath stri
 		// ever calling run.run — the one branch that makes this whole
 		// walk a preview rather than a run. run is never touched here;
 		// walkForEstimate never even constructs one.
-		if tally != nil {
-			tally.count(job.pkgPath, spec.moduleDir, spec.pkgDir)
+		if w.tally != nil {
+			w.tally.count(w.job.pkgPath, spec.moduleDir, spec.pkgDir)
 
 			continue
 		}
 
-		res, ok, equivalent, err := run.run(ctx, *spec)
+		res, ok, equivalent, err := w.run.run(ctx, *spec)
 		if err != nil {
 			return err
 		}
 
 		switch {
 		case ok:
-			sink.mutant(res)
+			w.sink.mutant(res)
 		case equivalent:
-			sink.equivalent(EquivalentResult{
+			w.sink.equivalent(EquivalentResult{
 				File:        res.File,
 				Line:        res.Line,
 				Operator:    res.Operator,

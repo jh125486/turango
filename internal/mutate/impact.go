@@ -142,27 +142,32 @@ func (m *impactMap) merge(profilePath, testName string, goFiles []string) error 
 			continue
 		}
 
-		byLine := m.lines[file]
-		if byLine == nil {
-			byLine = make(map[int][]string)
-			m.lines[file] = byLine
-		}
-
-		for _, block := range profile.Blocks {
-			// Count is the number of times the block ran. Zero means this test
-			// compiled the line and never executed it, which is exactly the
-			// case impact scope is here to skip.
-			if block.Count == 0 {
-				continue
-			}
-
-			for line := block.StartLine; line <= block.EndLine; line++ {
-				byLine[line] = appendTest(byLine[line], testName)
-			}
-		}
+		m.mergeBlocks(file, testName, profile.Blocks)
 	}
 
 	return nil
+}
+
+// mergeBlocks folds one profile's blocks for one file into the map.
+func (m *impactMap) mergeBlocks(file, testName string, blocks []cover.ProfileBlock) {
+	byLine := m.lines[file]
+	if byLine == nil {
+		byLine = make(map[int][]string)
+		m.lines[file] = byLine
+	}
+
+	for _, block := range blocks {
+		// Count is the number of times the block ran. Zero means this test
+		// compiled the line and never executed it, which is exactly the
+		// case impact scope is here to skip.
+		if block.Count == 0 {
+			continue
+		}
+
+		for line := block.StartLine; line <= block.EndLine; line++ {
+			byLine[line] = appendTest(byLine[line], testName)
+		}
+	}
 }
 
 // appendTest adds name to tests unless it is already the most recent entry.

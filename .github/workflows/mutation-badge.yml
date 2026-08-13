@@ -29,10 +29,10 @@ jobs:
     timeout-minutes: 150
     steps:
       - name: Check out code
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Set up Go
-        uses: actions/setup-go@v7
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
 
@@ -46,7 +46,7 @@ jobs:
       # and a real source edit invalidates only the mutants it affects, not
       # the whole run.
       - name: Restore mutation verdict cache
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: mutation-cache
           key: mutation-cache-${{ hashFiles('cmd/turango/**.go', 'internal/mutate/**.go', 'internal/mutator/**.go') }}
@@ -121,7 +121,7 @@ jobs:
         # keep_files: true so this workflow only ever touches its own
         # badges/ directory and never wipes out anything else later added
         # to gh-pages.
-        uses: peaceiris/actions-gh-pages@v4
+        uses: peaceiris/actions-gh-pages@84c30a85c19949d7eee79c4ff27748b70285e453 # v4
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: ./badges

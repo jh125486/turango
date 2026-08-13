@@ -154,7 +154,7 @@ func TestRunCacheScopeInteraction(t *testing.T) {
 		t.Fatalf("Run() (ScopePackage) error = %v", err)
 	}
 
-	if after := execCalls.Load(); after <= before {
+	if execCalls.Load() <= before {
 		t.Error("Run() (ScopePackage) spawned no go test subprocess: a ScopeFull-cached verdict was wrongly served under ScopePackage")
 	}
 }
@@ -199,7 +199,7 @@ func TestRunCacheTCEInteraction(t *testing.T) {
 		t.Fatalf("Run() (TCE=false) error = %v", err)
 	}
 
-	if after := execCalls.Load(); after <= before {
+	if execCalls.Load() <= before {
 		t.Error("Run() (TCE=false) spawned no go test/go build subprocess: an Equivalent-cached verdict from the TCE=true run was wrongly served under TCE=false")
 	}
 
@@ -218,9 +218,17 @@ func TestRunCacheTCEInteraction(t *testing.T) {
 // run, so serving it a cached verdict would defeat its whole purpose), but
 // its freshly-confirmed verdict is still written through afterward,
 // benefiting a later normal run's cache hit rate.
+//
+// Deliberately not t.Parallel(): its third Run() call needs its own
+// execCalls delta to be exactly zero, the same process-wide-counter
+// requirement TestRunCacheResumeIsFree's own comment gives — this test also
+// asserts an exact-zero delta (see below), so it needs the same isolation.
+// This test originally shipped with t.Parallel() set despite having the
+// same shape, which surfaced as a real CI-only flake: on a low-core-count
+// runner, ~15 other t.Parallel() tests in this file queue through few
+// concurrent slots, widening the window for a sibling's subprocess spawn to
+// land between this test's own Run() calls and inflate the shared counter.
 func TestRunCacheMutantReplayInteraction(t *testing.T) {
-	t.Parallel()
-
 	root := fixtureModule(t)
 	cacheDir := t.TempDir()
 

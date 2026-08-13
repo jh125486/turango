@@ -208,20 +208,19 @@ func (c *constSwap) candidates(obj *types.Const) []*types.Const {
 	return out
 }
 
-// buildGroups walks every file reachable through info.Scopes (the *ast.File
-// keys types.Config.Check always populates one for, per file) and groups
-// every package-level constant it finds by its declaration: constants in the
-// same parenthesized const ( ... ) block share a group keyed by that
-// *ast.GenDecl; a constant declared on its own is grouped with the other
-// constants of its file, keyed by the *ast.File.
+// eachPackageConst visits every package-level constant reachable through
+// info.Scopes (the *ast.File keys types.Config.Check always populates one
+// for, per file) and calls yield once per constant found, passing the
+// declaring *ast.File, the declaring *ast.GenDecl, and the resolved
+// *types.Const together — the shared four-deep walk (files -> const decls
+// -> specs -> names) [buildGroups] and [constsByFile] both need, so a caller
+// can key on either block-or-file granularity ([buildGroups]) or file
+// granularity alone ([constsByFile]) without re-walking the tree itself.
 //
-// This is how the operator learns block/file grouping without WithScope being
-// handed a syntax tree directly: info.Scopes' keys are themselves AST nodes,
-// which is enough to walk from.
-func buildGroups(info *types.Info) map[*types.Const][]*types.Const {
-	members := map[ast.Node][]*types.Const{}
-	keyOf := map[*types.Const]ast.Node{}
-
+// This is how the operator learns block/file grouping without WithScope
+// being handed a syntax tree directly: info.Scopes' keys are themselves AST
+// nodes, which is enough to walk from.
+func eachPackageConst(info *types.Info, yield func(file *ast.File, gen *ast.GenDecl, obj *types.Const)) {
 	for node := range info.Scopes {
 		file, ok := node.(*ast.File)
 		if !ok {
@@ -232,11 +231,6 @@ func buildGroups(info *types.Info) map[*types.Const][]*types.Const {
 			gen, ok := decl.(*ast.GenDecl)
 			if !ok || gen.Tok != token.CONST {
 				continue
-			}
-
-			var key ast.Node = file
-			if gen.Lparen.IsValid() {
-				key = gen
 			}
 
 			for _, spec := range gen.Specs {
@@ -251,12 +245,31 @@ func buildGroups(info *types.Info) map[*types.Const][]*types.Const {
 						continue
 					}
 
-					members[key] = append(members[key], obj)
-					keyOf[obj] = key
+					yield(file, gen, obj)
 				}
 			}
 		}
 	}
+}
+
+// buildGroups groups every package-level constant, visited via
+// [eachPackageConst], by its declaration: constants in the same
+// parenthesized const ( ... ) block share a group keyed by that
+// *ast.GenDecl; a constant declared on its own is grouped with the other
+// constants of its file, keyed by the *ast.File.
+func buildGroups(info *types.Info) map[*types.Const][]*types.Const {
+	members := map[ast.Node][]*types.Const{}
+	keyOf := map[*types.Const]ast.Node{}
+
+	eachPackageConst(info, func(file *ast.File, gen *ast.GenDecl, obj *types.Const) {
+		var key ast.Node = file
+		if gen.Lparen.IsValid() {
+			key = gen
+		}
+
+		members[key] = append(members[key], obj)
+		keyOf[obj] = key
+	})
 
 	groups := make(map[*types.Const][]*types.Const, len(keyOf))
 
@@ -552,43 +565,23 @@ func localVarUse(info *types.Info, pkg *types.Package, expr ast.Expr) (*ast.Iden
 	return ident, v, true
 }
 
-// constsByFile groups every package-level constant declared in any file
-// reachable through info.Scopes (the same *ast.File-keyed walk
-// [buildGroups] uses for v1, minus the block-vs-file distinction v1 needs
-// and this operator does not — see [localConstSwap]'s doc for why file
-// alone is the right granularity here), keyed by the declaring *ast.File
-// and sorted by name within each file for a deterministic Mutate order.
+// constsByFile groups every package-level constant, visited via
+// [eachPackageConst] (the same walk [buildGroups] uses for v1, minus the
+// block-vs-file distinction v1 needs and this operator does not — see
+// [localConstSwap]'s doc for why file alone is the right granularity here),
+// keyed by the declaring *ast.File and sorted by name within each file for a
+// deterministic Mutate order.
 func constsByFile(info *types.Info) map[*ast.File][]*types.Const {
 	out := map[*ast.File][]*types.Const{}
 
-	for node := range info.Scopes {
-		file, ok := node.(*ast.File)
-		if !ok {
-			continue
-		}
-
-		for _, decl := range file.Decls {
-			gen, ok := decl.(*ast.GenDecl)
-			if !ok || gen.Tok != token.CONST {
-				continue
-			}
-
-			for _, spec := range gen.Specs {
-				val, ok := spec.(*ast.ValueSpec)
-				if !ok {
-					continue
-				}
-
-				for _, name := range val.Names {
-					if c, ok := info.Defs[name].(*types.Const); ok {
-						out[file] = append(out[file], c)
-					}
-				}
-			}
-		}
-	}
+	eachPackageConst(info, func(file *ast.File, _ *ast.GenDecl, obj *types.Const) {
+		out[file] = append(out[file], obj)
+	})
 
 	for file := range out {
+		// Sorted by name for a deterministic Mutate order: out[file] is
+		// built from a map iteration over info.Scopes, whose order is not
+		// stable across runs.
 		sort.Slice(out[file], func(i, j int) bool {
 			return out[file][i].Name() < out[file][j].Name()
 		})

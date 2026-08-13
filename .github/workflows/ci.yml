@@ -21,7 +21,14 @@ jobs:
       SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
     steps:
       - name: Check out code
-        uses: actions/checkout@v7
+        # Actions below are pinned to full commit SHAs, not tags: a tag can be
+        # re-pointed (deliberately, by a re-tag, or maliciously, by a
+        # compromised release) to run different code than what was reviewed,
+        # while a SHA can't. The trailing `# vN` comment is only for humans —
+        # it's what Dependabot's github-actions ecosystem (see
+        # .github/dependabot.yml, already configured weekly) reads and
+        # rewrites when it bumps a pin to a new SHA.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           # Full history, not just the checked-out commit: SonarCloud's
           # scan step below uses it for blame/new-code-period analysis
@@ -30,7 +37,7 @@ jobs:
           fetch-depth: 0
 
       - name: Set up Go
-        uses: actions/setup-go@v7
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
 
@@ -71,7 +78,7 @@ jobs:
         run: go test -short -coverprofile=coverage.out ./...
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v7
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7
         with:
           files: ./coverage.out
           # Codecov's own current policy is that public open-source repos on
@@ -110,6 +117,6 @@ jobs:
         # sonar-project.properties), so this step must run after the Test
         # step above, not standalone.
         if: ${{ env.SONAR_TOKEN != '' }}
-        uses: SonarSource/sonarcloud-github-action@v5
+        uses: SonarSource/sonarcloud-github-action@ffc3010689be73b8e5ae0c57ce35968afd7909e8 # v5
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

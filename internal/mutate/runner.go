@@ -699,6 +699,18 @@ func classify(stdout, stderr []byte) (status Status, output string) {
 // signals classify needs: whether any test ran, whether a test or the
 // package failed, whether the build itself failed, and the reconstructed
 // plain-text output.
+// decodeTestEvent decodes line as one `go test -json` event. ok is false
+// when line doesn't start with `{` or fails to unmarshal, meaning it's not
+// an event at all — the caller's cue to fall back to its raw-passthrough
+// handling instead.
+func decodeTestEvent(line string) (ev testEvent, ok bool) {
+	if !strings.HasPrefix(line, "{") || json.Unmarshal([]byte(line), &ev) != nil {
+		return testEvent{}, false
+	}
+
+	return ev, true
+}
+
 func parseTestEvents(stdout []byte) (sawTest, testFailed, pkgFailed, buildFail bool, out string) {
 	var text, raw strings.Builder
 
@@ -707,8 +719,8 @@ func parseTestEvents(stdout []byte) (sawTest, testFailed, pkgFailed, buildFail b
 			continue
 		}
 
-		var ev testEvent
-		if !strings.HasPrefix(line, "{") || json.Unmarshal([]byte(line), &ev) != nil {
+		ev, ok := decodeTestEvent(line)
+		if !ok {
 			// Not an event: some toolchains interleave raw build diagnostics
 			// into stdout. Keep it as output and let the compile-error check
 			// see it.
@@ -818,6 +830,9 @@ func (r *runner) workspaceFor(ctx context.Context, tmp, moduleDir string, dirs m
 	if dirs != nil {
 		root, err = copyClosure(tmp, moduleDir, dirs)
 
+		// copyClosure writes only inside tmp, which the caller removes
+		// wholesale — see this func's own doc comment on why only
+		// copyWorktree's cleanup below has real work to do.
 		return root, func() {}, err
 	}
 
@@ -829,6 +844,8 @@ func (r *runner) workspaceFor(ctx context.Context, tmp, moduleDir string, dirs m
 
 	root, err = copyModule(tmp, moduleDir)
 
+	// Same asymmetry as the copyClosure branch above, and for the same
+	// reason — see this func's own doc comment.
 	return root, func() {}, err
 }
 
@@ -979,64 +996,81 @@ func gitWorktreeClean(ctx context.Context, repoRoot string) bool {
 // since ScopeFull's correctness depends on the *reverse* closure (every
 // package that could call into the target) — something a forward closure
 // says nothing about.
+// closureWalk holds the state of one [closureDirs] recursion — hoisted out
+// of closureDirs itself into a named type purely so its early returns don't
+// each pay for an extra nesting level of closure capture; see closureDirs'
+// own doc comment for what the walk means and why ok can be false.
+type closureWalk struct {
+	moduleDir string
+	dirs      map[string]bool
+	seen      map[string]bool
+	safe      bool
+}
+
+// visit walks p and its same-module imports, populating w.dirs and clearing
+// w.safe the moment the closure can no longer be trusted. Every early
+// return below has its own reason — see [closureDirs]' doc comment for the
+// ok==false cases these correspond to.
+func (w *closureWalk) visit(p *packages.Package) {
+	if p == nil || w.seen[p.PkgPath] || !w.safe {
+		return
+	}
+
+	w.seen[p.PkgPath] = true
+
+	if len(p.Errors) > 0 {
+		w.safe = false
+
+		return
+	}
+
+	if p.Module == nil || p.Module.Dir != w.moduleDir {
+		return // resolves from the module cache, nothing to copy
+	}
+
+	files := p.GoFiles
+	if len(files) == 0 {
+		files = p.CompiledGoFiles
+	}
+
+	if len(files) == 0 {
+		w.safe = false // can't even determine this package's directory
+
+		return
+	}
+
+	w.dirs[filepath.Dir(files[0])] = true
+
+	if hasEmbedDirective(files) {
+		w.safe = false
+
+		return
+	}
+
+	for _, imp := range p.Imports {
+		w.visit(imp)
+	}
+}
+
 func closureDirs(pkg *packages.Package) (dirs map[string]bool, ok bool) {
 	if pkg.Module == nil || pkg.Module.Dir == "" {
 		return nil, false
 	}
 
-	dirs = map[string]bool{}
-	seen := map[string]bool{}
-	safe := true
-
-	var walk func(p *packages.Package)
-	walk = func(p *packages.Package) {
-		if p == nil || seen[p.PkgPath] || !safe {
-			return
-		}
-
-		seen[p.PkgPath] = true
-
-		if len(p.Errors) > 0 {
-			safe = false
-
-			return
-		}
-
-		if p.Module == nil || p.Module.Dir != pkg.Module.Dir {
-			return // resolves from the module cache, nothing to copy
-		}
-
-		files := p.GoFiles
-		if len(files) == 0 {
-			files = p.CompiledGoFiles
-		}
-
-		if len(files) == 0 {
-			safe = false // can't even determine this package's directory
-
-			return
-		}
-
-		dirs[filepath.Dir(files[0])] = true
-
-		if hasEmbedDirective(files) {
-			safe = false
-
-			return
-		}
-
-		for _, imp := range p.Imports {
-			walk(imp)
-		}
+	w := &closureWalk{
+		moduleDir: pkg.Module.Dir,
+		dirs:      map[string]bool{},
+		seen:      map[string]bool{},
+		safe:      true,
 	}
 
-	walk(pkg)
+	w.visit(pkg)
 
-	if !safe {
+	if !w.safe {
 		return nil, false
 	}
 
-	return dirs, true
+	return w.dirs, true
 }
 
 // hasEmbedDirective reports whether any file in files contains a
@@ -1218,6 +1252,23 @@ func copyClosure(dst, moduleDir string, dirs map[string]bool) (string, error) {
 	return newModuleDir, nil
 }
 
+// copySymlink recreates src's symlink at dst, preserving the link target
+// verbatim (never resolving or rewriting it) — shared by [copyDirFiles] and
+// [copyTree], the two places a workspace copy walks into a symlink.
+func copySymlink(src, dst string) error {
+	link, err := os.Readlink(src)
+	if err != nil {
+		return err
+	}
+
+	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
+		return err
+	}
+
+	//nolint:gosec // copying the developer's own trusted module into a temp workspace, not a multi-tenant or attacker-controlled path
+	return os.Symlink(link, dst)
+}
+
 // copyDirFiles copies every regular file, and preserves every symlink (same
 // as copyTree), directly inside src — not subdirectories — into dst.
 func copyDirFiles(src, dst string) error {
@@ -1235,17 +1286,7 @@ func copyDirFiles(src, dst string) error {
 		dstPath := filepath.Join(dst, entry.Name())
 
 		if entry.Type()&fs.ModeSymlink != 0 {
-			link, err := os.Readlink(srcPath)
-			if err != nil {
-				return err
-			}
-
-			if err := os.MkdirAll(dst, 0o700); err != nil {
-				return err
-			}
-
-			//nolint:gosec // copying the developer's own trusted module into a temp workspace, not a multi-tenant or attacker-controlled path
-			if err := os.Symlink(link, dstPath); err != nil {
+			if err := copySymlink(srcPath, dstPath); err != nil {
 				return err
 			}
 
@@ -1533,13 +1574,7 @@ func copyTree(src, dst string) error {
 			return os.MkdirAll(target, info.Mode().Perm()|0o700)
 
 		case entry.Type()&fs.ModeSymlink != 0:
-			link, err := os.Readlink(path)
-			if err != nil {
-				return err
-			}
-
-			//nolint:gosec // copying the developer's own trusted module into a temp workspace, not a multi-tenant or attacker-controlled path
-			return os.Symlink(link, target)
+			return copySymlink(path, target)
 
 		case entry.Type().IsRegular():
 			info, err := entry.Info()
