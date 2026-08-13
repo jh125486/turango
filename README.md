@@ -32,8 +32,9 @@ the mutation engine; every other invocation (`turango build ./...`,
 `turango vet ./...`, plain `turango test ./...`, ...) is forwarded verbatim
 to the real Go toolchain, unchanged.
 
-Mutation testing probes test-suite sensitivity, not just code coverage. It
-mechanically introduces small, reversible changes ("mutants") into a
+Mutation testing evaluates test-suite fault-detection effectiveness, not just
+whether code was executed. It mechanically introduces small, reversible
+changes ("mutants") into a
 package's AST — flip `+` to `-`, flip `<` to `<=`, delete a statement, empty
 an `if` body — and reruns selected tests against each one. A mutant is
 "killed" when that run fails or times out and "survives" when those tests
