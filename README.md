@@ -92,8 +92,10 @@ example, including how it affects the reported score.
 
 ### Exit codes
 
-`0` success, `1` failure/error, `2` bad usage, `3` mutation score below
-`-mutatemin`.
+- `0` success
+- `1` failure/error
+- `2` bad usage
+- `3` mutation score below `-mutatemin`
 
 ## Flag deep dives
 
