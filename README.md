@@ -1,6 +1,6 @@
 # turango
 
-![turango mascot](turango.png)
+<img src="turango.png" alt="turango mascot" width="200">
 
 *Mascot derived from the Go gopher, designed by [Renee French](https://go.dev/blog/gopher), licensed under [Creative Commons Attribution 4.0](https://creativecommons.org/licenses/by/4.0/).*
 
@@ -83,37 +83,52 @@ All of turango's own flags require the `-flag=value` form (a bare
 | `-mutateestimate=true\|false` | `false` | Preview a run instead of executing it: walk every file/node to count how many mutants would be generated, per package, then time one baseline sample per package (whole-module under `-mutatescope=full`, per-package otherwise) to extrapolate a rough serial and `-mutateparallel`-divided time estimate — both explicitly hedged, since real speedup is sub-linear under contention. No mutation is ever applied to disk and no mutant's `go test` is ever spawned to classify it. Incompatible with `-mutateoutput`/`-mutatemin`, which are rejected at parse time (nothing was classified, so there's no report to write or score to gate on). |
 | `-mutatecache=<dir>` | none | Persist every mutant's verdict to a JSON-Lines file (`mutate-cache.jsonl`) inside this directory, and reuse those verdicts on a later run against unchanged source instead of re-executing `go test` for every mutant that's already cached — the fix for losing a whole overnight sweep to a killed process or a Ctrl+C. Keyed by more than just the mutant's ID (a same-position, same-width literal/identifier edit can otherwise collide) — see "Resuming after interruption" below. Incompatible with `-mutateestimate` (nothing is classified in estimate mode, so there's no verdict to cache); compatible with `-mutatemutant` (a replay always bypasses the cache read, but its result still gets cached for later). |
 
-### Resuming after interruption: `-mutatecache`
+### Suppressing a mutant: `//nomutant`
 
-A real mutation sweep is expensive — hours, for a large module — and until
-now turango had no way to pick back up after a kill (`SIGKILL`, an OOM
-reaper, a killed CI job) or even a graceful Ctrl+C: relaunching re-ran every
-mutant from scratch, including the ones that had already finished.
+A `//nomutant` (or `//nomutant: reason`) comment above a statement excludes
+it from mutation. On a compound statement (`if`/`for`/`switch`) the
+suppression cascades into its body. See `example/README.md` for a worked
+example, including how it affects the reported score.
 
-`-mutatecache=<dir>` fixes this by writing every mutant's verdict to
-`<dir>/mutate-cache.jsonl` as soon as it's produced, and consulting that file
-before spawning a mutant's `go test` on a later run. Re-running the exact
-same command against unchanged source resumes near-instantly; editing the
-source in between invalidates exactly the entries the edit affects, no more
-and no fewer.
+### Exit codes
 
-The cache key is deliberately more than a mutant's ID. A mutant ID hashes a
-*position* — file, line, column, operator, mutation index — not the node's
-own bytes, so a same-width edit at the same position (`x + 5` → `x + 7`,
-same column) produces an identical ID for genuinely different code. Keying
-on ID alone would risk serving the first edit's verdict for the second.
-Instead, the key also folds in a content fingerprint of exactly the files
-that mutant's `go test` run actually depends on (the whole module under
-`-mutatescope=full`; just the dependency closure otherwise — reusing the
-same closure machinery `-mutateworkspace` and scope narrowing already use),
-plus `-mutatescope`, `-mutatetce`, and a toolchain identifier (`go version` +
-`GOOS`/`GOARCH`) — each closes a real way the identical mutant could
-legitimately classify differently across two runs.
+`0` success, `1` failure/error, `2` bad usage, `3` mutation score below
+`-mutatemin`.
 
-Safe to delete at any time — an empty or missing cache is just a first run,
-the same way `$GOCACHE` behaves. Not portable across machines with a
-different Go toolchain or target platform; treat it the same way you'd treat
-`$GOCACHE` itself.
+## Flag deep dives
+
+### Scope trade-offs: `-mutatescope`
+
+`full` (the default) reruns `go test ./...` for the whole module against
+every mutant — the only scope that can't miss a kill, since a package's
+behavior is frequently only asserted on by its *callers'* tests, which live
+in other packages entirely. `package` and `impact` are real speed/coverage
+trade-offs against that: `package` reruns only the mutated file's own
+package, missing a kill from a neighboring package's integration-style test;
+`impact` goes further, building a per-test coverage map once and rerunning
+only the tests that actually cover the mutated line, so a mutant on an
+uncovered line is reported as a survivor without a test run at all. Neither
+narrower scope is a strictly-safe default — that's why `full` stays the
+default rather than the fastest option winning by default, the same
+reasoning `go test` itself applies by never skipping a package's tests
+based on a coverage guess.
+
+Each mutant still needs its own throwaway copy of the target module to run
+against, and how much gets copied is scope-dependent for a hard reason, not
+just a performance tuning knob: under `package`/`impact` scope, turango
+resolves the mutated package's actual forward import closure (via
+`golang.org/x/tools/go/packages`) and copies only that — the target
+package's own directory, every same-module package it imports
+transitively, `go.mod`/`go.sum`, `vendor/` if present, and any
+`//go:embed`-referenced paths. Under `full` scope this optimization is
+provably wrong to apply: `full`'s entire reason to exist depends on the
+*reverse* closure (every package that could call into the target), which a
+forward-closure copy says nothing about — a workspace built that way, run
+under `go test ./...`, would silently only contain (and therefore only run)
+the target package's own tests, indistinguishable in outcome from
+`package` scope but still labeled `full`. So `full` always falls back to a
+full recursive module copy, unconditionally, no closure computation
+attempted — a correctness boundary, not a missed optimization.
 
 ### Filtering equivalent mutants: `-mutatetce`
 
@@ -151,6 +166,59 @@ lesson generalizes past TCE specifically: turango's knobs
 setting depends on the target codebase's own shape, not a single
 universally-right configuration — measure before enabling one against a
 different codebase.
+
+### Building each mutant's workspace: `-mutateworkspace`
+
+Every mutant runs against its own throwaway copy of the target module — the
+mutated file has to sit somewhere that isn't the real source tree, and the
+copy needs the whole module graph to resolve imports (sibling packages,
+`replace` directives, `vendor/`, `//go:embed` assets). By default (`copy`)
+that's a plain recursive filesystem copy. `-mutateworkspace=worktree` builds
+it with `git worktree add` instead: a worktree shares the repository's
+object store rather than duplicating files, so it's cheaper on a large git
+repo, and a local `replace` directive pointing at a sibling checkout already
+resolves correctly with no path rewriting needed, since a worktree is the
+same repository checked out twice.
+
+It's opt-in, not a smarter default, because it has a real precondition a
+filesystem copy doesn't: `git worktree add` checks out `HEAD`, the last
+*commit*, never the on-disk working copy. Requesting `worktree` against a
+target with any uncommitted change anywhere in the repository (not just
+under the mutated package) — or against a target that isn't a git
+repository at all — falls back to `copy` on its own, silently and safely,
+so it's never wrong to ask for it; it just doesn't always help.
+
+### Resuming after interruption: `-mutatecache`
+
+A real mutation sweep is expensive — hours, for a large module — and until
+now turango had no way to pick back up after a kill (`SIGKILL`, an OOM
+reaper, a killed CI job) or even a graceful Ctrl+C: relaunching re-ran every
+mutant from scratch, including the ones that had already finished.
+
+`-mutatecache=<dir>` fixes this by writing every mutant's verdict to
+`<dir>/mutate-cache.jsonl` as soon as it's produced, and consulting that file
+before spawning a mutant's `go test` on a later run. Re-running the exact
+same command against unchanged source resumes near-instantly; editing the
+source in between invalidates exactly the entries the edit affects, no more
+and no fewer.
+
+The cache key is deliberately more than a mutant's ID. A mutant ID hashes a
+*position* — file, line, column, operator, mutation index — not the node's
+own bytes, so a same-width edit at the same position (`x + 5` → `x + 7`,
+same column) produces an identical ID for genuinely different code. Keying
+on ID alone would risk serving the first edit's verdict for the second.
+Instead, the key also folds in a content fingerprint of exactly the files
+that mutant's `go test` run actually depends on (the whole module under
+`-mutatescope=full`; just the dependency closure otherwise — reusing the
+same closure machinery `-mutateworkspace` and scope narrowing already use),
+plus `-mutatescope`, `-mutatetce`, and a toolchain identifier (`go version` +
+`GOOS`/`GOARCH`) — each closes a real way the identical mutant could
+legitimately classify differently across two runs.
+
+Safe to delete at any time — an empty or missing cache is just a first run,
+the same way `$GOCACHE` behaves. Not portable across machines with a
+different Go toolchain or target platform; treat it the same way you'd treat
+`$GOCACHE` itself.
 
 ### Before/after source in the JSON report
 
@@ -192,72 +260,6 @@ turango test -mutatemutant=a1b2c3d4e5f6 -mutate=. ./pkg/...
 `-mutate` still needs a value (it's a required regexp, not optional);
 `-mutatemutant` narrows further to one exact mutant once mutation mode is
 already active.
-
-### Building each mutant's workspace: `-mutateworkspace`
-
-Every mutant runs against its own throwaway copy of the target module — the
-mutated file has to sit somewhere that isn't the real source tree, and the
-copy needs the whole module graph to resolve imports (sibling packages,
-`replace` directives, `vendor/`, `//go:embed` assets). By default (`copy`)
-that's a plain recursive filesystem copy. `-mutateworkspace=worktree` builds
-it with `git worktree add` instead: a worktree shares the repository's
-object store rather than duplicating files, so it's cheaper on a large git
-repo, and a local `replace` directive pointing at a sibling checkout already
-resolves correctly with no path rewriting needed, since a worktree is the
-same repository checked out twice.
-
-It's opt-in, not a smarter default, because it has a real precondition a
-filesystem copy doesn't: `git worktree add` checks out `HEAD`, the last
-*commit*, never the on-disk working copy. Requesting `worktree` against a
-target with any uncommitted change anywhere in the repository (not just
-under the mutated package) — or against a target that isn't a git
-repository at all — falls back to `copy` on its own, silently and safely,
-so it's never wrong to ask for it; it just doesn't always help.
-
-### Scope trade-offs: `-mutatescope`
-
-`full` (the default) reruns `go test ./...` for the whole module against
-every mutant — the only scope that can't miss a kill, since a package's
-behavior is frequently only asserted on by its *callers'* tests, which live
-in other packages entirely. `package` and `impact` are real speed/coverage
-trade-offs against that: `package` reruns only the mutated file's own
-package, missing a kill from a neighboring package's integration-style test;
-`impact` goes further, building a per-test coverage map once and rerunning
-only the tests that actually cover the mutated line, so a mutant on an
-uncovered line is reported as a survivor without a test run at all. Neither
-narrower scope is a strictly-safe default — that's why `full` stays the
-default rather than the fastest option winning by default, the same
-reasoning `go test` itself applies by never skipping a package's tests
-based on a coverage guess.
-
-Each mutant still needs its own throwaway copy of the target module to run
-against, and how much gets copied is scope-dependent for a hard reason, not
-just a performance tuning knob: under `package`/`impact` scope, turango
-resolves the mutated package's actual forward import closure (via
-`golang.org/x/tools/go/packages`) and copies only that — the target
-package's own directory, every same-module package it imports
-transitively, `go.mod`/`go.sum`, `vendor/` if present, and any
-`//go:embed`-referenced paths. Under `full` scope this optimization is
-provably wrong to apply: `full`'s entire reason to exist depends on the
-*reverse* closure (every package that could call into the target), which a
-forward-closure copy says nothing about — a workspace built that way, run
-under `go test ./...`, would silently only contain (and therefore only run)
-the target package's own tests, indistinguishable in outcome from
-`package` scope but still labeled `full`. So `full` always falls back to a
-full recursive module copy, unconditionally, no closure computation
-attempted — a correctness boundary, not a missed optimization.
-
-### Suppressing a mutant: `//nomutant`
-
-A `//nomutant` (or `//nomutant: reason`) comment above a statement excludes
-it from mutation. On a compound statement (`if`/`for`/`switch`) the
-suppression cascades into its body. See `example/README.md` for a worked
-example, including how it affects the reported score.
-
-### Exit codes
-
-`0` success, `1` failure/error, `2` bad usage, `3` mutation score below
-`-mutatemin`.
 
 ## Mutation operators
 
