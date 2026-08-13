@@ -8,6 +8,7 @@
 [![Tests](https://github.com/jh125486/turango/actions/workflows/ci.yml/badge.svg)](https://github.com/jh125486/turango/actions/workflows/ci.yml)
 [![CodeQL](https://github.com/jh125486/turango/actions/workflows/codeql-analysis.yml/badge.svg)](https://github.com/jh125486/turango/actions/workflows/codeql-analysis.yml)
 [![Codecov](https://codecov.io/gh/jh125486/turango/branch/main/graph/badge.svg)](https://codecov.io/gh/jh125486/turango)
+[![CodeFactor](https://www.codefactor.io/repository/github/jh125486/turango/badge)](https://www.codefactor.io/repository/github/jh125486/turango)
 [![Bugs](https://sonarcloud.io/api/project_badges/measure?project=jh125486_turango&metric=bugs)](https://sonarcloud.io/summary/new_code?id=jh125486_turango)
 [![Code Smells](https://sonarcloud.io/api/project_badges/measure?project=jh125486_turango&metric=code_smells)](https://sonarcloud.io/summary/new_code?id=jh125486_turango)
 [![Reliability Rating](https://sonarcloud.io/api/project_badges/measure?project=jh125486_turango&metric=reliability_rating)](https://sonarcloud.io/summary/new_code?id=jh125486_turango)
