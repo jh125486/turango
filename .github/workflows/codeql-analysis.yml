@@ -40,18 +40,28 @@ jobs:
         uses: github/codeql-action/init@5595ccaf912efad79be6eef63a5619ff05969be3 # v4
         with:
           languages: ${{ matrix.language }}
+          # build-mode: manual, not autobuild — autobuild discovers and
+          # traces every go.mod it finds anywhere in the checkout, which
+          # includes each corpus/*/module fixture's own separate module
+          # (confirmed directly: the previous attempt's autobuild log
+          # listed all 20 go.mod files in the tree and traced each one,
+          # so corpus/**'s go/insecure-randomness findings kept reappearing
+          # even with config-file's paths-ignore correctly loaded — the
+          # exclusion filters *reported results*, not what autobuild
+          # chooses to build). Manual mode runs exactly the build command
+          # below, scoped to the root module only, matching what real CI
+          # actually builds.
+          build-mode: manual
           # paths-ignore is not a valid direct input on this action (passing
           # it here is silently ignored, not an error — confirmed the hard
           # way). Path filters only work via an external config file. See
-          # .github/codeql/codeql-config.yml for why corpus/** is excluded.
+          # .github/codeql/codeql-config.yml for why corpus/** is excluded
+          # from reported results too, as a second layer alongside
+          # build-mode: manual actually keeping it unbuilt.
           config-file: ./.github/codeql/codeql-config.yml
 
-      # Go is a compiled language CodeQL's autobuild step handles natively
-      # (it shells out to `go build ./...`), so no manual build step is
-      # needed here — see github/codeql-action's own docs for this exact
-      # matrix shape.
-      - name: Autobuild
-        uses: github/codeql-action/autobuild@5595ccaf912efad79be6eef63a5619ff05969be3 # v4
+      - name: Build
+        run: go build ./...
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@5595ccaf912efad79be6eef63a5619ff05969be3 # v4
