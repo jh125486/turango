@@ -1,10 +1,10 @@
-name: Mutation score badge
+name: Mutation badges
 
 # Dogfooding: turango mutates its own core packages the same way
 # TestRunAgainstRealModule (internal/mutate/engine_integration_test.go)
 # exercises a fixture module end to end, except here it runs for real
-# against turango's own source and publishes the resulting score as a
-# shields.io badge.
+# against turango's own source and publishes resulting score and mutant
+# count as shields.io badges.
 #
 # A full sweep is expensive — see ci.yml's "Corpus regression" step comment
 # for the scale one mutant's own `go test` cycle can hit — so this runs on a
@@ -71,10 +71,11 @@ jobs:
             -mutatecache=mutation-cache \
             ./cmd/turango/... ./internal/mutate/... ./internal/mutator/...
 
-      - name: Compute mutation score
+      - name: Compute mutation metrics
         id: score
         run: |
           report=mutation-report/mutate-report.json
+          mutants=$(jq '.Mutants | length' "$report")
           killed=$(jq '[.Mutants[] | select(.Status=="killed")] | length' "$report")
           survived=$(jq '[.Mutants[] | select(.Status=="survived")] | length' "$report")
           viable=$((killed + survived))
@@ -96,12 +97,13 @@ jobs:
             else print "red";
           }')
 
+          echo "mutants=$mutants" >> "$GITHUB_OUTPUT"
           echo "killed=$killed" >> "$GITHUB_OUTPUT"
           echo "survived=$survived" >> "$GITHUB_OUTPUT"
           echo "pct=$pct" >> "$GITHUB_OUTPUT"
           echo "color=$color" >> "$GITHUB_OUTPUT"
 
-      - name: Write shields.io endpoint JSON
+      - name: Write shields.io endpoint JSON files
         run: |
           mkdir -p badges
           cat > badges/mutation-score.json <<EOF
@@ -110,6 +112,15 @@ jobs:
             "label": "mutation score",
             "message": "${{ steps.score.outputs.pct }}%",
             "color": "${{ steps.score.outputs.color }}"
+          }
+          EOF
+
+          cat > badges/mutants-count.json <<EOF
+          {
+            "schemaVersion": 1,
+            "label": "mutants",
+            "message": "${{ steps.score.outputs.mutants }}",
+            "color": "blue"
           }
           EOF
 
@@ -128,5 +139,6 @@ jobs:
           keep_files: true
           commit_message: >-
             mutation score: ${{ steps.score.outputs.pct }}%
+            across ${{ steps.score.outputs.mutants }} mutants
             (${{ steps.score.outputs.killed }} killed /
             ${{ steps.score.outputs.survived }} survived)
