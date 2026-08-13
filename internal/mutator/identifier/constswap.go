@@ -233,21 +233,33 @@ func eachPackageConst(info *types.Info, yield func(file *ast.File, gen *ast.GenD
 				continue
 			}
 
-			for _, spec := range gen.Specs {
-				val, ok := spec.(*ast.ValueSpec)
-				if !ok {
-					continue
-				}
+			yieldDeclConsts(info, file, gen, yield)
+		}
+	}
+}
 
-				for _, name := range val.Names {
-					obj, ok := info.Defs[name].(*types.Const)
-					if !ok {
-						continue
-					}
+// yieldDeclConsts is [eachPackageConst]'s inner half: given one already-
+// identified `const ( ... )` declaration, walks its ValueSpecs and names,
+// resolving each to the *types.Const info.Check populated, and yields it
+// alongside the file/decl it came from. Split out purely to keep
+// eachPackageConst's own nesting depth readable — the four-level walk
+// (files -> decls -> specs -> names) was a single function before, and
+// reads no differently split at this exact seam, just shallower per
+// function.
+func yieldDeclConsts(info *types.Info, file *ast.File, gen *ast.GenDecl, yield func(file *ast.File, gen *ast.GenDecl, obj *types.Const)) {
+	for _, spec := range gen.Specs {
+		val, ok := spec.(*ast.ValueSpec)
+		if !ok {
+			continue
+		}
 
-					yield(file, gen, obj)
-				}
+		for _, name := range val.Names {
+			obj, ok := info.Defs[name].(*types.Const)
+			if !ok {
+				continue
 			}
+
+			yield(file, gen, obj)
 		}
 	}
 }

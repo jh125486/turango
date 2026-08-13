@@ -830,10 +830,11 @@ func (r *runner) workspaceFor(ctx context.Context, tmp, moduleDir string, dirs m
 	if dirs != nil {
 		root, err = copyClosure(tmp, moduleDir, dirs)
 
-		// copyClosure writes only inside tmp, which the caller removes
-		// wholesale — see this func's own doc comment on why only
-		// copyWorktree's cleanup below has real work to do.
-		return root, func() {}, err
+		return root, func() {
+			// copyClosure writes only inside tmp, which the caller
+			// removes wholesale — see this func's own doc comment on
+			// why only copyWorktree's cleanup below has real work to do.
+		}, err
 	}
 
 	if r.workspace == WorkspaceWorktree {
@@ -844,9 +845,10 @@ func (r *runner) workspaceFor(ctx context.Context, tmp, moduleDir string, dirs m
 
 	root, err = copyModule(tmp, moduleDir)
 
-	// Same asymmetry as the copyClosure branch above, and for the same
-	// reason — see this func's own doc comment.
-	return root, func() {}, err
+	return root, func() {
+		// Same asymmetry as the copyClosure branch above, and for the
+		// same reason — see this func's own doc comment.
+	}, err
 }
 
 // copyWorktree builds a mutant's workspace with `git worktree add` instead
