@@ -40,6 +40,16 @@ jobs:
         uses: github/codeql-action/init@5595ccaf912efad79be6eef63a5619ff05969be3 # v4
         with:
           languages: ${{ matrix.language }}
+          # corpus/**/module/** are frozen copies of real Go stdlib source,
+          # preserved byte-for-byte as historical bug-reproduction fixtures —
+          # not this project's code, and their upstream test helpers trip
+          # go/insecure-randomness (math/rand used deliberately for
+          # randomized fuzz-style test inputs, not a security-sensitive use)
+          # for no findings this project can act on. Excluded the same way
+          # gofmt/golangci-lint/SonarCloud already exclude these fixtures
+          # elsewhere.
+          paths-ignore: |
+            corpus/**
 
       # Go is a compiled language CodeQL's autobuild step handles natively
       # (it shells out to `go build ./...`), so no manual build step is
