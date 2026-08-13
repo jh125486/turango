@@ -185,11 +185,12 @@ Sibling flags, mirroring how `-fuzz` has `-fuzztime`/`-fuzzminimizetime`/
 - `-mutateoutput=<dir>` — write a JSON report.
 - `-mutatemin=<float>` — non-zero exit if the resulting score falls below
   the threshold, for CI gating.
-- `-mutatetce=true|false` — Trivial Compiler Equivalence: filter a mutant
-  whose compiled output exactly matches a baseline before it reaches the
-  test suite. Off by default, and worth staying off by default for most
-  codebases — see "Costs and risks" below for a real measurement showing
-  this optimization is a net *loss* for at least one real fixture.
+- `-mutatetce=true|false` — [Trivial Compiler Equivalence][TCE] (TCE):
+  filter a mutant whose compiled output exactly matches a baseline before
+  it reaches the test suite. Off by default, and worth staying off by
+  default for most codebases — see "Costs and risks" below for a real
+  measurement showing this optimization is a net *loss* for at least one
+  real fixture.
 
 A `//nomutant` (and `//nomutant:reason`) source comment suppresses
 mutation of the annotated statement, cascading into the body of a
@@ -344,11 +345,11 @@ score threshold are all now implemented, none of them present in 2018.
   file-level parallelism, and two opt-in, correctness-preserving filters
   (TCE, dependency-closure workspace copying). It does *not* attempt
   several techniques the mutation-testing research literature treats as
-  standard for reducing cost at scale — mutant subsumption / selective
-  mutation (running a reduced, representative subset of mutants instead of
-  every one an operator offers, noted but explicitly deferred alongside
-  TCE), higher-order mutation, ML-guided mutant prioritization or kill
-  prediction, or diff-scoped incremental mutation testing keyed to what
+  standard for reducing cost at scale — [mutant subsumption][subsumption] /
+  selective mutation (running a reduced, representative subset of mutants
+  instead of every one an operator offers, noted but explicitly deferred
+  alongside TCE), higher-order mutation, ML-guided mutant prioritization or
+  kill prediction, or diff-scoped incremental mutation testing keyed to what
   actually changed rather than a whole package. None of these are built,
   and none are needed to validate this proposal's core claim: that the
   mutate-rerun-classify mechanism itself belongs in the standard toolchain
@@ -393,6 +394,9 @@ score threshold are all now implemented, none of them present in 2018.
   (`turango test -race -mutate=... ./...`), but are opt-in, untested by
   default, and unbenchmarked for the cost/detection tradeoff that implies.
 
+[TCE]: https://doi.org/10.1109/ICSE.2015.103 "Papadakis, Jia, Harman & Le Traon, 'Trivial Compiler Equivalence: A Large Scale Empirical Study of a Simple, Fast and Effective Equivalent Mutant Detection Technique,' ICSE 2015"
+[subsumption]: https://doi.org/10.1109/ICST.2014.13 "Ammann, Delamaro & Offutt, 'Establishing Theoretical Minimal Sets of Mutants,' ICST 2014"
+
 ## Open questions
 
 1. Should `-mutatescope=impact`'s per-test coverage map, or the
@@ -416,3 +420,7 @@ score threshold are all now implemented, none of them present in 2018.
 - [golang/go#75315](https://github.com/golang/go/issues/75315) — complementary, assembly-scoped mutation testing, currently open.
 - [go-mutesting](https://github.com/zimmski/go-mutesting), [gomu](https://github.com/sivchari/gomu), [ooze](https://github.com/gtramontina/ooze) — third-party Go mutation testers, none integrated into `go test`.
 - PIT, muJava, MutPy — mutation testing prior art in Java/Python, surveyed in the author's 2018 paper.
+- [Trivial Compiler Equivalence][TCE] and [mutant subsumption][subsumption]
+  — the equivalent-mutant filtering and mutant-selection techniques
+  `-mutatetce` implements and (respectively) deliberately does not attempt
+  yet; see "Costs and risks" above.

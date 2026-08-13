@@ -26,6 +26,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"testing"
 	"time"
 
@@ -60,6 +61,157 @@ import (
 // with no per-entry attribution. Both need to be generous; only the first is
 // this package's to set.
 const corpusRunTimeout = 2 * time.Hour
+
+// TestDiscover exercises corpus.Discover's own walk/parse/sort logic against
+// synthetic fixtures built fresh per subtest — unlike TestCorpus below, which
+// discovers the real corpus/ tree only as a means to an end-to-end mutation
+// run, this is Discover's dedicated, fast unit coverage and never touches the
+// real corpus/ directory.
+func TestDiscover(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		build func(t *testing.T) string // returns corpusDir
+		want  []string                  // expected Entry.Name values, in Discover's order
+	}{
+		{
+			name: "a corpusDir that does not exist yet is not an error",
+			build: func(t *testing.T) string {
+				t.Helper()
+
+				return filepath.Join(t.TempDir(), "does-not-exist")
+			},
+			want: nil,
+		},
+		{
+			name: "a subdirectory holding two golden files sharing one module gets one entry per file",
+			build: func(t *testing.T) string {
+				t.Helper()
+
+				dir := t.TempDir()
+				sub := filepath.Join(dir, "stdlib-crypto-aes")
+				mustMkdir(t, sub)
+				mustWriteGolden(t, sub, "golden.json", `{"scope":"package"}`)
+				mustWriteGolden(t, sub, "golden-full.json", `{"scope":"full"}`)
+
+				return dir
+			},
+			want: []string{"stdlib-crypto-aes/golden", "stdlib-crypto-aes/golden-full"},
+		},
+		{
+			name: "a subdirectory with no golden file contributes nothing, silently",
+			build: func(t *testing.T) string {
+				t.Helper()
+
+				dir := t.TempDir()
+				mustMkdir(t, filepath.Join(dir, "no-golden-here"))
+				sub := filepath.Join(dir, "has-one")
+				mustMkdir(t, sub)
+				mustWriteGolden(t, sub, "golden.json", `{"scope":"full"}`)
+
+				return dir
+			},
+			want: []string{"has-one/golden"},
+		},
+		{
+			name: "a non-directory entry sitting in corpusDir is skipped, not treated as a fixture",
+			build: func(t *testing.T) string {
+				t.Helper()
+
+				dir := t.TempDir()
+				if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("not a corpus entry"), 0o600); err != nil {
+					t.Fatalf("WriteFile() error = %v", err)
+				}
+
+				sub := filepath.Join(dir, "real-entry")
+				mustMkdir(t, sub)
+				mustWriteGolden(t, sub, "golden.json", `{"scope":"full"}`)
+
+				return dir
+			},
+			want: []string{"real-entry/golden"},
+		},
+		{
+			// "aes-full/golden" sorts before "aes/golden": '-' (0x2D) is less
+			// than '/' (0x2F), so a naive directory-traversal order (which
+			// visits "aes" before "aes-full", since directory names alone
+			// sort the other way) would emit these two entries in the wrong
+			// order without Discover's explicit sort.Slice by Name.
+			name: "entries come back sorted by Name, not by directory traversal order",
+			build: func(t *testing.T) string {
+				t.Helper()
+
+				dir := t.TempDir()
+				mustMkdir(t, filepath.Join(dir, "aes"))
+				mustWriteGolden(t, filepath.Join(dir, "aes"), "golden.json", `{"scope":"package"}`)
+				mustMkdir(t, filepath.Join(dir, "aes-full"))
+				mustWriteGolden(t, filepath.Join(dir, "aes-full"), "golden.json", `{"scope":"full"}`)
+
+				return dir
+			},
+			want: []string{"aes-full/golden", "aes/golden"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			corpusDir := tt.build(t)
+
+			entries, err := corpus.Discover(corpusDir)
+			if err != nil {
+				t.Fatalf("Discover(%s) error = %v", corpusDir, err)
+			}
+
+			if tt.want == nil {
+				if entries != nil {
+					t.Fatalf("Discover(%s) = %v, want nil", corpusDir, entries)
+				}
+
+				return
+			}
+
+			got := make([]string, len(entries))
+			for i, e := range entries {
+				got[i] = e.Name
+
+				// Path is set from the real file Discover parsed it from, not
+				// just copied from the glob match -- confirm it still points
+				// at a real file rather than trusting the string alone.
+				if _, err := os.Stat(e.Path); err != nil {
+					t.Errorf("entry %q Path = %q does not exist: %v", e.Name, e.Path, err)
+				}
+			}
+
+			if !slices.Equal(got, tt.want) {
+				t.Errorf("Discover(%s) names = %v, want %v", corpusDir, got, tt.want)
+			}
+		})
+	}
+}
+
+// mustMkdir creates dir, failing the test immediately if it can't -- every
+// TestDiscover fixture is built fresh under t.TempDir(), so a failure here
+// means the test's own setup is broken, not the code under test.
+func mustMkdir(t *testing.T, dir string) {
+	t.Helper()
+
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		t.Fatalf("MkdirAll(%s) error = %v", dir, err)
+	}
+}
+
+// mustWriteGolden writes a golden*.json fixture file for TestDiscover.
+func mustWriteGolden(t *testing.T, dir, name, data string) {
+	t.Helper()
+
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatalf("WriteFile(%s) error = %v", path, err)
+	}
+}
 
 // TestCorpus runs every discovered corpus entry as its own subtest.
 //

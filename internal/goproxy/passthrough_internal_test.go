@@ -7,6 +7,28 @@
 // platform-specific executable-detection logic (unix permission bits vs.
 // Windows PATHEXT, see passthrough_unix.go/passthrough_windows.go) inside the
 // test itself.
+//
+// Forward is deliberately not covered here at all, not even its failure
+// path. Forward has no seam: it always calls the package-level Resolve(),
+// which always builds its last-resort fallback from runtime.GOROOT(). That
+// fallback is fixed at process start (runtime/env_posix.go snapshots the OS
+// environment into an internal "envs" slice before any Go code runs, and
+// runtime.GOROOT() reads only that snapshot — confirmed empirically that
+// os.Setenv/t.Setenv during the test have no effect on it) and, in any
+// environment where `go test` could build and launch this test binary at
+// all, that fallback GOROOT is essentially guaranteed to contain a real,
+// executable "go". So forcing Resolve() to fail deterministically from
+// inside a test is not achievable through GOROOT/PATH env manipulation. The
+// only way to force it would be to remove or rename the real, live GOROOT's
+// bin/go on disk — a destructive, process-wide filesystem change (not scoped
+// to this test binary) that could break any other test process or `go`
+// invocation running concurrently on the same machine or CI runner, which is
+// unacceptable collateral for a unit test. Worse, calling Forward at all
+// without that guarantee risks Resolve() succeeding, in which case Forward
+// reaches Run's successful syscall.Exec and replaces the test binary
+// mid-run — exactly the catastrophic outcome this package's tests must never
+// risk. So Forward is left untested; execError and Run's failure path (both
+// exercised below) cover everything reachable without that risk.
 package goproxy
 
 import (
@@ -365,6 +387,121 @@ func TestResolverResolve(t *testing.T) {
 				t.Parallel()
 			}
 			tc.run(t)
+		})
+	}
+}
+
+// TestExecError covers execError's pure wrapping behaviour: the returned
+// error's message must mention both the failing goBin and the original
+// error, and %w must keep the chain reachable via errors.Is/errors.Unwrap so
+// callers can still detect e.g. a wrapped os.ErrNotExist.
+func TestExecError(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name  string
+		goBin string
+		err   error
+	}{
+		{
+			name:  "PlainError",
+			goBin: "/usr/bin/go",
+			err:   errors.New("boom"),
+		},
+		{
+			name:  "WrappedSentinel",
+			goBin: "/nonexistent/bin/go",
+			err:   os.ErrNotExist,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := execError(tc.goBin, tc.err)
+
+			if got == nil {
+				t.Fatal("execError() = nil, want a non-nil error")
+			}
+			if !strings.Contains(got.Error(), tc.goBin) {
+				t.Errorf("execError().Error() = %q, want it to contain goBin %q", got.Error(), tc.goBin)
+			}
+			if !strings.Contains(got.Error(), tc.err.Error()) {
+				t.Errorf("execError().Error() = %q, want it to contain the original error %q", got.Error(), tc.err.Error())
+			}
+			if !errors.Is(got, tc.err) {
+				t.Errorf("errors.Is(execError(...), %v) = false, want true: execError must wrap with %%w", tc.err)
+			}
+			if unwrapped := errors.Unwrap(got); unwrapped != tc.err { //nolint:errorlint // asserting exact identity of the wrapped error, not matching against a chain
+				t.Errorf("errors.Unwrap(execError(...)) = %v, want %v", unwrapped, tc.err)
+			}
+		})
+	}
+}
+
+// TestRunExecFailure covers Run's failure path only: syscall.Exec (unix) /
+// cmd.Start (windows) returning an error because goBin cannot be launched at
+// all. This is safe to run in-process because exec only replaces the calling
+// process on success (see the package's Run doc comment) — every case here
+// is constructed so the underlying exec call cannot possibly succeed, so Run
+// always returns normally with a non-zero code and a wrapped error instead of
+// replacing the test binary.
+//
+// Run's success path (goBin exists, is executable, and syscall.Exec succeeds)
+// is deliberately never exercised by any test in this package: on success it
+// replaces the process that called it, which would tear down the test binary
+// itself mid-run rather than merely fail the test.
+func TestRunExecFailure(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name  string
+		goBin func(t *testing.T) string
+	}{
+		{
+			name: "NonexistentBinary",
+			goBin: func(t *testing.T) string {
+				t.Helper()
+
+				return filepath.Join(t.TempDir(), "no-such-go-binary")
+			},
+		},
+		{
+			name: "NotExecutable",
+			goBin: func(t *testing.T) string {
+				t.Helper()
+
+				path := filepath.Join(t.TempDir(), "not-executable")
+				if err := os.WriteFile(path, []byte("not a real binary\n"), 0o600); err != nil {
+					t.Fatalf("write %s: %v", path, err)
+				}
+
+				return path
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			goBin := tc.goBin(t)
+
+			code, err := Run(goBin, nil)
+
+			if err == nil {
+				t.Fatalf("Run(%q, nil) error = nil, want a non-nil error: goBin cannot be executed", goBin)
+			}
+			if code == 0 {
+				t.Errorf("Run(%q, nil) code = 0, want a non-zero exit code", goBin)
+			}
+			if !strings.Contains(err.Error(), goBin) {
+				t.Errorf("Run(%q, nil) error = %q, want it to reference goBin (i.e. wrapped via execError)", goBin, err.Error())
+			}
+			if errors.Unwrap(err) == nil {
+				t.Errorf("Run(%q, nil) error = %q, want a wrapped error (execError uses %%w)", goBin, err.Error())
+			}
 		})
 	}
 }
