@@ -16,7 +16,14 @@ on:
   push:
     branches: [main]
 
-permissions: read-all
+# read-all was broader than needed: the job below already sets its own
+# precise permissions (security-events/id-token/contents/actions), which
+# always wins over this top-level default anyway — read-all only mattered
+# for a hypothetical future job in this file that didn't set its own,
+# which doesn't exist. Narrowed to match every other workflow's convention
+# in this repo.
+permissions:
+  contents: read
 
 jobs:
   analysis:

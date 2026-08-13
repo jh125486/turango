@@ -5,13 +5,17 @@
 *Mascot derived from the Go gopher, designed by [Renee French](https://go.dev/blog/gopher), licensed under [Creative Commons Attribution 4.0](https://creativecommons.org/licenses/by/4.0/).*
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/jh125486/turango)](https://pkg.go.dev/github.com/jh125486/turango)
+
 [![Tests](https://github.com/jh125486/turango/actions/workflows/ci.yml/badge.svg)](https://github.com/jh125486/turango/actions/workflows/ci.yml)
 [![CodeQL](https://github.com/jh125486/turango/actions/workflows/codeql-analysis.yml/badge.svg)](https://github.com/jh125486/turango/actions/workflows/codeql-analysis.yml)
+[![Mutation score](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/jh125486/turango/gh-pages/mutation-score.json)](https://github.com/jh125486/turango/actions/workflows/mutation-badge.yml)
 
 [![Codecov](https://codecov.io/gh/jh125486/turango/branch/main/graph/badge.svg)](https://codecov.io/gh/jh125486/turango)
 [![Sonar Coverage](https://sonarcloud.io/api/project_badges/measure?project=jh125486_turango&metric=coverage)](https://sonarcloud.io/summary/overall?id=jh125486_turango)
 
 [![CodeFactor](https://www.codefactor.io/repository/github/jh125486/turango/badge)](https://www.codefactor.io/repository/github/jh125486/turango)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/jh125486/turango/badge)](https://scorecard.dev/viewer/?uri=github.com/jh125486/turango)
+
 [![Bugs](https://sonarcloud.io/api/project_badges/measure?project=jh125486_turango&metric=bugs)](https://sonarcloud.io/summary/new_code?id=jh125486_turango)
 [![Code Smells](https://sonarcloud.io/api/project_badges/measure?project=jh125486_turango&metric=code_smells)](https://sonarcloud.io/summary/new_code?id=jh125486_turango)
 [![Reliability Rating](https://sonarcloud.io/api/project_badges/measure?project=jh125486_turango&metric=reliability_rating)](https://sonarcloud.io/summary/new_code?id=jh125486_turango)
@@ -19,9 +23,6 @@
 [![Technical Debt](https://sonarcloud.io/api/project_badges/measure?project=jh125486_turango&metric=sqale_index)](https://sonarcloud.io/summary/new_code?id=jh125486_turango)
 [![Maintainability Rating](https://sonarcloud.io/api/project_badges/measure?project=jh125486_turango&metric=sqale_rating)](https://sonarcloud.io/summary/new_code?id=jh125486_turango)
 [![Vulnerabilities](https://sonarcloud.io/api/project_badges/measure?project=jh125486_turango&metric=vulnerabilities)](https://sonarcloud.io/summary/new_code?id=jh125486_turango)
-
-[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/jh125486/turango/badge)](https://scorecard.dev/viewer/?uri=github.com/jh125486/turango)
-[![Mutation score](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/jh125486/turango/gh-pages/mutation-score.json)](https://github.com/jh125486/turango/actions/workflows/mutation-badge.yml)
 
 Mutation testing for `go test`, added the same way fuzzing was: not a
 separate tool bolted onto the ecosystem, but a `go`-compatible drop-in that
