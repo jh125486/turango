@@ -1,0 +1,9 @@
+# CodeFactor configuration for jh125486/turango.
+#
+# corpus/**/module/** are frozen copies of real Go stdlib source, preserved
+# byte-for-byte as historical bug-reproduction fixtures -- not this
+# project's code, and CodeFactor's own complexity/style findings against
+# them aren't actionable here. Excluded the same way gofmt/golangci-lint/
+# SonarCloud/CodeQL already exclude these frozen fixtures elsewhere.
+ExcludePaths:
+  - corpus/**
