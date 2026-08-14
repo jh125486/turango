@@ -481,7 +481,7 @@ func cacheSkipIfPrivileged(t *testing.T) {
 		t.Skip("permission-bit semantics this test relies on are Unix-specific")
 	}
 
-	if os.Geteuid() == 0 {
+	if cacheRunningAsRoot() {
 		t.Skip("running as root: permission checks this test relies on always pass")
 	}
 }
@@ -565,37 +565,49 @@ func TestFingerprintFile(t *testing.T) {
 	t.Run("a symlink's target text stands in for content, matching copyTree's own placement", func(t *testing.T) {
 		t.Parallel()
 
+		// fingerprintFile hashes both the entry's base-relative name and its
+		// content, so the symlink and the plain file below are placed in
+		// separate subdirs under the same entry name ("entry") — matching
+		// names is what isolates the comparison to content alone, which is
+		// the concrete claim fingerprintFile's doc comment makes: a symlink's
+		// target text stands in for content, matching copyTree's own
+		// placement.
 		dir := t.TempDir()
+		linkDir := filepath.Join(dir, "as-symlink")
+		fileDir := filepath.Join(dir, "as-plain-file")
+
+		if err := os.Mkdir(linkDir, 0o700); err != nil {
+			t.Fatalf("Mkdir() error = %v", err)
+		}
+
+		if err := os.Mkdir(fileDir, 0o700); err != nil {
+			t.Fatalf("Mkdir() error = %v", err)
+		}
+
 		target := filepath.Join(dir, "target-does-not-need-to-exist")
-		link := filepath.Join(dir, "link")
+		link := filepath.Join(linkDir, "entry")
 
 		if err := os.Symlink(target, link); err != nil {
 			t.Fatalf("Symlink() error = %v", err)
 		}
 
 		hLink := sha256.New()
-		if err := fingerprintFile(hLink, dir, link); err != nil {
+		if err := fingerprintFile(hLink, linkDir, link); err != nil {
 			t.Fatalf("fingerprintFile(symlink) error = %v", err)
 		}
 
-		// A plain file whose *content* is exactly the link's target text must
-		// hash identically to the symlink itself, which is the concrete claim
-		// fingerprintFile's doc comment makes.
-		asFile := filepath.Join(dir, "target-as-plain-file")
+		asFile := filepath.Join(fileDir, "entry")
 		if err := os.WriteFile(asFile, []byte(target), 0o600); err != nil {
 			t.Fatalf("WriteFile() error = %v", err)
 		}
 
 		hFile := sha256.New()
-		if err := fingerprintFile(hFile, dir, asFile); err != nil {
+		if err := fingerprintFile(hFile, fileDir, asFile); err != nil {
 			t.Fatalf("fingerprintFile(plain file) error = %v", err)
 		}
 
-		linkRel, _ := filepath.Rel(dir, link)
-		fileRel, _ := filepath.Rel(dir, asFile)
-
-		if linkRel == fileRel {
-			t.Fatal("test fixture bug: link and asFile must have different relative names")
+		if got, want := hLink.Sum(nil), hFile.Sum(nil); !bytes.Equal(got, want) {
+			t.Errorf("fingerprintFile(symlink) = %x, want %x (same as plain file with identical name/content)", got, want)
 		}
 	})
 

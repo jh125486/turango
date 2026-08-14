@@ -623,7 +623,7 @@ func repoModuleRoot(t *testing.T) string {
 //   - Run's and walkForEstimate's loadTyped() error branches: load() and
 //     loadTyped() are called with the same opts.Dir/opts.patterns() a few
 //     lines apart, so any Dir/pattern failure hits load()'s own earlier
-//     error return first (already covered by TestRunRejectsUnknownPackages
+//     error return first (already covered by TestRunRejectsInvalidOptions
 //     et al.). The only way to make loadTyped() alone fail is a difference
 //     specific to its extra Mode bits (NeedSyntax/NeedTypes/NeedDeps), which
 //     the go/packages driver surfaces as a soft per-package IllTyped error
@@ -1352,7 +1352,7 @@ func TestBuildEstimateResultScopeFull(t *testing.T) {
 // TestLoadTopLevelError, TestLoadTypedTopLevelError and
 // TestLoadClosuresTopLevelError each cover their own function's top-level
 // packages.Load() error return — as opposed to the per-package errs>0 path
-// [TestRunRejectsUnknownPackages]/[TestEstimateRejectsInvalidOptions] already
+// [TestRunRejectsInvalidOptions]/[TestEstimateRejectsInvalidOptions] already
 // cover — via a Dir that does not exist at all, which fails during
 // packages.Load's own chdir before it ever gets to resolving a pattern.
 // Calling these directly, independent of load()'s own success, is the only

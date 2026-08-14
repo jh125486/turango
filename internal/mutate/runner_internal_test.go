@@ -16,7 +16,6 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
-	"syscall"
 	"testing"
 
 	"golang.org/x/tools/go/packages"
@@ -1825,7 +1824,7 @@ func TestCopyDirFilesErrors(t *testing.T) {
 		writeFiles(t, map[string]string{filepath.Join(src, "a.go"): "package p\n"})
 
 		fifo := filepath.Join(src, "pipe")
-		if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		if err := runnerMkfifo(fifo, 0o600); err != nil {
 			t.Skipf("mkfifo unsupported on this platform: %v", err)
 		}
 
@@ -1864,7 +1863,7 @@ func TestCopyTreeSymlinksAndSpecialFiles(t *testing.T) {
 	fifo := filepath.Join(src, "sub", "pipe")
 
 	fifoCreated := true
-	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+	if err := runnerMkfifo(fifo, 0o600); err != nil {
 		fifoCreated = false
 	}
 

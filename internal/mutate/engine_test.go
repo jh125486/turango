@@ -198,34 +198,26 @@ func TestWorkspaceStringUnknown(t *testing.T) {
 	}
 }
 
-// TestRunRejectsUnknownPackages checks that a bad pattern is an error rather
-// than an empty, apparently-successful run.
-func TestRunRejectsUnknownPackages(t *testing.T) {
-	t.Parallel()
-
-	root := fixtureModule(t)
-
-	if _, err := mutate.Run(t.Context(), mutate.Options{
-		Packages: []string{"./does-not-exist/..."},
-		Dir:      root,
-	}); err == nil {
-		t.Fatal("Run() error = nil, want an error for an unmatched pattern")
-	}
-}
-
-// TestRunRejectsInvalidOptions covers Run's early validation steps that fail
-// before any package is ever loaded: an unknown operator name and an
-// unparseable FuncPattern regexp. Both are cheap to check — no fixture
-// module or toolchain work is needed, since Run fails before load() is ever
-// reached — so this stays out of the integration-tagged file despite being
+// TestRunRejectsInvalidOptions covers every way Run fails before a single
+// mutant runs: a bad package pattern (rejected by load()) and the two
+// validation steps that fail even earlier, before any package is ever
+// loaded — an unknown operator name and an unparseable FuncPattern regexp.
+// All three are cheap to check — no toolchain work happens on any of these
+// paths — so this stays out of the integration-tagged file despite being
 // exercised through the exported entry point.
 func TestRunRejectsInvalidOptions(t *testing.T) {
 	t.Parallel()
+
+	root := fixtureModule(t)
 
 	tests := map[string]struct {
 		opts       mutate.Options
 		wantSubstr string
 	}{
+		"unmatched package pattern": {
+			opts:       mutate.Options{Packages: []string{"./does-not-exist/..."}, Dir: root},
+			wantSubstr: "does-not-exist",
+		},
 		"unknown operator": {
 			opts:       mutate.Options{Operators: []string{"no/such/operator"}},
 			wantSubstr: "no/such/operator",
