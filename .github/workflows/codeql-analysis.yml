@@ -12,9 +12,13 @@ on:
     - cron: '30 4 * * 1'
 
 permissions:
-  actions: read
+  # actions:read and security-events:write live at job level below, which
+  # always wins over this top-level default anyway — narrowed here to match
+  # every other workflow's convention in this repo (see scorecard.yml's
+  # identical fix), since OpenSSF Scorecard's Token-Permissions check flags
+  # any write scope set at the top level, whether or not a job actually
+  # uses it.
   contents: read
-  security-events: write
 
 jobs:
   analyze:
