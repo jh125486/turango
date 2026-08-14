@@ -9,6 +9,7 @@
 [![Tests](https://github.com/jh125486/turango/actions/workflows/ci.yml/badge.svg)](https://github.com/jh125486/turango/actions/workflows/ci.yml)
 [![CodeQL](https://github.com/jh125486/turango/actions/workflows/codeql-analysis.yml/badge.svg)](https://github.com/jh125486/turango/actions/workflows/codeql-analysis.yml)
 [![Mutation score](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/jh125486/turango/gh-pages/mutation-score.json)](https://github.com/jh125486/turango/actions/workflows/mutation-badge.yml)
+[![Mutants](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/jh125486/turango/gh-pages/mutants-count.json)](https://github.com/jh125486/turango/actions/workflows/mutation-badge.yml)
 
 [![Codecov](https://codecov.io/gh/jh125486/turango/branch/main/graph/badge.svg)](https://codecov.io/gh/jh125486/turango)
 [![Sonar Coverage](https://sonarcloud.io/api/project_badges/measure?project=jh125486_turango&metric=coverage)](https://sonarcloud.io/summary/overall?id=jh125486_turango)
@@ -33,19 +34,113 @@ the mutation engine; every other invocation (`turango build ./...`,
 `turango vet ./...`, plain `turango test ./...`, ...) is forwarded verbatim
 to the real Go toolchain, unchanged.
 
-Mutation testing measures test-suite *quality*, not code coverage. It
-mechanically introduces small, reversible changes ("mutants") into a
+Mutation testing evaluates test-suite fault-detection effectiveness, not just
+whether code was executed. It mechanically introduces small, reversible
+changes ("mutants") into a
 package's AST — flip `+` to `-`, flip `<` to `<=`, delete a statement, empty
-an `if` body — and reruns the test suite against each one. A mutant the
-suite catches is "killed": proof the suite actually asserts on that
-behavior. A mutant that survives is a gap — code that runs during tests but
-that nothing checks.
+an `if` body — and reruns selected tests against each one. A mutant is
+"killed" when that run fails or times out and "survives" when those tests
+pass. Both verdicts are evidence to interpret, not proof by themselves: a
+kill can be incidental, while a survivor can be a test gap, uncovered code,
+or a behaviorally-equivalent change.
 
 See [`PROPOSAL.md`](PROPOSAL.md) for the full case for why this belongs in
 `go test` itself, including evidence gathered by running turango against
 real `crypto/...` stdlib packages.
 
+## Mutation testing in software engineering
+
+Mutation testing tests the tests. Structural coverage answers whether a
+line or branch ran; mutation testing asks whether changing its behavior
+would make the suite fail. That makes a surviving mutant a concrete review
+target: either an assertion, input, or test boundary is missing, or the
+change is behaviorally irrelevant. Empirical work has found that mutant
+detection correlates with detection of real faults independently of code
+coverage, while large-scale industrial research found that developers use
+survivors to add useful tests and that mutants can be coupled to historical
+production faults. Mutation testing is still a proxy for fault detection,
+not proof that the program is correct.
+
+### How it works
+
+1. Run the original test suite. Mutation results are meaningless unless the
+   baseline is green and repeatable.
+2. Generate many program variants, usually with one small syntactic change
+   each: reverse a comparison, alter a boundary, replace an operator, remove
+   a statement, or change a literal.
+3. Build and test each variant in isolation. A failing test or timeout
+   **kills** the mutant; an all-green run means it **survived**; a variant
+   that cannot compile is **not viable**.
+4. Inspect survivors, then add a contract-level test, fix an incorrect
+   requirement or implementation, or document why the mutation should be
+   excluded.
+
+Turango reports its score as `killed / (killed + survived)`. Not-viable,
+suppressed, and TCE-filtered equivalent mutants are outside the ratio. That
+accounting detail matters: tools with different operators, filters, scopes,
+or denominator rules do not produce directly comparable scores.
+
+### What the score does—and does not—say
+
+- A killed mutant shows that the selected test run fails or times out for
+  that change. It does not show that an assertion checks the right
+  requirement; incidental or overly coupled assertions can kill mutants too.
+- A survivor is evidence to investigate, not automatically a missing test.
+  It may expose a genuine test gap, an **equivalent mutant** whose observable
+  behavior is unchanged, or behavior the team intentionally does not test
+  (for example, unimportant logging).
+- A high score gives confidence only over the code, operators, and test
+  scope actually exercised. It says nothing about faults the selected
+  mutation model cannot represent, omitted packages, missing end-to-end
+  behavior, or a wrong specification shared by code and tests.
+- The useful unit is usually a survivor and its source diff, not a
+  repository-wide percentage. Prefer improving important behavior over
+  chasing an arbitrary 100% target.
+
+### Common gotchas
+
+- **Equivalent mutants:** determining semantic equivalence is not generally
+  automatable. Treat compiler-based filtering as a useful partial technique,
+  review suspicious survivors, and document suppressions instead of weakening
+  the threshold silently.
+- **Runtime cost:** mutant count multiplied by test-suite time is only a
+  first-order estimate; workspace creation, compilation, and tool overhead
+  add cost. Test selection, narrower scopes, parallel workers, caching,
+  incremental runs, and selective operators reduce cost, but scope reduction
+  can miss tests in callers or integration packages.
+- **Flaky or stateful tests:** timing sensitivity, test-order dependencies,
+  shared external state, and nondeterminism can turn mutants into false kills
+  or inconsistent survivors. Stabilize and repeat the baseline first.
+- **Test overfitting:** do not mirror implementation details merely to kill a
+  mutant. Assert externally meaningful contracts and boundary behavior; if
+  two implementations are equivalent under the contract, suppress the mutant
+  with a reason.
+- **Metric gaming:** generated code, defensive code, trivial accessors, and
+  low-value side effects can dominate a report. Exclude them deliberately and
+  visibly. A higher score caused only by changing the operator set or
+  denominator is not a stronger suite.
+- **CI adoption:** start on changed or high-risk packages, triage survivors,
+  and record a baseline. Ratchet against regressions rather than imposing a
+  universal threshold on day one; run broader mutation sweeps periodically to
+  catch cross-package gaps hidden by fast local scopes.
+
+Research and practitioner references:
+
+- Jia and Harman, [*An Analysis and Survey of the Development of Mutation
+  Testing*](https://doi.org/10.1109/TSE.2010.62) (2011).
+- Papadakis et al., [*Mutation Testing Advances: An Analysis and
+  Survey*](https://discovery.ucl.ac.uk/id/eprint/10056704/) (2019).
+- Just et al., [*Are Mutants a Valid Substitute for Real Faults in Software
+  Testing?*](https://doi.org/10.1145/2635868.2635929) (2014).
+- Petrovic et al., [*Long Term Effects of Mutation
+  Testing*](https://research.google/pubs/long-term-effects-of-mutation-testing/)
+  (2021).
+- PIT, [*Basic concepts*](https://pitest.org/quickstart/basic_concepts/), for a
+  practical description of test selection and equivalent mutations.
+
 ## Install / build
+
+Turango requires Go 1.26 or newer.
 
 ```
 go build ./cmd/turango
@@ -64,7 +159,9 @@ turango test -mutate=. ./...
 expression matched against function/method names, not a package selector.
 `-mutate=.` matches every function (mirroring `-bench=.`'s "run every
 benchmark" convention); package selection is the ordinary trailing
-argument(s), exactly as with those three flags.
+argument(s), exactly as with those three flags. Package-level declarations
+are not inside a function, so they remain eligible regardless of the
+function-name regexp.
 
 Everything that isn't `test` with a `-mutate=` flag goes straight to the
 real `go` command:
@@ -88,12 +185,12 @@ All of turango's own flags require the `-flag=value` form (a bare
 | `-mutateparallel=<n>` | `GOMAXPROCS` | Worker-pool size. Parallelizes at the file level, since one file's AST is mutated in place across its own mutants. |
 | `-mutatetimeout=<duration>` | baseline-derived | Per-mutant budget. If unset, turango times the real suite three times, averages, and scales by CPU count, so a mutant that produces an infinite loop (e.g. `i++` flipped to `i--`) doesn't stall the run to `go test`'s own ~10-minute default. A timeout counts as a kill. |
 | `-mutateoutput=<dir>` | none | Write a JSON report (`mutate-report.json`) into this directory. |
-| `-mutatemin=<float>` | none | Exit with status 3 if the resulting mutation score falls below this threshold (0–1) — for CI gating. |
+| `-mutatemin=<float>` | none | Exit with status 3 if the resulting mutation score falls below this threshold — for CI gating. Scores themselves range from 0 to 1. |
 | `-mutatemutant=<id>` | none | Replay exactly one mutant by the ID printed for it (in the console survivor listing or a JSON report's `MutantResult.ID`). The engine still walks every file and node — that part is cheap — but only the matching mutation is ever run, so the result holds at most one mutant. |
 | `-mutatetce=true\|false` | `false` | Trivial Compiler Equivalence: filter a mutant whose compiled output exactly matches a per-package baseline before it ever reaches the test suite, reporting it separately (see below) instead of as an ordinary survivor. Off by default — see "Filtering equivalent mutants" below for why. |
-| `-mutateworkspace=copy\|worktree` | `copy` | How each mutant's throwaway execution copy is built. `copy` recursively copies the module (works everywhere, no git dependency). `worktree` uses `git worktree add` instead, which shares the repository's object store rather than duplicating files — cheaper when the target module lives in a large git repo. Strictly opt-in and self-falling-back: requesting it against a target that isn't inside a clean git working tree (or isn't a git repo at all — every corpus fixture under `corpus/*/module/` is deliberately a plain directory) silently reverts to `copy`, never an error. |
+| `-mutateworkspace=copy\|worktree` | `copy` | How a mutant's throwaway workspace is built when turango needs the full module. `copy` recursively copies it (works everywhere, no git dependency). `worktree` uses `git worktree add`, sharing the repository's object store. Under `package`/`impact`, a safe dependency-closure copy takes precedence over either setting. `worktree` is opt-in and falls back to `copy` when the target is not inside a clean git working tree. |
 | `-mutateestimate=true\|false` | `false` | Preview a run instead of executing it: walk every file/node to count how many mutants would be generated, per package, then time one baseline sample per package (whole-module under `-mutatescope=full`, per-package otherwise) to extrapolate a rough serial and `-mutateparallel`-divided time estimate — both explicitly hedged, since real speedup is sub-linear under contention. No mutation is ever applied to disk and no mutant's `go test` is ever spawned to classify it. Incompatible with `-mutateoutput`/`-mutatemin`, which are rejected at parse time (nothing was classified, so there's no report to write or score to gate on). |
-| `-mutatecache=<dir>` | none | Persist every mutant's verdict to a JSON-Lines file (`mutate-cache.jsonl`) inside this directory, and reuse those verdicts on a later run against unchanged source instead of re-executing `go test` for every mutant that's already cached — the fix for losing a whole overnight sweep to a killed process or a Ctrl+C. Keyed by more than just the mutant's ID (a same-position, same-width literal/identifier edit can otherwise collide) — see "Resuming after interruption" below. Incompatible with `-mutateestimate` (nothing is classified in estimate mode, so there's no verdict to cache); compatible with `-mutatemutant` (a replay always bypasses the cache read, but its result still gets cached for later). |
+| `-mutatecache=<dir>` | none | Persist executed and TCE-classified verdicts to a JSON-Lines file (`mutate-cache.jsonl`) inside this directory, and reuse them on later runs against unchanged source. Uncovered `impact` survivors are recomputed without running tests. Keys contain more than the mutant ID (a same-position, same-width literal/identifier edit can otherwise collide) — see "Resuming after interruption" below. Incompatible with `-mutateestimate`; compatible with `-mutatemutant` (replay bypasses cache reads but writes its result). |
 
 ### Suppressing a mutant: `//nomutant`
 
@@ -127,22 +224,23 @@ default rather than the fastest option winning by default, the same
 reasoning `go test` itself applies by never skipping a package's tests
 based on a coverage guess.
 
-Each mutant still needs its own throwaway copy of the target module to run
-against, and how much gets copied is scope-dependent for a hard reason, not
-just a performance tuning knob: under `package`/`impact` scope, turango
-resolves the mutated package's actual forward import closure (via
-`golang.org/x/tools/go/packages`) and copies only that — the target
-package's own directory, every same-module package it imports
-transitively, `go.mod`/`go.sum`, `vendor/` if present, and any
-`//go:embed`-referenced paths. Under `full` scope this optimization is
-provably wrong to apply: `full`'s entire reason to exist depends on the
+Each mutant requiring execution needs its own throwaway workspace, and how
+much gets copied is scope-dependent for a hard reason, not just a performance
+tuning knob: under `package`/`impact` scope, turango
+resolves the mutated package's forward import closure (via
+`golang.org/x/tools/go/packages`) and copies its ordinary source files,
+same-module dependencies, and `go.mod`/`go.sum`. Cases that cannot be copied
+safely as a closure — including vendoring, `//go:embed` assets, and local
+replacement modules — fall back to a full-module workspace. Under `full`
+scope the closure optimization is wrong to apply: `full`'s reason depends on the
 *reverse* closure (every package that could call into the target), which a
 forward-closure copy says nothing about — a workspace built that way, run
 under `go test ./...`, would silently only contain (and therefore only run)
 the target package's own tests, indistinguishable in outcome from
-`package` scope but still labeled `full`. So `full` always falls back to a
-full recursive module copy, unconditionally, no closure computation
-attempted — a correctness boundary, not a missed optimization.
+`package` scope but still labeled `full`. So `full` always uses a full-module
+workspace — recursive copy or requested worktree — with no closure
+computation attempted. This is a correctness boundary, not a missed
+optimization.
 
 ### Filtering equivalent mutants: `-mutatetce`
 
@@ -157,10 +255,9 @@ deleting a dead store nothing downstream reads). A `Survived` verdict on one
 of these is noise: the suite didn't miss a real behavioral gap, because
 there was no behavioral difference to notice.
 
-`-mutatetce=true` catches this class specifically: it builds each mutant's
-package once, normally, then again with `go build -gcflags=-S` (an assembly
-listing) and compares it — with source line-number annotations stripped —
-against a once-per-package baseline built from the unmutated source. A match
+`-mutatetce=true` catches this class specifically: it builds one normalized
+`go build -gcflags=-S` assembly baseline per unmutated package, then compares
+each mutant's normalized assembly against that baseline. A match
 means the mutant never reaches `go test` at all; it's reported under the
 JSON report's `Equivalents` array (and a summary `equivalent: N` line) rather
 than as a `MutantResult`. Comparing normalized `-S` disassembly rather than
@@ -188,16 +285,16 @@ different codebase.
 
 ### Building each mutant's workspace: `-mutateworkspace`
 
-Every mutant runs against its own throwaway copy of the target module — the
-mutated file has to sit somewhere that isn't the real source tree, and the
-copy needs the whole module graph to resolve imports (sibling packages,
-`replace` directives, `vendor/`, `//go:embed` assets). By default (`copy`)
-that's a plain recursive filesystem copy. `-mutateworkspace=worktree` builds
-it with `git worktree add` instead: a worktree shares the repository's
-object store rather than duplicating files, so it's cheaper on a large git
-repo, and a local `replace` directive pointing at a sibling checkout already
-resolves correctly with no path rewriting needed, since a worktree is the
-same repository checked out twice.
+Every mutant requiring execution runs against its own throwaway workspace —
+the mutated file has to sit somewhere outside the real source tree, with
+enough of the module graph to resolve imports (sibling packages, `replace`
+directives, `vendor/`, `//go:embed` assets). Cache hits and uncovered
+`impact`-scope survivors do not need one. Under narrow scopes turango first
+tries a dependency-closure copy; unsafe cases fall back to a full workspace.
+By default (`copy`) that fallback is a recursive filesystem copy.
+`-mutateworkspace=worktree` instead uses `git worktree add`: a worktree shares
+the repository's object store rather than duplicating files, so it can be
+cheaper on a large git repo.
 
 It's opt-in, not a smarter default, because it has a real precondition a
 filesystem copy doesn't: `git worktree add` checks out `HEAD`, the last
@@ -214,40 +311,39 @@ now turango had no way to pick back up after a kill (`SIGKILL`, an OOM
 reaper, a killed CI job) or even a graceful Ctrl+C: relaunching re-ran every
 mutant from scratch, including the ones that had already finished.
 
-`-mutatecache=<dir>` fixes this by writing every mutant's verdict to
-`<dir>/mutate-cache.jsonl` as soon as it's produced, and consulting that file
-before spawning a mutant's `go test` on a later run. Re-running the exact
-same command against unchanged source resumes near-instantly; editing the
-source in between invalidates exactly the entries the edit affects, no more
-and no fewer.
+`-mutatecache=<dir>` writes each executed or TCE-classified verdict to
+`<dir>/mutate-cache.jsonl` as soon as it is produced, then consults that file
+before spawning a mutant's `go test` on a later run. Re-running the same
+command against unchanged source resumes quickly. Uncovered `impact`-scope
+survivors are not cached because recomputing them does not run tests.
 
 The cache key is deliberately more than a mutant's ID. A mutant ID hashes a
 *position* — file, line, column, operator, mutation index — not the node's
 own bytes, so a same-width edit at the same position (`x + 5` → `x + 7`,
 same column) produces an identical ID for genuinely different code. Keying
 on ID alone would risk serving the first edit's verdict for the second.
-Instead, the key also folds in a content fingerprint of exactly the files
-that mutant's `go test` run actually depends on (the whole module under
-`-mutatescope=full`; just the dependency closure otherwise — reusing the
-same closure machinery `-mutateworkspace` and scope narrowing already use),
-plus `-mutatescope`, `-mutatetce`, and a toolchain identifier (`go version` +
-`GOOS`/`GOARCH`) — each closes a real way the identical mutant could
-legitimately classify differently across two runs.
+Instead, the key also folds in a content fingerprint for its workspace scope
+(the whole module under `-mutatescope=full`; the dependency closure when that
+optimization is safe), plus `-mutatescope`, `-mutatetce`, and a toolchain
+identifier (`go version` + `GOOS`/`GOARCH`). An edit invalidates all entries
+covered by that fingerprint, which can conservatively mean every cached
+mutant under `full` scope.
 
 Safe to delete at any time — an empty or missing cache is just a first run,
-the same way `$GOCACHE` behaves. Not portable across machines with a
-different Go toolchain or target platform; treat it the same way you'd treat
-`$GOCACHE` itself.
+the same way `$GOCACHE` behaves. Keep cache directories scoped to one build
+environment: timeout, build tags, CGO settings, and most other `go env` values
+are not part of the key, so changing them can reuse a stale verdict (including
+a timeout classified as a kill).
 
 ### Before/after source in the JSON report
 
 Every `MutantResult` in `-mutateoutput`'s JSON report carries `Before`/
 `After`: the mutated node's printed source text, immediately before and
 after the mutation — the actual diff `Description` only summarises (e.g.
-`Description: "== -> !="`, `Before: "v < lo"`, `After: "v >= lo"`), usable
+`Description: "< -> >="`, `Before: "v < lo"`, `After: "v >= lo"`), usable
 without hand-deriving it from `File`/`Line` and a checkout of the source at
-that point. `After` is empty for a removed statement (there's nothing there
-to print) rather than a stale duplicate of `Before`. The console survivor
+that point. An empty `After` marks a removed statement rather than repeating
+`Before`. The console survivor
 listing is unchanged — `Description` is still the only per-row text shown
 there, to keep the table scannable.
 
@@ -296,7 +392,9 @@ Fourteen operators, across six packages:
   float literal by a small relative nudge in each direction),
   `literal/boolean` (`true`↔`false`).
 - **`identifier`** — `identifier/constswap`: swaps a package-level const
-  reference for a same-type sibling in the same `const(...)` block;
+  reference for a same-type sibling in the same `const(...)` block, or for a
+  same-type constant declared elsewhere in the same file when no block
+  sibling exists;
   `identifier/localconstswap`: swaps a function-local variable used as a
   comparison operand (`<`, `<=`, `>`, `>=`, `==`, `!=`) for a type-compatible
   package-level constant declared in the same file — the pair that reproduces
@@ -321,60 +419,39 @@ Fourteen operators, across six packages:
 
 ## Architecture
 
-Mutant generation and collection, end to end. Results are collected into one
-`*Result` by a single consumer goroutine draining three channels (mutants,
-suppressions, TCE-filtered equivalents), not a mutex — `testing/synctest`'s
-"durably blocked" detection covers channel send/recv but not
-`sync.Mutex.Lock`, so a channel-based collector stays testable against
-future scheduling changes in a way a mutex-guarded one wouldn't, even
-though nothing in it is timing-dependent today; the worker pool itself is
-file-level (`errgroup`, bounded by `-mutateparallel`), and each file's walk
-is strictly sequential internally since a file's mutants share one AST that
-is mutated in place and reverted between mutants.
+Turango loads and plans once, then processes source files through a bounded
+worker pool. Mutants within one file run sequentially because they share an
+AST that is changed and reverted in place. A single consumer collects and
+sorts mutant, suppression, and TCE-equivalent results.
 
 ```mermaid
 flowchart TD
-    CLI["turango test -mutate=... ./..."] --> Parse["main.go: parseMutateFlags"]
-    Parse --> Run["mutate.Run(ctx, Options)"]
+    CLI["turango test -mutate=..."] --> Prepare["Load packages and operators; resolve scope and timeout"]
+    Prepare --> Pool["Bounded worker pool: one job per source file"]
 
-    Run --> Load["load(): go/packages.Load"]
-    Run --> Baseline["resolveTimeout(): time the real suite 3x, scale by CPU count"]
-    Run --> Plan["plan()/planScope()/planTCEBaseline(): one fileJob per file"]
-    Plan --> Pool["execute(): errgroup worker pool, bounded by -mutateparallel"]
-
-    subgraph Worker["one goroutine per file, bounded"]
-        MF["mutateFile(): parse once, scan //nomutant, print baseline"]
-        MF --> Walk["ast.Inspect walk"]
-        Walk --> VN["visitNode(): per AST node"]
-        VN -->|func pattern mismatch or suppressed| Skip["skip subtree, send on suppressions channel"]
-        VN -->|operator.Applies| Mut["for each Mutate() result: compute mutantID"]
-        Mut -->|-mutatemutant set, no match| NextMut["skip this mutation"]
-        Mut --> RR["runner.run(): apply, print, diff against baseline"]
-        RR -->|byte-identical| NoOp["not a real mutant, dropped"]
-        RR -->|real change| Copy["workspaceFor(): copyModule, or copyWorktree if -mutateworkspace=worktree and the target is a clean git repo"]
-        Copy --> TCE{"-mutatetce=true?"}
-        TCE -->|compiled output matches baseline| SendEq["send on equivalents channel"]
-        TCE -->|different, or TCE off| GoTest["exec real go test (scope-limited args, derived timeout)"]
-        GoTest --> Classify["classify(): killed / survived / not-viable"]
-        Classify --> SendMut["send on mutants channel"]
+    subgraph Worker["Per-file worker: mutations run sequentially on one AST"]
+        Parse["Parse/type-check once; scan //nomutant"] --> Mutate["Walk AST; apply one mutation"]
+        Mutate --> Resolve["Resolve via impact coverage, cache, TCE, or isolated tests"]
+        Resolve --> Verdict["Killed / survived / not viable"]
+        Resolve --> Equivalent["Equivalent"]
+        Verdict --> Revert["Revert mutation"]
+        Equivalent --> Revert
     end
 
-    Pool --> Worker
-    SendMut --> Consumer["collector's consumer goroutine: append + sort by file, line, operator, description"]
-    SendEq --> Consumer
-    Skip --> Consumer
-    Consumer --> Report["Result: console WriteSummary / JSON via -mutateoutput"]
+    Pool --> Parse
+    Revert --> Collect["Collect and sort results"]
+    Collect --> Output["Console summary and optional JSON"]
 ```
 
 ## Try it
 
 - [`example/`](example/) — ordinary, deliberately-imperfect order-pricing
   code with an ordinary test suite. `example/README.md` has a runnable
-  command and real, unedited turango output, including what surviving
-  mutants point to and what `//nomutant` costs the score.
+  command and explains what surviving mutants and `//nomutant` suppressions
+  do to the score.
 - [`example/legacy/`](example/legacy/) — the original `go-turango`
   prototype's demo package, ported unchanged: one coarse assertion,
-  38 mutants, 12 survivors — a clean illustration of what a single
+  74 mutants, 29 survivors — a clean illustration of what a single
   overall-result check misses.
 
 ## Alias mode (experimental, opt-in)
