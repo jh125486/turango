@@ -17,6 +17,20 @@ import (
 	"github.com/jh125486/turango/internal/mutate"
 )
 
+// TestExitCodesAreStable makes the command's documented process-status
+// contract explicit. Scripts distinguish a bad invocation, a run failure,
+// and a score-gate failure, so these values must not drift or overlap.
+func TestExitCodesAreStable(t *testing.T) {
+	t.Parallel()
+
+	got := []int{exitOK, exitFailure, exitUsage, exitBelowThreshold}
+	want := []int{0, 1, 2, 3}
+
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("exit codes = %v, want %v", got, want)
+	}
+}
+
 // TestParseMutateFlagsRecognition covers the one question asked of every
 // `turango test` invocation: is this a mutation request, or the real go
 // command's business?
