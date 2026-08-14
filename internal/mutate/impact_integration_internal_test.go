@@ -171,7 +171,7 @@ func TestB(t *testing.T) {}
 		t.Fatal("buildImpact() error = nil, want the injected context cancellation to surface")
 	}
 
-	if got := wrapped.Context.Err(); got == nil {
+	if wrapped.Context.Err() == nil {
 		t.Error("underlying context.Err() = nil after buildImpact returned, want it cancelled")
 	}
 }

@@ -949,7 +949,7 @@ func F() int {
 			t.Fatal("no *ast.BasicLit found in snippet")
 		}
 
-		if got := bound.Applies(lit); got {
+		if bound.Applies(lit) {
 			t.Error("Applies(BasicLit) = true, want false")
 		}
 
@@ -963,7 +963,7 @@ func F() int {
 
 		xIdent := findIdent(t, file, info, "x")
 
-		if got := bound.Applies(xIdent); got {
+		if bound.Applies(xIdent) {
 			t.Error("Applies(x) = true, want false")
 		}
 
