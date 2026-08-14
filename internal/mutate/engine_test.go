@@ -3,6 +3,7 @@ package mutate_test
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/jh125486/turango/internal/mutate"
@@ -174,6 +175,29 @@ func TestParseWorkspace(t *testing.T) {
 	}
 }
 
+// TestScopeStringUnknown covers Scope.String()'s fallback spelling for a
+// value outside [ScopeFull]/[ScopePackage]/[ScopeImpact]'s defined range —
+// reachable only via an explicit invalid conversion like this one, never
+// through [mutate.ParseScope] or the classifier (see unknownSpelling's own
+// doc comment in engine.go).
+func TestScopeStringUnknown(t *testing.T) {
+	t.Parallel()
+
+	if got, want := mutate.Scope(99).String(), "unknown"; got != want {
+		t.Errorf("Scope(99).String() = %q, want %q", got, want)
+	}
+}
+
+// TestWorkspaceStringUnknown is [TestScopeStringUnknown]'s counterpart for
+// [mutate.Workspace].
+func TestWorkspaceStringUnknown(t *testing.T) {
+	t.Parallel()
+
+	if got, want := mutate.Workspace(99).String(), "unknown"; got != want {
+		t.Errorf("Workspace(99).String() = %q, want %q", got, want)
+	}
+}
+
 // TestRunRejectsUnknownPackages checks that a bad pattern is an error rather
 // than an empty, apparently-successful run.
 func TestRunRejectsUnknownPackages(t *testing.T) {
@@ -186,5 +210,87 @@ func TestRunRejectsUnknownPackages(t *testing.T) {
 		Dir:      root,
 	}); err == nil {
 		t.Fatal("Run() error = nil, want an error for an unmatched pattern")
+	}
+}
+
+// TestRunRejectsInvalidOptions covers Run's early validation steps that fail
+// before any package is ever loaded: an unknown operator name and an
+// unparseable FuncPattern regexp. Both are cheap to check — no fixture
+// module or toolchain work is needed, since Run fails before load() is ever
+// reached — so this stays out of the integration-tagged file despite being
+// exercised through the exported entry point.
+func TestRunRejectsInvalidOptions(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		opts       mutate.Options
+		wantSubstr string
+	}{
+		"unknown operator": {
+			opts:       mutate.Options{Operators: []string{"no/such/operator"}},
+			wantSubstr: "no/such/operator",
+		},
+		"invalid FuncPattern": {
+			opts:       mutate.Options{FuncPattern: "("},
+			wantSubstr: "func pattern",
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := mutate.Run(t.Context(), tt.opts)
+			if err == nil {
+				t.Fatal("Run() error = nil, want an error")
+			}
+
+			if !strings.Contains(err.Error(), tt.wantSubstr) {
+				t.Errorf("Run() error = %v, want it to contain %q", err, tt.wantSubstr)
+			}
+		})
+	}
+}
+
+// TestEstimateRejectsInvalidOptions is [TestRunRejectsInvalidOptions]'s
+// counterpart for Estimate: the same early-validation failures (an unknown
+// operator, an unparseable FuncPattern) plus an unmatched package pattern,
+// which Estimate's own load() step must reject exactly as Run's does.
+func TestEstimateRejectsInvalidOptions(t *testing.T) {
+	t.Parallel()
+
+	root := fixtureModule(t)
+
+	tests := map[string]struct {
+		opts       mutate.Options
+		wantSubstr string
+	}{
+		"unknown operator": {
+			opts:       mutate.Options{Operators: []string{"no/such/operator"}},
+			wantSubstr: "no/such/operator",
+		},
+		"invalid FuncPattern": {
+			opts:       mutate.Options{FuncPattern: "("},
+			wantSubstr: "func pattern",
+		},
+		"unmatched package pattern": {
+			opts:       mutate.Options{Packages: []string{"./does-not-exist/..."}, Dir: root},
+			wantSubstr: "does-not-exist",
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := mutate.Estimate(t.Context(), tt.opts)
+			if err == nil {
+				t.Fatal("Estimate() error = nil, want an error")
+			}
+
+			if !strings.Contains(err.Error(), tt.wantSubstr) {
+				t.Errorf("Estimate() error = %v, want it to contain %q", err, tt.wantSubstr)
+			}
+		})
 	}
 }

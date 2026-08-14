@@ -9,6 +9,8 @@ package mutate
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"go/ast"
 	"go/parser"
@@ -241,6 +243,53 @@ func literalMutationModule(t *testing.T, literal int, withTest bool) literalFixt
 	}
 
 	return literalFixture{root: root, path: path, fset: fset, file: file, baseline: baseline, mutation: mutation}
+}
+
+// runnerFakeErrContext wraps a real context.Context but always reports a
+// fixed, non-nil Err() — used by TestGoTestReturnsParentContextErr to
+// distinguish goTest's own outer-cancellation check (which reads the
+// *parent* ctx passed in, not the runCtx derived from it via
+// context.WithTimeout) without actually cancelling anything: Done() is left
+// untouched (never closes), so the derived runCtx is never itself
+// cancelled and the real `go test` subprocess runs to a normal, fast
+// completion — only the direct Err() check at the end of goTest sees
+// anything different.
+type runnerFakeErrContext struct {
+	context.Context
+	err error
+}
+
+func (c runnerFakeErrContext) Err() error { return c.err }
+
+// TestGoTestReturnsParentContextErr covers goTest's final branch: after a
+// real `go test` run completes normally, if the *parent* context (as
+// opposed to goTest's own per-mutant runCtx) already reports an error, that
+// is what must be returned and timedOut must stay false, distinguishing
+// "the caller was cancelled" from "this mutant hung" (see goTest's own doc
+// comment).
+func TestGoTestReturnsParentContextErr(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	writeFiles(t, map[string]string{
+		filepath.Join(root, "go.mod"):    "module example.com/goterr\n\ngo 1.26\n",
+		filepath.Join(root, "p.go"):      "package p\n",
+		filepath.Join(root, "p_test.go"): "package p\n\nimport \"testing\"\n\nfunc TestNoop(t *testing.T) {}\n",
+	})
+
+	sentinel := errors.New("parent context already done")
+	ctx := runnerFakeErrContext{Context: t.Context(), err: sentinel}
+
+	r := &runner{goBin: "go", testTimeout: time.Minute}
+
+	_, _, timedOut, err := r.goTest(ctx, root, []string{allPackages})
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("goTest() error = %v, want it to be (wrap) the parent context's own error %v", err, sentinel)
+	}
+
+	if timedOut {
+		t.Error("goTest() timedOut = true, want false: this is parent cancellation, not the runner's own per-mutant timeout")
+	}
 }
 
 // TestRunClosesSameMutantIDDifferentContentCollision is the persistent

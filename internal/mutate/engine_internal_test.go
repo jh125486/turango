@@ -13,13 +13,21 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
+	"reflect"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"golang.org/x/tools/go/packages"
 
 	"github.com/jh125486/turango/internal/mutator"
 )
@@ -589,5 +597,837 @@ func repoModuleRoot(t *testing.T) string {
 		}
 
 		dir = parent
+	}
+}
+
+// --- Coverage gap-closing tests below (engine.go). Helpers are prefixed
+// "engine" to avoid colliding with same-named helpers other concurrently
+// edited _test.go files in this package might add. ---
+
+// Documented coverage gaps left in engine.go, matching the reasoning style
+// internal/goproxy/passthrough_internal_test.go's own Forward exception
+// uses: a real seam would need either unsafe mocking of the Go toolchain, a
+// destructive process-wide filesystem change, or a genuine data race, none
+// of which is worth taking on for one branch each.
+//
+//   - Run's and Estimate's own goproxy.Resolve() error branches (engine.go's
+//     Run around "goBin, err := goproxy.Resolve()" and Estimate's identical
+//     first line): goproxy.Resolve() always falls back to
+//     runtime.GOROOT(), fixed at process start and essentially guaranteed to
+//     hold a real, executable "go" in any environment that could build and
+//     run this test binary at all. Forcing it to fail would need deleting or
+//     renaming the real GOROOT's bin/go on disk — a destructive,
+//     process-wide change unacceptable for a unit test (see
+//     passthrough_internal_test.go's own Forward exception for the identical
+//     reasoning against the same function).
+//   - Run's and walkForEstimate's loadTyped() error branches: load() and
+//     loadTyped() are called with the same opts.Dir/opts.patterns() a few
+//     lines apart, so any Dir/pattern failure hits load()'s own earlier
+//     error return first (already covered by TestRunRejectsUnknownPackages
+//     et al.). The only way to make loadTyped() alone fail is a difference
+//     specific to its extra Mode bits (NeedSyntax/NeedTypes/NeedDeps), which
+//     the go/packages driver surfaces as a soft per-package IllTyped error
+//     (already fail-soft handled in planPackage), not the hard top-level
+//     Load() error this branch guards — there is no dependency-injection
+//     seam over packages.Load in this codebase to fake the latter.
+//   - Run's plan() error branch and walkForEstimate's mirror: reaching it
+//     requires planPackage's own planPrecompute() call to fail (see
+//     TestPlanPackage's "planPrecompute error propagates" case below, which
+//     covers that logic directly), but every real trigger is either a
+//     context cancellation racing load()'s real `go list` subprocess call
+//     (whose ctx.Err()/Done() polling cadence is an x/tools implementation
+//     detail, not a documented contract to build a deterministic test
+//     against) or a filesystem race after a real module was already loaded
+//     successfully. walkForEstimate's own mirror branch is additionally
+//     unreachable *by construction*: planPackage skips planPrecompute
+//     entirely when p.estimateOnly is true (see planPackage's own
+//     "if !p.estimateOnly" gate), so plan() can never return a non-nil error
+//     when called with estimateOnly:true — the walkForEstimate call site
+//     this specific "if err != nil" guards is dead code today. Flagged here
+//     per this task's instructions rather than silently left or deleted;
+//     removing it is a production-code change outside a test-only task's
+//     scope.
+//   - load()'s "len(pkgs) == 0" branch: empirically, every packages.Load
+//     invocation against the standard `go list`-backed driver — a
+//     nonexistent Dir, an unmatched pattern, an empty pattern, a directory
+//     with no Go files — returns either a non-nil top-level error or at
+//     least one synthesized package carrying an Errors entry, never a bare
+//     empty, error-free slice. This appears to guard a non-standard
+//     packages.Driver implementation (see packages.Config's Driver field,
+//     selectable via GOPACKAGESDRIVER) that this project does not use and
+//     has no seam to fake.
+//   - planScope's "ctx cancelled specifically between buildImpact() failing
+//     and planScope's own follow-up ctx.Err() check" branch: the other two
+//     outcomes of that call (ctx already cancelled beforehand; buildImpact
+//     fails with ctx never cancelled) are both covered directly by
+//     TestPlanScope below. This third one requires ctx to become cancelled
+//     during buildImpact's real subprocess call specifically — a genuine
+//     race with no deterministic trigger short of synchronizing against a
+//     purpose-built fake toolchain binary, which is exactly the kind of
+//     unsafe/brittle mocking this project's own documented-exception
+//     precedent (see above) argues against taking on for one branch.
+//   - mutateFile's printer.Fprint error branch: printer.Fprint's only
+//     documented failure mode is the underlying io.Writer returning an
+//     error, and the target here is a bytes.Buffer, whose Write never
+//     errors. Reaching this branch would need a deliberately malformed
+//     *ast.File engineered to make go/printer itself misbehave in a way
+//     that returns an error rather than panicking — not a realistic input
+//     this engine ever produces (every AST it walks came from parser.ParseFile
+//     or packages.Load's own type-checked Syntax) and not worth fabricating
+//     just to touch this line.
+
+// engineCtxErrAfterFirst is a context.Context whose Err() returns nil on its
+// first call and context.Canceled on every call after — used to
+// deterministically trigger a cancellation check that sits *after* at least
+// one other ctx.Err() call has already had to return nil, without racing a
+// real goroutine-based cancel against the code under test.
+type engineCtxErrAfterFirst struct {
+	context.Context
+	calls atomic.Int32
+}
+
+func (c *engineCtxErrAfterFirst) Err() error {
+	if c.calls.Add(1) == 1 {
+		return nil
+	}
+
+	return context.Canceled
+}
+
+// TestOptionsPatterns covers patterns()'s empty-means-"." convention, the
+// same zero-value-means-everything shape mutators()/parallel() already have
+// their own dedicated tests for in this file.
+func TestOptionsPatterns(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		packages []string
+		want     []string
+	}{
+		"empty defaults to dot": {
+			packages: nil,
+			want:     []string{"."},
+		},
+		"nonempty kept verbatim": {
+			packages: []string{"./...", "./cmd/..."},
+			want:     []string{"./...", "./cmd/..."},
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			got := (Options{Packages: tt.packages}).patterns()
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("patterns() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestBaselineTimeoutInvalidRunsOrCPUs covers the defensive floor: a
+// non-positive runs or cpus count returns MinBaselineTimeout immediately,
+// without ever calling the suite timer.
+func TestBaselineTimeoutInvalidRunsOrCPUs(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct{ runs, cpus int }{
+		"zero runs":     {runs: 0, cpus: 4},
+		"negative runs": {runs: -1, cpus: 4},
+		"zero cpus":     {runs: 3, cpus: 0},
+		"negative cpus": {runs: 3, cpus: -1},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			var calls int
+
+			timer := func(context.Context) (time.Duration, error) {
+				calls++
+
+				return time.Minute, nil
+			}
+
+			got, err := baselineTimeout(t.Context(), tt.runs, tt.cpus, timer)
+			if err != nil {
+				t.Fatalf("baselineTimeout() error = %v", err)
+			}
+
+			if got != MinBaselineTimeout {
+				t.Errorf("baselineTimeout() = %v, want %v (the floor)", got, MinBaselineTimeout)
+			}
+
+			if calls != 0 {
+				t.Errorf("baselineTimeout() timed the suite %d time(s) despite runs=%d cpus=%d, want 0", calls, tt.runs, tt.cpus)
+			}
+		})
+	}
+}
+
+// TestSortResultEquivalentsOrdering is [TestCollectorSorts]'s counterpart
+// for Result.Equivalents: the same file/line/operator/description tie-break
+// chain, but exercised directly against sortResult since collector.consume
+// only ever calls it after every channel is closed.
+func TestSortResultEquivalentsOrdering(t *testing.T) {
+	t.Parallel()
+
+	result := &Result{
+		Equivalents: []EquivalentResult{
+			{File: "b.go", Line: 1, Operator: "control/if", Description: "x"},
+			{File: "a.go", Line: 9, Operator: "control/if", Description: "x"},
+			{File: "a.go", Line: 2, Operator: "operator/binary", Description: "b"},
+			{File: "a.go", Line: 2, Operator: "control/if", Description: "z"},
+			{File: "a.go", Line: 2, Operator: "control/if", Description: "a"},
+		},
+	}
+
+	sortResult(result)
+
+	want := []string{
+		"a.go:2:control/if:a",
+		"a.go:2:control/if:z",
+		"a.go:2:operator/binary:b",
+		"a.go:9:control/if:x",
+		"b.go:1:control/if:x",
+	}
+
+	for i, e := range result.Equivalents {
+		if key := fmt.Sprintf("%s:%d:%s:%s", e.File, e.Line, e.Operator, e.Description); key != want[i] {
+			t.Errorf("equivalent %d = %s, want %s", i, key, want[i])
+		}
+	}
+}
+
+// TestPlanClosure covers every way planClosure declines before ever
+// producing a real closure: [ScopeFull] (a forward closure is provably
+// wrong there), no closurePkgs loaded this run, no variant found for dir,
+// and resolveClosure itself declining (here, a variant with no Module info,
+// the cheapest way to make resolveClosure's own moduleDir=="" check fire).
+func TestPlanClosure(t *testing.T) {
+	t.Parallel()
+
+	const dir = "/some/pkg/dir"
+
+	t.Run("ScopeFull always declines", func(t *testing.T) {
+		t.Parallel()
+
+		closurePkgs := map[string][]*packages.Package{dir: {{}}}
+		if got := planClosure(ScopeFull, closurePkgs, dir); got != nil {
+			t.Errorf("planClosure() = %v, want nil under ScopeFull", got)
+		}
+	})
+
+	t.Run("nil closurePkgs declines", func(t *testing.T) {
+		t.Parallel()
+
+		if got := planClosure(ScopePackage, nil, dir); got != nil {
+			t.Errorf("planClosure() = %v, want nil when closurePkgs is nil", got)
+		}
+	})
+
+	t.Run("dir not resolved this run declines", func(t *testing.T) {
+		t.Parallel()
+
+		closurePkgs := map[string][]*packages.Package{"/other/dir": {{}}}
+		if got := planClosure(ScopePackage, closurePkgs, dir); got != nil {
+			t.Errorf("planClosure() = %v, want nil when dir has no entry", got)
+		}
+	})
+
+	t.Run("resolveClosure declines", func(t *testing.T) {
+		t.Parallel()
+
+		closurePkgs := map[string][]*packages.Package{dir: {{}}}
+		if got := planClosure(ScopePackage, closurePkgs, dir); got != nil {
+			t.Errorf("planClosure() = %v, want nil when resolveClosure declines", got)
+		}
+	})
+}
+
+// TestPlanScope covers the non-impact no-op short circuit, the
+// already-cancelled-context short circuit ahead of buildImpact, and
+// buildImpact failing (ctx never cancelled) demoting to [ScopePackage]
+// rather than failing. See the documented-gaps comment above this block for
+// the one remaining planScope branch left uncovered.
+func TestPlanScope(t *testing.T) {
+	t.Parallel()
+
+	t.Run("non-impact scope is a no-op", func(t *testing.T) {
+		t.Parallel()
+
+		scope, cover, err := planScope(t.Context(), "/nonexistent/go", ScopePackage, nil, nil)
+		if err != nil || scope != ScopePackage || cover != nil {
+			t.Errorf("planScope() = (%v, %v, %v), want (%v, nil, nil)", scope, cover, err, ScopePackage)
+		}
+	})
+
+	t.Run("cancelled context before buildImpact", func(t *testing.T) {
+		t.Parallel()
+
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+
+		_, _, err := planScope(ctx, "/nonexistent/go", ScopeImpact, nil, nil)
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("planScope() error = %v, want %v", err, context.Canceled)
+		}
+	})
+
+	t.Run("buildImpact failure demotes to package scope", func(t *testing.T) {
+		t.Parallel()
+
+		root := t.TempDir()
+		pkg := &packages.Package{
+			Module:  &packages.Module{Dir: root},
+			GoFiles: []string{filepath.Join(root, "f.go")},
+		}
+
+		scope, cover, err := planScope(t.Context(), "/nonexistent/go", ScopeImpact, pkg, pkg.GoFiles)
+		if err != nil {
+			t.Fatalf("planScope() error = %v", err)
+		}
+
+		if scope != ScopePackage || cover != nil {
+			t.Errorf("planScope() = (%v, %v), want (%v, nil): a failed coverage build must fail soft", scope, cover, ScopePackage)
+		}
+	})
+}
+
+// TestPlanTCEBaseline covers the TCE-disabled no-op, the
+// already-cancelled-context short circuit, and packagePattern failing
+// (mismatched absolute/relative moduleDir and firstFile) failing soft
+// rather than propagating.
+func TestPlanTCEBaseline(t *testing.T) {
+	t.Parallel()
+
+	t.Run("TCE disabled is a no-op", func(t *testing.T) {
+		t.Parallel()
+
+		got, err := planTCEBaseline(t.Context(), "/nonexistent/go", Options{}, "/mod", "/mod/f.go")
+		if err != nil || got != nil {
+			t.Errorf("planTCEBaseline() = (%v, %v), want (nil, nil) when TCE is off", got, err)
+		}
+	})
+
+	t.Run("cancelled context", func(t *testing.T) {
+		t.Parallel()
+
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+
+		_, err := planTCEBaseline(ctx, "/nonexistent/go", Options{TCE: true}, "/mod", "/mod/f.go")
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("planTCEBaseline() error = %v, want %v", err, context.Canceled)
+		}
+	})
+
+	t.Run("packagePattern failure fails soft", func(t *testing.T) {
+		t.Parallel()
+
+		got, err := planTCEBaseline(t.Context(), "/nonexistent/go", Options{TCE: true}, "relative/moduledir", "/absolute/f.go")
+		if err != nil || got != nil {
+			t.Errorf("planTCEBaseline() = (%v, %v), want (nil, nil): a packagePattern failure must fail soft", got, err)
+		}
+	})
+}
+
+// TestPlanCacheFingerprint covers the CacheDir-unset no-op, the
+// already-cancelled-context short circuit, and cacheFingerprint itself
+// failing (a moduleDir that cannot be walked) propagating as a real error —
+// unlike planScope/planTCEBaseline's optimisation failures, this one is not
+// fail-soft (see planCacheFingerprint's own doc comment for why).
+func TestPlanCacheFingerprint(t *testing.T) {
+	t.Parallel()
+
+	t.Run("CacheDir unset is a no-op", func(t *testing.T) {
+		t.Parallel()
+
+		got, err := planCacheFingerprint(t.Context(), Options{}, "/mod", nil, map[string]string{})
+		if err != nil || got != "" {
+			t.Errorf("planCacheFingerprint() = (%q, %v), want (\"\", nil)", got, err)
+		}
+	})
+
+	t.Run("cancelled context", func(t *testing.T) {
+		t.Parallel()
+
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+
+		_, err := planCacheFingerprint(ctx, Options{CacheDir: "cache"}, "/mod", nil, map[string]string{})
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("planCacheFingerprint() error = %v, want %v", err, context.Canceled)
+		}
+	})
+
+	t.Run("fingerprint failure propagates", func(t *testing.T) {
+		t.Parallel()
+
+		_, err := planCacheFingerprint(t.Context(), Options{CacheDir: "cache"}, "/nonexistent/module/dir/xyz", nil, map[string]string{})
+		if err == nil {
+			t.Error("planCacheFingerprint() error = nil, want an error for a module directory that cannot be walked")
+		}
+	})
+}
+
+// TestPlanPrecomputePropagatesErrors isolates each of planPrecompute's three
+// error-propagation branches by toggling exactly one of Scope/TCE/CacheDir
+// against an already-cancelled context, so only the corresponding
+// sub-precompute's own ctx.Err() check is ever reached.
+func TestPlanPrecomputePropagatesErrors(t *testing.T) {
+	t.Parallel()
+
+	t.Run("planScope error", func(t *testing.T) {
+		t.Parallel()
+
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+
+		p := planner{goBin: "/nonexistent/go", opts: Options{Scope: ScopeImpact}}
+
+		_, err := planPrecompute(ctx, p, &packages.Package{}, []string{"x.go"}, map[string]string{})
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("planPrecompute() error = %v, want %v", err, context.Canceled)
+		}
+	})
+
+	t.Run("planTCEBaseline error", func(t *testing.T) {
+		t.Parallel()
+
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+
+		p := planner{goBin: "/nonexistent/go", opts: Options{TCE: true}}
+		pkg := &packages.Package{Module: &packages.Module{Dir: "/mod"}}
+
+		_, err := planPrecompute(ctx, p, pkg, []string{"/mod/x.go"}, map[string]string{})
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("planPrecompute() error = %v, want %v", err, context.Canceled)
+		}
+	})
+
+	t.Run("planCacheFingerprint error", func(t *testing.T) {
+		t.Parallel()
+
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+
+		p := planner{goBin: "/nonexistent/go", opts: Options{CacheDir: "cache"}}
+		pkg := &packages.Package{Module: &packages.Module{Dir: "/mod"}}
+
+		_, err := planPrecompute(ctx, p, pkg, []string{"/mod/x.go"}, map[string]string{})
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("planPrecompute() error = %v, want %v", err, context.Canceled)
+		}
+	})
+}
+
+// TestPlanPackage covers planPackage's three "nothing to mutate here"
+// no-ops (no module, empty module dir, every GoFile is a _test.go) plus
+// planPrecompute's error propagating through unchanged.
+func TestPlanPackage(t *testing.T) {
+	t.Parallel()
+
+	t.Run("nil module is skipped", func(t *testing.T) {
+		t.Parallel()
+
+		jobs, err := planPackage(t.Context(), planner{}, &packages.Package{}, map[string]string{})
+		if err != nil || jobs != nil {
+			t.Errorf("planPackage() = (%v, %v), want (nil, nil) for a package with no module", jobs, err)
+		}
+	})
+
+	t.Run("empty module dir is skipped", func(t *testing.T) {
+		t.Parallel()
+
+		pkg := &packages.Package{Module: &packages.Module{Dir: ""}}
+
+		jobs, err := planPackage(t.Context(), planner{}, pkg, map[string]string{})
+		if err != nil || jobs != nil {
+			t.Errorf("planPackage() = (%v, %v), want (nil, nil) for an empty module dir", jobs, err)
+		}
+	})
+
+	t.Run("only test files is skipped", func(t *testing.T) {
+		t.Parallel()
+
+		pkg := &packages.Package{
+			Module:  &packages.Module{Dir: "/mod"},
+			GoFiles: []string{"/mod/foo_test.go"},
+		}
+
+		jobs, err := planPackage(t.Context(), planner{estimateOnly: true}, pkg, map[string]string{})
+		if err != nil || jobs != nil {
+			t.Errorf("planPackage() = (%v, %v), want (nil, nil) when every GoFile is a _test.go", jobs, err)
+		}
+	})
+
+	t.Run("planPrecompute error propagates", func(t *testing.T) {
+		t.Parallel()
+
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+
+		pkg := &packages.Package{
+			Module:  &packages.Module{Dir: "/mod"},
+			GoFiles: []string{"/mod/f.go"},
+		}
+		p := planner{goBin: "/nonexistent/go", opts: Options{CacheDir: "cache"}}
+
+		jobs, err := planPackage(ctx, p, pkg, map[string]string{})
+		if !errors.Is(err, context.Canceled) || jobs != nil {
+			t.Errorf("planPackage() = (%v, %v), want (nil, %v)", jobs, err, context.Canceled)
+		}
+	})
+}
+
+// TestBindMutators covers the typedPkg==nil half of bindMutators: a
+// TypedMutator selected without usable type information for the package is
+// dropped entirely, while a plain, untyped mutator passes through as the
+// identical, run-wide shared instance.
+func TestBindMutators(t *testing.T) {
+	t.Parallel()
+
+	plain, err := mutator.New("control/if")
+	if err != nil {
+		t.Fatalf("mutator.New(control/if) error = %v", err)
+	}
+
+	typed, err := mutator.New("identifier/constswap")
+	if err != nil {
+		t.Fatalf("mutator.New(identifier/constswap) error = %v", err)
+	}
+
+	got := bindMutators([]mutator.Mutator{plain, typed}, nil)
+
+	if len(got) != 1 {
+		t.Fatalf("bindMutators() with no usable type info returned %d mutator(s), want 1 (the typed one dropped)", len(got))
+	}
+
+	if got[0].Name() != plain.Name() {
+		t.Errorf("bindMutators() kept %q, want the untyped operator %q", got[0].Name(), plain.Name())
+	}
+}
+
+// TestSyntaxForNoMatch covers syntaxFor's fallback: a path that is not
+// among typedPkg.CompiledGoFiles returns nil rather than panicking or
+// returning a mismatched tree.
+func TestSyntaxForNoMatch(t *testing.T) {
+	t.Parallel()
+
+	typedPkg := &packages.Package{
+		CompiledGoFiles: []string{"/a/b/other.go"},
+		Syntax:          []*ast.File{{}},
+	}
+
+	if got := syntaxFor(typedPkg, "/a/b/target.go"); got != nil {
+		t.Errorf("syntaxFor() = %v, want nil when path is not among CompiledGoFiles", got)
+	}
+}
+
+// TestMutateFileParseError covers the parser.ParseFile failure path: a file
+// with invalid Go syntax must fail the walk with a wrapped parse error
+// rather than panicking or silently skipping the file.
+func TestMutateFileParseError(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	path := filepath.Join(root, "broken.go")
+
+	if err := os.WriteFile(path, []byte("package broken\n\nfunc F( {\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	job := &fileJob{moduleDir: root, path: path}
+
+	err := mutateFile(t.Context(), nil, job, nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "parsing") {
+		t.Errorf("mutateFile() error = %v, want it to name a parse failure", err)
+	}
+}
+
+// TestMutateFileRelPathFallback covers filepath.Rel's own failure inside
+// mutateFile: a moduleDir that cannot be made relative to path (mismatched
+// absolute/relative) must fall back to the absolute path rather than
+// failing the whole walk — mutateFile has nothing else to do with an empty
+// mutators list, so a clean, error-free return is the only observable
+// proof the fallback was taken instead of the walk aborting.
+func TestMutateFileRelPathFallback(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	path := filepath.Join(root, "ok.go")
+
+	if err := os.WriteFile(path, []byte("package ok\n\nfunc F() {}\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	// A relative moduleDir against an absolute path is exactly what makes
+	// filepath.Rel itself return an error (verified directly against
+	// filepath.Rel's own documented behaviour, not an assumption).
+	job := &fileJob{moduleDir: "relative/moduledir", path: path}
+
+	if err := mutateFile(t.Context(), nil, job, nil, nil); err != nil {
+		t.Errorf("mutateFile() error = %v, want nil: an unrelatable moduleDir should fall back, not fail the walk", err)
+	}
+}
+
+// TestMutateFileCtxCancelledDuringWalk covers the ast.Inspect-level
+// cancellation check, distinct from [TestMutateFileStopsWhenCancelled]'s
+// already-cancelled-before-the-call case: engineCtxErrAfterFirst lets the
+// pre-parse check (the first ctx.Err() call) see a live context, then
+// reports cancellation starting from the very first AST node the walk
+// visits.
+func TestMutateFileCtxCancelledDuringWalk(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	path := filepath.Join(root, "ok.go")
+
+	if err := os.WriteFile(path, []byte("package ok\n\nfunc F() {}\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	ctx := &engineCtxErrAfterFirst{Context: t.Context()}
+	job := &fileJob{moduleDir: root, path: path}
+
+	err := mutateFile(ctx, nil, job, nil, nil)
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("mutateFile() error = %v, want %v", err, context.Canceled)
+	}
+}
+
+// TestVisitNodeFuncPatternSkip covers the FuncPattern filter: a function
+// whose name does not match must be skipped (visit=false) before suppression
+// or any mutator is ever consulted.
+func TestVisitNodeFuncPatternSkip(t *testing.T) {
+	t.Parallel()
+
+	fset := token.NewFileSet()
+
+	file, err := parser.ParseFile(fset, "skip.go", "package skip\n\nfunc Foo() {}\n", parser.ParseComments)
+	if err != nil {
+		t.Fatalf("ParseFile() error = %v", err)
+	}
+
+	var funcDecl *ast.FuncDecl
+
+	ast.Inspect(file, func(n ast.Node) bool {
+		if fd, ok := n.(*ast.FuncDecl); ok {
+			funcDecl = fd
+
+			return false
+		}
+
+		return true
+	})
+
+	if funcDecl == nil {
+		t.Fatal("no FuncDecl found in fixture source")
+	}
+
+	w := walkState{job: &fileJob{funcPattern: regexp.MustCompile("^Bar$")}}
+	spec := &mutant{fset: fset}
+
+	visit, err := visitNode(t.Context(), w, spec, funcDecl)
+	if err != nil {
+		t.Fatalf("visitNode() error = %v", err)
+	}
+
+	if visit {
+		t.Error("visitNode() visit = true, want false: FuncPattern should have skipped Foo")
+	}
+}
+
+// TestVisitMutationsCtxCancelled covers visitMutations' own mid-loop
+// cancellation check, called directly with an already-cancelled context so
+// the very first mutation offered hits it — distinct from
+// [TestMutateFileStopsWhenCancelled]'s outer-walk check and
+// [TestMutateFileCtxCancelledDuringWalk]'s ast.Inspect-level one.
+func TestVisitMutationsCtxCancelled(t *testing.T) {
+	t.Parallel()
+
+	fset := token.NewFileSet()
+
+	src := "package cond\n\nfunc F() {\n\tif true {\n\t\tprintln()\n\t}\n}\n"
+
+	file, err := parser.ParseFile(fset, "cond.go", src, parser.ParseComments)
+	if err != nil {
+		t.Fatalf("ParseFile() error = %v", err)
+	}
+
+	var ifStmt *ast.IfStmt
+
+	ast.Inspect(file, func(n ast.Node) bool {
+		if is, ok := n.(*ast.IfStmt); ok {
+			ifStmt = is
+
+			return false
+		}
+
+		return true
+	})
+
+	if ifStmt == nil {
+		t.Fatal("no IfStmt found in fixture source")
+	}
+
+	m, err := mutator.New("control/if")
+	if err != nil {
+		t.Fatalf("mutator.New(control/if) error = %v", err)
+	}
+
+	if !m.Applies(ifStmt) {
+		t.Fatal("control/if does not apply to the fixture's if statement")
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	w := walkState{job: &fileJob{}, dedup: make(idDeduper)}
+	spec := &mutant{fset: fset, path: "cond.go"}
+
+	if err := visitMutations(ctx, w, spec, m, ifStmt); !errors.Is(err, context.Canceled) {
+		t.Errorf("visitMutations() error = %v, want %v", err, context.Canceled)
+	}
+}
+
+// TestPackageBaselineErrors covers both of packageBaseline's fail-soft
+// zero-baseline outcomes: packagePattern failing (mismatched
+// absolute/relative moduleDir/pkgDir) and goTestSuite itself failing (a
+// nonexistent go binary, the same defensive pattern every other whitebox
+// test in this package uses).
+func TestPackageBaselineErrors(t *testing.T) {
+	t.Parallel()
+
+	t.Run("packagePattern failure", func(t *testing.T) {
+		t.Parallel()
+
+		got := packageBaseline(t.Context(), "/nonexistent/go", "relative/moduledir", "/absolute/pkgdir")
+		if got != 0 {
+			t.Errorf("packageBaseline() = %v, want 0 when the package cannot be located within the module", got)
+		}
+	})
+
+	t.Run("goTestSuite failure", func(t *testing.T) {
+		t.Parallel()
+
+		root := t.TempDir()
+
+		got := packageBaseline(t.Context(), "/nonexistent/go", root, root)
+		if got != 0 {
+			t.Errorf("packageBaseline() = %v, want 0 when the toolchain cannot be run", got)
+		}
+	})
+}
+
+// TestBuildEstimateResultScopeFull covers the [ScopeFull] branch: a single
+// whole-module baseline sample is timed once (never reached under a
+// narrower scope, which every other buildEstimateResult-exercising test in
+// this package uses instead) and applied identically to every package.
+func TestBuildEstimateResultScopeFull(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	counts := estimateCounts{
+		total: 3,
+		order: []string{"example.com/pkg"},
+		hits:  map[string]*pkgHits{"example.com/pkg": {moduleDir: root, pkgDir: root, count: 3}},
+	}
+
+	result := buildEstimateResult(t.Context(), "/nonexistent/go", Options{Scope: ScopeFull, Parallel: 2}, counts)
+
+	if result.Total != 3 {
+		t.Errorf("Total = %d, want 3", result.Total)
+	}
+
+	if len(result.Packages) != 1 || result.Packages[0].Baseline != 0 {
+		t.Errorf("Packages = %+v, want one entry with a zero baseline (the toolchain call failed)", result.Packages)
+	}
+}
+
+// TestLoadTopLevelError, TestLoadTypedTopLevelError and
+// TestLoadClosuresTopLevelError each cover their own function's top-level
+// packages.Load() error return — as opposed to the per-package errs>0 path
+// [TestRunRejectsUnknownPackages]/[TestEstimateRejectsInvalidOptions] already
+// cover — via a Dir that does not exist at all, which fails during
+// packages.Load's own chdir before it ever gets to resolving a pattern.
+// Calling these directly, independent of load()'s own success, is the only
+// way to isolate loadTyped's/loadClosures's own error return: called
+// through Run/Estimate, an unusable Dir always fails load()'s identical,
+// earlier call first. This is a real (but cheap — `go list` fails near
+// instantly on a missing directory, no compilation or test execution)
+// subprocess call, the same "go list is not toolchain execution" precedent
+// [TestWalkForEstimateSpawnsNoSubprocess] already establishes for this file.
+func TestLoadTopLevelError(t *testing.T) {
+	t.Parallel()
+
+	if _, err := load(t.Context(), Options{Dir: "/nonexistent/dir/turango-xyz"}); err == nil {
+		t.Fatal("load() error = nil, want an error for a nonexistent Dir")
+	}
+}
+
+func TestLoadTypedTopLevelError(t *testing.T) {
+	t.Parallel()
+
+	if _, err := loadTyped(t.Context(), Options{Dir: "/nonexistent/dir/turango-xyz"}); err == nil {
+		t.Fatal("loadTyped() error = nil, want an error for a nonexistent Dir")
+	}
+}
+
+func TestLoadClosuresTopLevelError(t *testing.T) {
+	t.Parallel()
+
+	if _, err := loadClosures(t.Context(), Options{Dir: "/nonexistent/dir/turango-xyz"}); err == nil {
+		t.Fatal("loadClosures() error = nil, want an error for a nonexistent Dir")
+	}
+}
+
+// TestLoadClosuresSkipsFilelessPackage covers loadClosures' fileless-package
+// skip: a directory holding only a black-box "_test.go" file (package
+// foo_test, no foo.go at all) makes packages.Load, under Tests:true,
+// synthesize a base production-package entry with empty GoFiles *and*
+// CompiledGoFiles *and* no Errors — confirmed empirically against the real
+// go/packages driver, not assumed — which loadClosures must skip rather
+// than recording under a zero-length files[0] index.
+func TestLoadClosuresSkipsFilelessPackage(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+
+	files := map[string]string{
+		filepath.Join(root, "go.mod"):                 "module example.com/fileless\n\ngo 1.23\n",
+		filepath.Join(root, "extonly", "foo_test.go"): "package foo_test\n\nimport \"testing\"\n\nfunc TestFoo(t *testing.T) {}\n",
+	}
+
+	for path, content := range files {
+		if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+			t.Fatalf("MkdirAll(%s) error = %v", filepath.Dir(path), err)
+		}
+
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatalf("WriteFile(%s) error = %v", path, err)
+		}
+	}
+
+	byDir, err := loadClosures(t.Context(), Options{Dir: root, Packages: []string{"./..."}})
+	if err != nil {
+		t.Fatalf("loadClosures() error = %v", err)
+	}
+
+	extonlyDir := filepath.Join(root, "extonly")
+
+	entries := byDir[extonlyDir]
+	if len(entries) == 0 {
+		t.Fatalf("loadClosures() has no entries for %s, want at least the external test variant", extonlyDir)
+	}
+
+	for _, pkg := range entries {
+		if len(pkg.GoFiles) == 0 && len(pkg.CompiledGoFiles) == 0 {
+			t.Errorf("loadClosures() kept a fileless package variant %+v, want the fileless base variant skipped entirely", pkg)
+		}
 	}
 }
