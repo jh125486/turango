@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -120,14 +121,42 @@ example.com/p/p.go:4.1,5.2 1 2
 	}
 }
 
-func TestImpactMapMergeRejectsGarbage(t *testing.T) {
+// TestImpactMapMergeProfileErrors covers merge's two non-happy-path
+// profilePath cases: a file that exists but isn't a coverage profile at all
+// (a real parse error), and a profile that was never written (the
+// os.IsNotExist branch that buildImpact's doc comment says a test skipped
+// before it runs anything can leave behind) — which merge treats as "covered
+// nothing" rather than an error.
+func TestImpactMapMergeProfileErrors(t *testing.T) {
 	t.Parallel()
 
-	m := &impactMap{lines: make(map[string]map[int][]string)}
+	goFiles := []string{"/abs/p/p.go"}
 
-	err := m.merge(writeProfile(t, "this is not a coverage profile\n"), "TestX", []string{"/abs/p/p.go"})
-	if err == nil {
-		t.Fatal("merge() error = nil, want an error for an unparseable profile")
+	tests := map[string]struct {
+		path    func(t *testing.T) string
+		wantErr bool
+	}{
+		"unparseable profile is a real error": {
+			path:    func(t *testing.T) string { return writeProfile(t, "this is not a coverage profile\n") },
+			wantErr: true,
+		},
+		"a profile that was never written is not an error": {
+			path:    func(t *testing.T) string { return filepath.Join(t.TempDir(), "never-written.out") },
+			wantErr: false,
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			m := &impactMap{lines: make(map[string]map[int][]string)}
+
+			err := m.merge(tt.path(t), "TestX", goFiles)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("merge() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
 	}
 }
 
@@ -171,5 +200,55 @@ func TestMatchProfileFile(t *testing.T) {
 
 	if _, ok := matchProfileFile("example.com/other/nope.go", goFiles); ok {
 		t.Error("matchProfileFile() matched a file outside the package")
+	}
+}
+
+// TestBuildImpactEarlyErrors covers the two error returns buildImpact can
+// take before it ever shells out successfully to the real Go toolchain, so
+// neither case needs a working "go" on PATH or the "integration" build tag
+// buildImpact's other (real-toolchain) branches need in
+// impact_integration_internal_test.go: packagePattern failing on a
+// (moduleDir, pkgDir) pair that cannot be related (one absolute, one
+// relative), and listTests failing outright because goBin does not exist.
+func TestBuildImpactEarlyErrors(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		goBin             string
+		moduleDir, pkgDir string
+		wantErrStr        string
+	}{
+		"packagePattern cannot relate an absolute pkgDir to a relative moduleDir": {
+			goBin: "go", moduleDir: "relative/module", pkgDir: "/abs/pkg",
+			wantErrStr: "locating package",
+		},
+		"listTests fails outright when goBin does not exist": {
+			goBin: "/nonexistent/turango-test-go-binary", moduleDir: t.TempDir(), pkgDir: t.TempDir(),
+			wantErrStr: "listing tests",
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := buildImpact(t.Context(), tt.goBin, tt.moduleDir, tt.pkgDir, nil)
+			if err == nil || !strings.Contains(err.Error(), tt.wantErrStr) {
+				t.Errorf("buildImpact() error = %v, want it to contain %q", err, tt.wantErrStr)
+			}
+		})
+	}
+}
+
+// TestListTestsError covers listTests' own error return directly: a
+// nonexistent goBin never even starts, which real success-path coverage of
+// listTests (via buildImpact, exercised end to end in
+// impact_integration_internal_test.go and engine_integration_test.go) never
+// reaches.
+func TestListTestsError(t *testing.T) {
+	t.Parallel()
+
+	if _, err := listTests(t.Context(), "/nonexistent/turango-test-go-binary", t.TempDir(), "."); err == nil {
+		t.Error("listTests() error = nil for a nonexistent goBin, want an error")
 	}
 }

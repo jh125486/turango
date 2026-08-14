@@ -11,9 +11,14 @@ package mutate
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -215,6 +220,29 @@ func TestCacheFingerprint(t *testing.T) {
 
 		if _, err := cacheFingerprint(filepath.Join(t.TempDir(), "does-not-exist"), nil); err == nil {
 			t.Error("cacheFingerprint() error = nil for a nonexistent directory, want an error")
+		}
+	})
+
+	t.Run("a fingerprintFile failure on one walked file propagates out of cacheFingerprint itself", func(t *testing.T) {
+		t.Parallel()
+
+		cacheSkipIfPrivileged(t)
+
+		root := writeFingerprintModule(t, "package p\n\nconst X = 1\n")
+		secret := filepath.Join(root, "secret.go")
+
+		if err := os.WriteFile(secret, []byte("package p\n"), 0o600); err != nil {
+			t.Fatalf("WriteFile(%s) error = %v", secret, err)
+		}
+
+		if err := os.Chmod(secret, 0o000); err != nil {
+			t.Fatalf("Chmod(%s) error = %v", secret, err)
+		}
+
+		t.Cleanup(func() { _ = os.Chmod(secret, 0o600) })
+
+		if _, err := cacheFingerprint(root, nil); err == nil {
+			t.Error("cacheFingerprint() error = nil for a module containing an unreadable file, want the fingerprintFile error to propagate")
 		}
 	})
 }
@@ -440,4 +468,360 @@ func TestCacheRecordJSONRoundTrip(t *testing.T) {
 			}
 		})
 	}
+}
+
+// cacheSkipIfPrivileged skips a permission-dependent subtest under root
+// (where every permission check trivially passes, defeating the point of the
+// test) and on Windows (where filepath.Rel/os.Chmod's Unix permission-bit
+// semantics this file relies on do not hold).
+func cacheSkipIfPrivileged(t *testing.T) {
+	t.Helper()
+
+	if runtime.GOOS == "windows" {
+		t.Skip("permission-bit semantics this test relies on are Unix-specific")
+	}
+
+	if cacheRunningAsRoot() {
+		t.Skip("running as root: permission checks this test relies on always pass")
+	}
+}
+
+// cacheFailAfterNWriter is a minimal io.Writer stub that succeeds its first n
+// Write calls and fails every call after — the only way to reach
+// fingerprintFile's three h.Write error-propagation branches, since the real
+// sha256.Writer [cacheFingerprint] always passes it never itself errors.
+type cacheFailAfterNWriter struct {
+	n     int
+	calls int
+}
+
+func (w *cacheFailAfterNWriter) Write(p []byte) (int, error) {
+	w.calls++
+
+	if w.calls > w.n {
+		return 0, errors.New("cacheFailAfterNWriter: injected write error")
+	}
+
+	return len(p), nil
+}
+
+// TestFingerprintFile covers fingerprintFile directly (rather than only
+// through cacheFingerprint's whole-file-set callers), which is the only way
+// to reach: a mismatched relative/absolute (base, path) pair, where
+// filepath.Rel errors and rel silently falls back to path rather than
+// fingerprintFile failing outright; a path that is a directory rather than a
+// file, where os.ReadFile fails with something other than "not a symlink";
+// and all three h.Write error-propagation branches, unreachable through the
+// real sha256.Writer every other caller uses.
+func TestFingerprintFile(t *testing.T) {
+	t.Parallel()
+
+	realFile := filepath.Join(t.TempDir(), "real.txt")
+	if err := os.WriteFile(realFile, []byte("hello, fingerprint"), 0o600); err != nil {
+		t.Fatalf("WriteFile(%s) error = %v", realFile, err)
+	}
+
+	t.Run("error/no-error paths", func(t *testing.T) {
+		t.Parallel()
+
+		dir := t.TempDir()
+
+		tests := map[string]struct {
+			base, path string
+			wantErrStr string
+		}{
+			"mismatched relative base falls back to path, not an error": {
+				base: "not/a/real/base", path: realFile, wantErrStr: "",
+			},
+			"nonexistent path is a real Lstat error": {
+				base: dir, path: filepath.Join(dir, "does-not-exist"), wantErrStr: "mutate: reading",
+			},
+			"a directory path is a real ReadFile error": {
+				base: dir, path: dir, wantErrStr: "mutate: reading",
+			},
+		}
+
+		for name, tt := range tests {
+			t.Run(name, func(t *testing.T) {
+				t.Parallel()
+
+				err := fingerprintFile(io.Discard, tt.base, tt.path)
+
+				if tt.wantErrStr == "" {
+					if err != nil {
+						t.Errorf("fingerprintFile() error = %v, want nil", err)
+					}
+
+					return
+				}
+
+				if err == nil || !strings.Contains(err.Error(), tt.wantErrStr) {
+					t.Errorf("fingerprintFile() error = %v, want it to contain %q", err, tt.wantErrStr)
+				}
+			})
+		}
+	})
+
+	t.Run("a symlink's target text stands in for content, matching copyTree's own placement", func(t *testing.T) {
+		t.Parallel()
+
+		// fingerprintFile hashes both the entry's base-relative name and its
+		// content, so the symlink and the plain file below are placed in
+		// separate subdirs under the same entry name ("entry") — matching
+		// names is what isolates the comparison to content alone, which is
+		// the concrete claim fingerprintFile's doc comment makes: a symlink's
+		// target text stands in for content, matching copyTree's own
+		// placement.
+		dir := t.TempDir()
+		linkDir := filepath.Join(dir, "as-symlink")
+		fileDir := filepath.Join(dir, "as-plain-file")
+
+		if err := os.Mkdir(linkDir, 0o700); err != nil {
+			t.Fatalf("Mkdir() error = %v", err)
+		}
+
+		if err := os.Mkdir(fileDir, 0o700); err != nil {
+			t.Fatalf("Mkdir() error = %v", err)
+		}
+
+		target := filepath.Join(dir, "target-does-not-need-to-exist")
+		link := filepath.Join(linkDir, "entry")
+
+		if err := os.Symlink(target, link); err != nil {
+			t.Fatalf("Symlink() error = %v", err)
+		}
+
+		hLink := sha256.New()
+		if err := fingerprintFile(hLink, linkDir, link); err != nil {
+			t.Fatalf("fingerprintFile(symlink) error = %v", err)
+		}
+
+		asFile := filepath.Join(fileDir, "entry")
+		if err := os.WriteFile(asFile, []byte(target), 0o600); err != nil {
+			t.Fatalf("WriteFile() error = %v", err)
+		}
+
+		hFile := sha256.New()
+		if err := fingerprintFile(hFile, fileDir, asFile); err != nil {
+			t.Fatalf("fingerprintFile(plain file) error = %v", err)
+		}
+
+		if got, want := hLink.Sum(nil), hFile.Sum(nil); !bytes.Equal(got, want) {
+			t.Errorf("fingerprintFile(symlink) = %x, want %x (same as plain file with identical name/content)", got, want)
+		}
+	})
+
+	t.Run("h.Write error propagation", func(t *testing.T) {
+		t.Parallel()
+
+		tests := map[string]struct{ failAfter int }{
+			"fails on the relative-name write":        {failAfter: 0},
+			"fails on the delimiter write after name": {failAfter: 1},
+			"fails on the content write":              {failAfter: 2},
+		}
+
+		for name, tt := range tests {
+			t.Run(name, func(t *testing.T) {
+				t.Parallel()
+
+				w := &cacheFailAfterNWriter{n: tt.failAfter}
+
+				err := fingerprintFile(w, filepath.Dir(realFile), realFile)
+				if err == nil || !strings.Contains(err.Error(), "injected write error") {
+					t.Errorf("fingerprintFile() error = %v, want the injected write error", err)
+				}
+			})
+		}
+	})
+}
+
+// TestLoadCacheIndexErrors covers loadCacheIndex's two filesystem error
+// paths TestLoadCacheIndex's happy/torn-write cases don't reach: a read
+// failure that is not "file does not exist" (a directory given as the cache
+// path), and a torn-write recovery whose corrective os.Truncate itself fails
+// (a read-only cache file).
+func TestLoadCacheIndexErrors(t *testing.T) {
+	t.Parallel()
+
+	t.Run("a directory as the cache path is a real, non-NotExist read error", func(t *testing.T) {
+		t.Parallel()
+
+		if _, err := loadCacheIndex(t.TempDir()); err == nil {
+			t.Error("loadCacheIndex() error = nil for a directory path, want a read error")
+		}
+	})
+
+	t.Run("a read-only file blocks the torn-write truncate recovery", func(t *testing.T) {
+		t.Parallel()
+
+		cacheSkipIfPrivileged(t)
+
+		path := filepath.Join(t.TempDir(), "mutate-cache.jsonl")
+
+		valid, err := json.Marshal(cacheRecord{Key: cacheKey{MutantID: "a"}, Status: Killed})
+		if err != nil {
+			t.Fatalf("Marshal() error = %v", err)
+		}
+
+		content := append([]byte(nil), valid...)
+		content = append(content, '\n')
+		content = append(content, []byte(`{"Key":{"MutantID":"torn"},"Stat`)...)
+
+		if err := os.WriteFile(path, content, 0o600); err != nil {
+			t.Fatalf("WriteFile(%s) error = %v", path, err)
+		}
+
+		if err := os.Chmod(path, 0o400); err != nil {
+			t.Fatalf("Chmod(%s) error = %v", path, err)
+		}
+
+		t.Cleanup(func() { _ = os.Chmod(path, 0o600) })
+
+		if _, err := loadCacheIndex(path); err == nil {
+			t.Error("loadCacheIndex() error = nil for a read-only file with a torn trailing write, want a truncate error")
+		}
+	})
+}
+
+// TestClosurePathsErrors covers closurePaths' branches TestCacheFingerprint's
+// narrow-scope cases don't reach: a go.mod/go.sum stat failure that is not
+// "file does not exist" (the containing directory is unreadable), a dirs
+// entry that cannot be listed at all, and a subdirectory inside a dirs entry
+// being skipped rather than included.
+func TestClosurePathsErrors(t *testing.T) {
+	t.Parallel()
+
+	t.Run("a blocked module directory is a real, non-NotExist stat error", func(t *testing.T) {
+		t.Parallel()
+
+		cacheSkipIfPrivileged(t)
+
+		parent := t.TempDir()
+		blocked := filepath.Join(parent, "blocked")
+
+		if err := os.Mkdir(blocked, 0o750); err != nil {
+			t.Fatalf("Mkdir(%s) error = %v", blocked, err)
+		}
+
+		//nolint:gosec // restoring the directory's own prior (0750) permission bits so t.TempDir()'s cleanup can traverse and remove it; gosec's G302 threshold is written for regular files, not directories, which need their execute bit back to be removable at all
+		t.Cleanup(func() { _ = os.Chmod(blocked, 0o750) })
+
+		if err := os.Chmod(blocked, 0o000); err != nil {
+			t.Fatalf("Chmod(%s) error = %v", blocked, err)
+		}
+
+		if _, err := closurePaths(blocked, nil); err == nil {
+			t.Error("closurePaths() error = nil for an unreadable module directory, want a stat error")
+		}
+	})
+
+	t.Run("a dirs entry that cannot be read is a real error", func(t *testing.T) {
+		t.Parallel()
+
+		root := t.TempDir()
+
+		if _, err := closurePaths(root, map[string]bool{filepath.Join(root, "does-not-exist"): true}); err == nil {
+			t.Error("closurePaths() error = nil for an unreadable dirs entry, want a read error")
+		}
+	})
+
+	t.Run("a subdirectory inside a dirs entry is skipped, its sibling file is not", func(t *testing.T) {
+		t.Parallel()
+
+		root := t.TempDir()
+
+		writeFiles(t, map[string]string{
+			filepath.Join(root, "a", "a.go"):           "package a\n",
+			filepath.Join(root, "a", "nested", "b.go"): "package nested\n",
+		})
+
+		paths, err := closurePaths(root, map[string]bool{filepath.Join(root, "a"): true})
+		if err != nil {
+			t.Fatalf("closurePaths() error = %v", err)
+		}
+
+		for _, p := range paths {
+			if filepath.Base(filepath.Dir(p)) == "nested" {
+				t.Errorf("closurePaths() included a file inside a nested subdirectory: %s", p)
+			}
+		}
+
+		var sawAGo bool
+
+		for _, p := range paths {
+			if p == filepath.Join(root, "a", "a.go") {
+				sawAGo = true
+			}
+		}
+
+		if !sawAGo {
+			t.Errorf("closurePaths() = %v, want it to include %s", paths, filepath.Join(root, "a", "a.go"))
+		}
+	})
+}
+
+// TestNewCacheStoreOpenError covers newCacheStore's os.OpenFile error path: a
+// cache path whose parent directory does not exist cannot be created by
+// O_CREATE alone.
+func TestNewCacheStoreOpenError(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "does-not-exist", "mutate-cache.jsonl")
+
+	if _, err := newCacheStore(path); err == nil {
+		t.Error("newCacheStore() error = nil for a missing parent directory, want an open error")
+	}
+}
+
+// TestCacheStoreConsumeErrors covers consume's two failure branches
+// TestLoadCacheIndex's happy-path cacheStore usage never reaches: a write
+// failure (an already-closed file) that both sets werr and, for every record
+// after the first, takes the "already failed, drop it" branch; and a write
+// that succeeds but whose final close-time fsync fails (a pipe, which
+// supports Write but not fsync).
+func TestCacheStoreConsumeErrors(t *testing.T) {
+	t.Parallel()
+
+	t.Run("a write failure sets werr, and a second record hits the already-failed branch", func(t *testing.T) {
+		t.Parallel()
+
+		f, err := os.CreateTemp(t.TempDir(), "closed-*.jsonl")
+		if err != nil {
+			t.Fatalf("CreateTemp() error = %v", err)
+		}
+
+		if err := f.Close(); err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+
+		s := &cacheStore{records: make(chan cacheRecord), done: make(chan struct{})}
+		go s.consume(f)
+
+		s.record(cacheRecord{Key: cacheKey{MutantID: "a"}})
+		s.record(cacheRecord{Key: cacheKey{MutantID: "b"}})
+
+		if err := s.close(); err == nil {
+			t.Error("cacheStore.close() error = nil after writing to an already-closed file, want a write error")
+		}
+	})
+
+	t.Run("a write that succeeds but cannot fsync (a pipe) surfaces a sync error", func(t *testing.T) {
+		t.Parallel()
+
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatalf("Pipe() error = %v", err)
+		}
+
+		t.Cleanup(func() { _ = r.Close() })
+
+		s := &cacheStore{records: make(chan cacheRecord), done: make(chan struct{})}
+		go s.consume(w)
+
+		s.record(cacheRecord{Key: cacheKey{MutantID: "a"}, Status: Killed})
+
+		if err := s.close(); err == nil {
+			t.Error("cacheStore.close() error = nil for a pipe (fsync unsupported), want a sync error")
+		}
+	})
 }

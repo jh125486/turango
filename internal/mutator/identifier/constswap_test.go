@@ -314,6 +314,28 @@ const A = 1
 func F() int { return A }
 `}}
 
+	blankIdent := []fileSrc{{name: snippet, src: `package p
+
+const (
+	_ = iota
+	A
+	B
+)
+
+func F() int { return A }
+`}}
+
+	threeSiblings := []fileSrc{{name: snippet, src: `package p
+
+const (
+	A = 1
+	B = 2
+	C = 3
+)
+
+func F() int { return A }
+`}}
+
 	return []scopeCase{
 		{
 			// The core positive case: two same-type constants in one
@@ -378,6 +400,37 @@ func F() int { return A }
 			targetFile:  snippet,
 			target:      "A",
 			wantApplies: false,
+		},
+		{
+			// The blank identifier in a const( ... ) block, verified against
+			// go/types' actual behaviour rather than assumed: unlike a blank
+			// *variable* (where info.Defs records nil), go/types does record
+			// a real *types.Const, named "_", for a blank const spec — so
+			// yieldDeclConsts's info.Defs[name].(*types.Const) type assertion
+			// succeeds for it, and it is offered as an ordinary same-group
+			// sibling alongside B. Sorted by name, "_" (0x5F) sorts after
+			// the uppercase letters, so B is offered before it.
+			name:            "blank identifier in const block is an ordinary sibling",
+			files:           blankIdent,
+			targetFile:      snippet,
+			target:          "A",
+			wantApplies:     true,
+			wantMutations:   []string{"A -> B", "A -> _"},
+			checkRoundTrip:  true,
+			wantAppliedText: "B",
+		},
+		{
+			// Three same-type constants in one block: A has two siblings
+			// (B, C), which is what exercises buildGroups' sort.Slice
+			// comparator — a group of exactly one sibling (as in "same
+			// block: A/B" above) never invokes it, since sort.Slice does not
+			// call Less for a length-1 slice.
+			name:          "same block: three siblings",
+			files:         threeSiblings,
+			targetFile:    snippet,
+			target:        "A",
+			wantApplies:   true,
+			wantMutations: []string{"A -> B", "A -> C"},
 		},
 	}
 }
@@ -651,6 +704,149 @@ func F() bool {
 			comparison:  "x > 5",
 			wantApplies: false,
 		},
+		{
+			// representable's signed-integer path: a plain "int" local is
+			// types.Int, one of the two kinds representable's first switch
+			// case (Int, Int64) handles via inSignedRange.
+			name: "signed local: int",
+			src: `package p
+
+const Max = 100
+
+func F() bool {
+	var x int
+
+	return x > 5
+}
+`,
+			comparison:    "x > 5",
+			wantApplies:   true,
+			wantMutations: []string{"x -> Max"},
+		},
+		{
+			// representable's Int8 case.
+			name: "signed local: int8",
+			src: `package p
+
+const Max = 100
+
+func F() bool {
+	var x int8
+
+	return x > 5
+}
+`,
+			comparison:    "x > 5",
+			wantApplies:   true,
+			wantMutations: []string{"x -> Max"},
+		},
+		{
+			// representable's Int16 case.
+			name: "signed local: int16",
+			src: `package p
+
+const Max = 1000
+
+func F() bool {
+	var x int16
+
+	return x > 5
+}
+`,
+			comparison:    "x > 5",
+			wantApplies:   true,
+			wantMutations: []string{"x -> Max"},
+		},
+		{
+			// representable's Int32 case.
+			name: "signed local: int32",
+			src: `package p
+
+const Max = 100000
+
+func F() bool {
+	var x int32
+
+	return x > 5
+}
+`,
+			comparison:    "x > 5",
+			wantApplies:   true,
+			wantMutations: []string{"x -> Max"},
+		},
+		{
+			// representable's Uint8 case (Uint/Uint64/Uintptr is already
+			// covered by the strconv-shaped uint64 cases above).
+			name: "unsigned local: uint8",
+			src: `package p
+
+const Max = 200
+
+func F() bool {
+	var x uint8
+
+	return x > 5
+}
+`,
+			comparison:    "x > 5",
+			wantApplies:   true,
+			wantMutations: []string{"x -> Max"},
+		},
+		{
+			// representable's Uint16 case.
+			name: "unsigned local: uint16",
+			src: `package p
+
+const Max = 60000
+
+func F() bool {
+	var x uint16
+
+	return x > 5
+}
+`,
+			comparison:    "x > 5",
+			wantApplies:   true,
+			wantMutations: []string{"x -> Max"},
+		},
+		{
+			// representable's Uint32 case.
+			name: "unsigned local: uint32",
+			src: `package p
+
+const Max = 4000000000
+
+func F() bool {
+	var x uint32
+
+	return x > 5
+}
+`,
+			comparison:    "x > 5",
+			wantApplies:   true,
+			wantMutations: []string{"x -> Max"},
+		},
+		{
+			// representable's early, kind-based rejection: F is an untyped
+			// *float* constant, so representable must reject it before ever
+			// consulting the variable's basic kind (val.Kind() != constant.Int
+			// short-circuits ahead of the switch on basic.Kind()) — even
+			// though x's own type (uint64) would otherwise be a representable
+			// target for an integer constant.
+			name: "untyped float candidate: not representable (non-integer)",
+			src: `package p
+
+const F = 1.5
+
+func F2() bool {
+	var x uint64
+
+	return x > 5
+}
+`,
+			comparison:  "x > 5",
+			wantApplies: false,
+		},
 	}
 }
 
@@ -708,6 +904,73 @@ func TestLocalMutate(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestConstSwapMutateIgnoresIneligibleNodes calls Mutate() directly — without
+// going through Applies() first, unlike every scopeCases scenario above — on
+// nodes constUseIdent rejects for two different reasons: a node that is not
+// an *ast.Ident at all, and an *ast.Ident that is a use of something other
+// than a package-level constant (here, a local variable). Both are real,
+// reachable inputs: the engine's own contract calls Applies() before Mutate()
+// on every node it walks, but Mutate() does not assume that discipline itself
+// (unlike, e.g., control/if.go's Mutate, which re-checks its own Applies())
+// and must return nil rather than panic for either shape.
+func TestConstSwapMutateIgnoresIneligibleNodes(t *testing.T) {
+	t.Parallel()
+
+	const src = `package p
+
+const A = 1
+
+func F() int {
+	x := 2
+
+	return x + A
+}
+`
+
+	_, file, info, pkg := typeCheckFunc(t, src)
+	bound := boundMutator(t, identifier.ConstSwapName, info, pkg)
+
+	t.Run("non-ident node", func(t *testing.T) {
+		t.Parallel()
+
+		var lit *ast.BasicLit
+
+		ast.Inspect(file, func(node ast.Node) bool {
+			if l, ok := node.(*ast.BasicLit); ok {
+				lit = l
+			}
+
+			return true
+		})
+
+		if lit == nil {
+			t.Fatal("no *ast.BasicLit found in snippet")
+		}
+
+		if got := bound.Applies(lit); got {
+			t.Error("Applies(BasicLit) = true, want false")
+		}
+
+		if got := bound.Mutate(lit); got != nil {
+			t.Errorf("Mutate(BasicLit) = %v, want nil", got)
+		}
+	})
+
+	t.Run("ident use of a non-const object", func(t *testing.T) {
+		t.Parallel()
+
+		xIdent := findIdent(t, file, info, "x")
+
+		if got := bound.Applies(xIdent); got {
+			t.Error("Applies(x) = true, want false")
+		}
+
+		if got := bound.Mutate(xIdent); got != nil {
+			t.Errorf("Mutate(x) = %v, want nil", got)
+		}
+	})
 }
 
 // TestLocalMutateReproducesStrconvShape is the required acceptance proof for

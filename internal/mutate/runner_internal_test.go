@@ -6,6 +6,7 @@ package mutate
 
 import (
 	"bytes"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/printer"
@@ -545,6 +546,11 @@ func TestCommonDir(t *testing.T) {
 		"only root":       {paths: []string{"/a", "/b"}, want: "/"},
 		"nothing at all":  {paths: nil, want: ""},
 		"three way split": {paths: []string{"/a/b/c", "/a/b/d/e", "/a/x"}, want: "/a"},
+		// Relative paths with no shared first segment: the common-prefix
+		// loop empties parts entirely (distinct from "nothing at all"
+		// above, which never even enters the loop), exercising commonDir's
+		// own separate "if len(parts) == 0" branch.
+		"no common root, relative paths": {paths: []string{"a/b", "c/d"}, want: ""},
 	}
 
 	for name, tt := range tests {
@@ -625,6 +631,284 @@ replace example.com/lib => ../lib
 	}
 }
 
+// TestParseReplacesEdgeCases covers parseReplaces' own branches that no
+// existing test (all of which go through a real, well-formed go.mod with a
+// local replace) ever exercises: no go.mod at all, a go.mod that cannot
+// even be read as a file (a non-ENOENT os.ReadFile error), a go.mod that
+// fails to parse, and a replace directive whose right-hand side is a real
+// module version rather than a filesystem path.
+func TestParseReplacesEdgeCases(t *testing.T) {
+	t.Parallel()
+
+	t.Run("no go.mod at all", func(t *testing.T) {
+		t.Parallel()
+
+		out, err := parseReplaces(t.TempDir())
+		if err != nil {
+			t.Fatalf("parseReplaces() error = %v, want nil for a missing go.mod", err)
+		}
+
+		if out != nil {
+			t.Errorf("parseReplaces() = %v, want nil", out)
+		}
+	})
+
+	t.Run("moduleDir is a file, not a directory", func(t *testing.T) {
+		t.Parallel()
+
+		// filepath.Join(moduleDir, "go.mod") then names a path through a
+		// regular file, which os.ReadFile fails to open with an error that
+		// is not os.IsNotExist.
+		notADir := filepath.Join(t.TempDir(), "notadir")
+		writeFiles(t, map[string]string{notADir: "not a directory\n"})
+
+		if _, err := parseReplaces(notADir); err == nil {
+			t.Fatal("parseReplaces() error = nil, want a non-nil, non-IsNotExist read error")
+		}
+	})
+
+	t.Run("malformed go.mod", func(t *testing.T) {
+		t.Parallel()
+
+		moduleDir := t.TempDir()
+		writeFiles(t, map[string]string{filepath.Join(moduleDir, "go.mod"): "this is not valid go.mod syntax\n"})
+
+		if _, err := parseReplaces(moduleDir); err == nil {
+			t.Fatal("parseReplaces() error = nil, want a non-nil error from modfile.Parse")
+		}
+	})
+
+	t.Run("a non-local replace target is excluded", func(t *testing.T) {
+		t.Parallel()
+
+		moduleDir := t.TempDir()
+		writeFiles(t, map[string]string{
+			filepath.Join(moduleDir, "go.mod"): "module example.com/mod\n\ngo 1.23\n\n" +
+				"replace example.com/x => example.com/y v1.0.0\n",
+		})
+
+		out, err := parseReplaces(moduleDir)
+		if err != nil {
+			t.Fatalf("parseReplaces() error = %v", err)
+		}
+
+		if len(out) != 0 {
+			t.Errorf("parseReplaces() = %v, want empty: the replace target is a module version, not a filesystem path", out)
+		}
+	})
+}
+
+// TestLocalReplacesError and TestInModuleReplaceTargetsError cover each
+// function's own error propagation from parseReplaces — neither is ever
+// exercised through resolveClosure/copyModule's own tests, which always use
+// a well-formed go.mod.
+func TestLocalReplacesError(t *testing.T) {
+	t.Parallel()
+
+	moduleDir := t.TempDir()
+	writeFiles(t, map[string]string{filepath.Join(moduleDir, "go.mod"): "not valid go.mod\n"})
+
+	if _, err := localReplaces(moduleDir); err == nil {
+		t.Fatal("localReplaces() error = nil, want a non-nil error from a malformed go.mod")
+	}
+}
+
+func TestInModuleReplaceTargetsError(t *testing.T) {
+	t.Parallel()
+
+	moduleDir := t.TempDir()
+	writeFiles(t, map[string]string{filepath.Join(moduleDir, "go.mod"): "not valid go.mod\n"})
+
+	if _, err := inModuleReplaceTargets(moduleDir); err == nil {
+		t.Fatal("inModuleReplaceTargets() error = nil, want a non-nil error from a malformed go.mod")
+	}
+}
+
+// TestPlaceRootsDedupeAndFallback covers two placeRoots branches
+// TestCopyModuleWithLocalReplace's happy path never reaches: a duplicate
+// root is only placed once, and roots with no usable common ancestor fall
+// back to the flat, uniquely-named slot.
+func TestPlaceRootsDedupeAndFallback(t *testing.T) {
+	t.Parallel()
+
+	t.Run("duplicate roots are deduped", func(t *testing.T) {
+		t.Parallel()
+
+		root := filepath.FromSlash("/a/b/c")
+
+		dests := placeRoots("/dst", []string{root, root})
+		if len(dests) != 1 {
+			t.Fatalf("placeRoots() = %v, want exactly one entry for a duplicated root", dests)
+		}
+	})
+
+	t.Run("no common ancestor falls back to a flat name", func(t *testing.T) {
+		t.Parallel()
+
+		// Relative, single-segment roots share no common ancestor at all:
+		// commonDir returns "", forcing every root onto the fallback name.
+		roots := []string{filepath.FromSlash("a"), filepath.FromSlash("b")}
+
+		dests := placeRoots("/dst", roots)
+		if len(dests) != 2 {
+			t.Fatalf("placeRoots() = %v, want two distinct entries", dests)
+		}
+
+		for i, root := range roots {
+			dest, ok := dests[root]
+			if !ok {
+				t.Fatalf("placeRoots() missing an entry for %q", root)
+			}
+
+			wantPrefix := filepath.FromSlash(fmt.Sprintf("/dst/_mod%d_", i))
+			if !strings.HasPrefix(dest, wantPrefix) {
+				t.Errorf("placeRoots()[%q] = %q, want it under the flat fallback name %q*", root, dest, wantPrefix)
+			}
+		}
+	})
+}
+
+// TestRewriteReplacesErrors covers rewriteReplaces' own error and branch
+// paths: a missing go.mod, a malformed one, a replace target absent from
+// dests (silently skipped), a Rel failure between an absolute moduleDir and
+// a relative dest, a rewritten path that needs "./" prepended because Rel's
+// own result has no dot-prefix, an invalid old module path rejected by
+// AddReplace, and a read-only go.mod that cannot be written back.
+func TestRewriteReplacesErrors(t *testing.T) {
+	t.Parallel()
+
+	t.Run("go.mod does not exist", func(t *testing.T) {
+		t.Parallel()
+
+		moduleDir := t.TempDir()
+
+		err := rewriteReplaces(moduleDir, []localReplace{{oldPath: "example.com/x", target: "/elsewhere"}}, map[string]string{"/elsewhere": "/dst/elsewhere"})
+		if err == nil {
+			t.Fatal("rewriteReplaces() error = nil, want a non-nil error for a missing go.mod")
+		}
+	})
+
+	t.Run("malformed go.mod", func(t *testing.T) {
+		t.Parallel()
+
+		moduleDir := t.TempDir()
+		writeFiles(t, map[string]string{filepath.Join(moduleDir, "go.mod"): "not valid go.mod\n"})
+
+		err := rewriteReplaces(moduleDir, []localReplace{{oldPath: "example.com/x", target: "/elsewhere"}}, map[string]string{"/elsewhere": "/dst/elsewhere"})
+		if err == nil {
+			t.Fatal("rewriteReplaces() error = nil, want a non-nil error from modfile.Parse")
+		}
+	})
+
+	t.Run("replace target absent from dests is skipped", func(t *testing.T) {
+		t.Parallel()
+
+		moduleDir := t.TempDir()
+		const original = "module example.com/mod\n\ngo 1.23\n\nreplace example.com/x => ../x\n"
+		writeFiles(t, map[string]string{filepath.Join(moduleDir, "go.mod"): original})
+
+		// dests has no entry for "/elsewhere": the replace loop's own "if
+		// !ok { continue }" branch, leaving go.mod's existing directive
+		// untouched by AddReplace.
+		if err := rewriteReplaces(moduleDir, []localReplace{{oldPath: "example.com/x", oldVersion: "", target: "/elsewhere"}}, map[string]string{}); err != nil {
+			t.Fatalf("rewriteReplaces() error = %v, want nil: an absent dests entry should be silently skipped", err)
+		}
+
+		data, err := os.ReadFile(filepath.Join(moduleDir, "go.mod"))
+		if err != nil {
+			t.Fatalf("reading go.mod: %v", err)
+		}
+
+		if !strings.Contains(string(data), "../x") {
+			t.Errorf("go.mod = %q, want the original replace target untouched", data)
+		}
+	})
+
+	t.Run("filepath.Rel fails between an absolute moduleDir and a relative dest", func(t *testing.T) {
+		t.Parallel()
+
+		moduleDir := t.TempDir() // absolute
+		writeFiles(t, map[string]string{
+			filepath.Join(moduleDir, "go.mod"): "module example.com/mod\n\ngo 1.23\n\nreplace example.com/x => ../x\n",
+		})
+
+		replaces := []localReplace{{oldPath: "example.com/x", target: "/elsewhere"}}
+		dests := map[string]string{"/elsewhere": "relative/dest"} // relative: Rel(moduleDir, ...) fails
+
+		if err := rewriteReplaces(moduleDir, replaces, dests); err == nil {
+			t.Fatal("rewriteReplaces() error = nil, want a non-nil error from filepath.Rel")
+		}
+	})
+
+	t.Run("a Rel result with no dot-prefix gets one prepended", func(t *testing.T) {
+		t.Parallel()
+
+		moduleDir := t.TempDir()
+		writeFiles(t, map[string]string{
+			filepath.Join(moduleDir, "go.mod"): "module example.com/mod\n\ngo 1.23\n\nreplace example.com/x => ../x\n",
+		})
+
+		// dest is a subdirectory of moduleDir itself, so
+		// filepath.Rel(moduleDir, dest) yields "vendored/x" with no leading
+		// "./" or "../" — rewriteReplaces must add the "./" itself.
+		dest := filepath.Join(moduleDir, "vendored", "x")
+		replaces := []localReplace{{oldPath: "example.com/x", target: "/elsewhere"}}
+		dests := map[string]string{"/elsewhere": dest}
+
+		if err := rewriteReplaces(moduleDir, replaces, dests); err != nil {
+			t.Fatalf("rewriteReplaces() error = %v", err)
+		}
+
+		data, err := os.ReadFile(filepath.Join(moduleDir, "go.mod"))
+		if err != nil {
+			t.Fatalf("reading go.mod: %v", err)
+		}
+
+		if !strings.Contains(string(data), "./vendored/x") {
+			t.Errorf("go.mod = %q, want the rewritten replace to start with \"./\"", data)
+		}
+	})
+
+	// No test here for mod.AddReplace's or mod.Format's own error returns
+	// (rewriteReplaces' two lines calling them): as of golang.org/x/mod
+	// v0.38.0 (this module's pinned version), neither
+	// (*modfile.File).AddReplace's underlying addReplace (it neither
+	// validates oldPath/newPath — AutoQuote only quotes, never rejects —
+	// nor can the line-update path it takes fail) nor (*modfile.File).Format
+	// (`return Format(f.Syntax), nil` — literally always nil) ever actually
+	// returns a non-nil error. This makes rewriteReplaces' own
+	// "if err := mod.AddReplace(...); err != nil" and
+	// "if err != nil { ... }" (after mod.Format()) branches provably
+	// unreachable with the dependency version currently in go.mod — not a
+	// test gap, two genuine dead branches in production code. Reported in
+	// the task summary rather than deleted, per this task's own
+	// instructions not to edit runner.go.
+
+	t.Run("go.mod cannot be written back", func(t *testing.T) {
+		t.Parallel()
+
+		moduleDir := t.TempDir()
+		goModPath := filepath.Join(moduleDir, "go.mod")
+		writeFiles(t, map[string]string{
+			goModPath: "module example.com/mod\n\ngo 1.23\n\nreplace example.com/x => ../x\n",
+		})
+
+		if err := os.Chmod(goModPath, 0o400); err != nil {
+			t.Fatalf("Chmod() error = %v", err)
+		}
+
+		t.Cleanup(func() { _ = os.Chmod(goModPath, 0o600) })
+
+		dest := filepath.Join(t.TempDir(), "x")
+		replaces := []localReplace{{oldPath: "example.com/x", target: "/elsewhere"}}
+		dests := map[string]string{"/elsewhere": dest}
+
+		if err := rewriteReplaces(moduleDir, replaces, dests); err == nil {
+			t.Skip("rewriteReplaces() error = nil: running as a user that can write a read-only file (e.g. root); skipping")
+		}
+	})
+}
+
 // replaceTarget pulls the right-hand side out of the single replace line in a
 // go.mod.
 func replaceTarget(t *testing.T, gomod string) string {
@@ -656,6 +940,34 @@ func writeFiles(t *testing.T, files map[string]string) {
 			t.Fatalf("WriteFile(%s) error = %v", path, err)
 		}
 	}
+}
+
+// TestCopyModuleErrors covers copyModule's own two error-propagation
+// points: localReplaces failing to parse a malformed go.mod, and copyTree
+// failing on a moduleDir that does not exist.
+func TestCopyModuleErrors(t *testing.T) {
+	t.Parallel()
+
+	t.Run("malformed go.mod", func(t *testing.T) {
+		t.Parallel()
+
+		moduleDir := t.TempDir()
+		writeFiles(t, map[string]string{filepath.Join(moduleDir, "go.mod"): "this is not a valid go.mod\n"})
+
+		if _, err := copyModule(t.TempDir(), moduleDir); err == nil {
+			t.Fatal("copyModule() error = nil, want a non-nil error from a malformed go.mod")
+		}
+	})
+
+	t.Run("moduleDir does not exist", func(t *testing.T) {
+		t.Parallel()
+
+		missing := filepath.Join(t.TempDir(), "does-not-exist")
+
+		if _, err := copyModule(t.TempDir(), missing); err == nil {
+			t.Fatal("copyModule() error = nil, want a non-nil error copying a nonexistent moduleDir")
+		}
+	})
 }
 
 // The tests below cover the dependency-closure workspace copy's
@@ -868,6 +1180,152 @@ func TestClosureDirs(t *testing.T) {
 			t.Error("closureDirs() ok = true, want false: pkg has no Module at all")
 		}
 	})
+}
+
+// TestClosureWalkVisitGuards covers visit's own leading guard clause
+// directly against a hand-built closureWalk, rather than trying to coax
+// closureDirs' map-based recursion into hitting each condition through
+// iteration order (which Go does not guarantee): a nil package, an
+// already-seen package, and a walk already marked unsafe by an earlier
+// sibling must each return immediately without touching w.dirs.
+func TestClosureWalkVisitGuards(t *testing.T) {
+	t.Parallel()
+
+	t.Run("nil package is ignored", func(t *testing.T) {
+		t.Parallel()
+
+		w := &closureWalk{dirs: map[string]bool{}, seen: map[string]bool{}, safe: true}
+		w.visit(nil)
+
+		if len(w.dirs) != 0 || !w.safe {
+			t.Errorf("visit(nil) mutated the walk: dirs = %v, safe = %v", w.dirs, w.safe)
+		}
+	})
+
+	t.Run("already-seen package is not reprocessed", func(t *testing.T) {
+		t.Parallel()
+
+		w := &closureWalk{
+			moduleDir: "/mod",
+			dirs:      map[string]bool{},
+			seen:      map[string]bool{"example.com/mod/target": true},
+			safe:      true,
+		}
+
+		w.visit(&packages.Package{
+			PkgPath: "example.com/mod/target",
+			Module:  &packages.Module{Dir: "/mod"},
+			GoFiles: []string{"/mod/target/target.go"},
+		})
+
+		if len(w.dirs) != 0 {
+			t.Errorf("visit() reprocessed an already-seen package: dirs = %v, want empty", w.dirs)
+		}
+	})
+
+	t.Run("already-unsafe walk short-circuits", func(t *testing.T) {
+		t.Parallel()
+
+		w := &closureWalk{
+			moduleDir: "/mod",
+			dirs:      map[string]bool{},
+			seen:      map[string]bool{},
+			safe:      false, // a sibling import already tripped this
+		}
+
+		w.visit(&packages.Package{
+			PkgPath: "example.com/mod/target",
+			Module:  &packages.Module{Dir: "/mod"},
+			GoFiles: []string{"/mod/target/target.go"},
+		})
+
+		if len(w.dirs) != 0 || len(w.seen) != 0 {
+			t.Errorf("visit() kept processing after safe was already false: dirs = %v, seen = %v", w.dirs, w.seen)
+		}
+	})
+}
+
+// TestClosureDirsFallsBackToCompiledGoFiles covers the GoFiles-empty
+// fallback: a package go/packages loaded without GoFiles set (e.g. a
+// non-default build config) still has its directory determined from
+// CompiledGoFiles instead.
+func TestClosureDirsFallsBackToCompiledGoFiles(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	moduleDir := filepath.Join(dir, "mod")
+	targetDir := filepath.Join(moduleDir, "target")
+
+	writeFiles(t, map[string]string{filepath.Join(targetDir, "target.go"): "package target\n"})
+
+	target := &packages.Package{
+		PkgPath:         "example.com/mod/target",
+		Module:          &packages.Module{Dir: moduleDir},
+		CompiledGoFiles: []string{filepath.Join(targetDir, "target.go")},
+	}
+
+	dirs, ok := closureDirs(target)
+	if !ok {
+		t.Fatal("closureDirs() ok = false, want true: CompiledGoFiles alone should be enough to locate the package")
+	}
+
+	if want := map[string]bool{targetDir: true}; !reflect.DeepEqual(dirs, want) {
+		t.Errorf("closureDirs() = %v, want %v", dirs, want)
+	}
+}
+
+// TestClosureDirsNoFilesIsUnsafe covers the case neither GoFiles nor
+// CompiledGoFiles can answer: closureDirs cannot even determine the
+// package's own directory, so the whole result must be unsafe.
+func TestClosureDirsNoFilesIsUnsafe(t *testing.T) {
+	t.Parallel()
+
+	target := &packages.Package{
+		PkgPath: "example.com/mod/target",
+		Module:  &packages.Module{Dir: "/mod"},
+	}
+
+	if _, ok := closureDirs(target); ok {
+		t.Error("closureDirs() ok = true, want false: neither GoFiles nor CompiledGoFiles is set")
+	}
+}
+
+// TestResolveClosureNoModuleInfo covers the earliest resolveClosure guard:
+// when none of the supplied package variants carry module information at
+// all, there is nothing to resolve a closure against.
+func TestResolveClosureNoModuleInfo(t *testing.T) {
+	t.Parallel()
+
+	if _, ok := resolveClosure(&packages.Package{PkgPath: "example.com/mod/target"}); ok {
+		t.Error("resolveClosure() ok = true, want false: no package variant has Module info")
+	}
+}
+
+// TestResolveClosureClosureDirsFails covers resolveClosure's own "if !ok"
+// branch after calling closureDirs — distinct from the vendor/replace
+// early-outs above, which never even reach closureDirs: a module with
+// neither a vendor/ directory nor any replace directive, but whose target
+// package has a //go:embed directive, must still fall back.
+func TestResolveClosureClosureDirsFails(t *testing.T) {
+	t.Parallel()
+
+	moduleDir := t.TempDir()
+	targetDir := filepath.Join(moduleDir, "target")
+
+	writeFiles(t, map[string]string{
+		filepath.Join(moduleDir, "go.mod"):    "module example.com/mod\n\ngo 1.23\n",
+		filepath.Join(targetDir, "target.go"): "package target\n\n//go:embed data.txt\nvar data string\n",
+	})
+
+	target := &packages.Package{
+		PkgPath: "example.com/mod/target",
+		Module:  &packages.Module{Dir: moduleDir},
+		GoFiles: []string{filepath.Join(targetDir, "target.go")},
+	}
+
+	if _, ok := resolveClosure(target); ok {
+		t.Error("resolveClosure() ok = true, want false: the target package itself has a //go:embed directive")
+	}
 }
 
 // TestResolveClosure covers the fallback triggers closureDirs alone doesn't
@@ -1200,6 +1658,320 @@ func TestCopyClosure(t *testing.T) {
 	}
 }
 
+// TestCopyClosureErrors covers copyClosure's three error-propagation
+// points: copying go.mod itself failing, filepath.Rel failing on a dirs
+// entry that isn't absolute, and copyDirFiles failing on a dirs entry that
+// does not exist.
+func TestCopyClosureErrors(t *testing.T) {
+	t.Parallel()
+
+	t.Run("copying go.mod fails", func(t *testing.T) {
+		t.Parallel()
+
+		moduleDir := t.TempDir()
+		writeFiles(t, map[string]string{filepath.Join(moduleDir, "go.mod"): "module example.com/mod\n\ngo 1.23\n"})
+
+		dst := t.TempDir()
+		// Pre-create the copy's destination go.mod as a directory, so
+		// copyFile's os.OpenFile(..., O_TRUNC) collides with an existing
+		// directory instead of writing a regular file.
+		if err := os.MkdirAll(filepath.Join(dst, "mod", "go.mod"), 0o750); err != nil {
+			t.Fatalf("MkdirAll() error = %v", err)
+		}
+
+		if _, err := copyClosure(dst, moduleDir, nil); err == nil {
+			t.Fatal("copyClosure() error = nil, want a non-nil error copying go.mod over an existing directory")
+		}
+	})
+
+	t.Run("filepath.Rel fails on a non-absolute dirs entry", func(t *testing.T) {
+		t.Parallel()
+
+		moduleDir := t.TempDir() // absolute
+
+		if _, err := copyClosure(t.TempDir(), moduleDir, map[string]bool{"relative/dir": true}); err == nil {
+			t.Fatal("copyClosure() error = nil, want a non-nil error locating a relative dirs entry within an absolute moduleDir")
+		}
+	})
+
+	t.Run("stating go.mod fails with a non-IsNotExist error", func(t *testing.T) {
+		t.Parallel()
+
+		moduleDir := t.TempDir()
+		writeFiles(t, map[string]string{filepath.Join(moduleDir, "go.mod"): "module example.com/mod\n\ngo 1.23\n"})
+
+		// Denying execute/search permission on moduleDir itself makes
+		// os.Stat(moduleDir/go.mod) fail with a permission error, not
+		// ErrNotExist -- the one os.Stat failure mode the IsNotExist
+		// continue-branch does not swallow.
+		if err := os.Chmod(moduleDir, 0); err != nil {
+			t.Fatalf("Chmod() error = %v", err)
+		}
+
+		//nolint:gosec // restoring this test's own t.TempDir() fixture to a usable (traversable) directory afterward, not attacker-controlled input
+		t.Cleanup(func() { _ = os.Chmod(moduleDir, 0o750) })
+
+		if _, err := copyClosure(t.TempDir(), moduleDir, nil); err == nil {
+			t.Skip("copyClosure() error = nil: running as a user unaffected by directory permissions (e.g. root); skipping")
+		}
+	})
+
+	t.Run("copyDirFiles fails on a nonexistent dirs entry", func(t *testing.T) {
+		t.Parallel()
+
+		moduleDir := t.TempDir()
+		missing := filepath.Join(moduleDir, "does-not-exist")
+
+		if _, err := copyClosure(t.TempDir(), moduleDir, map[string]bool{missing: true}); err == nil {
+			t.Fatal("copyClosure() error = nil, want a non-nil error for a dirs entry that does not exist")
+		}
+	})
+}
+
+// TestCopySymlinkErrors covers copySymlink's two error-propagation points:
+// os.Readlink failing on a path that isn't actually a symlink, and
+// os.MkdirAll failing because a regular file blocks part of dst's path.
+func TestCopySymlinkErrors(t *testing.T) {
+	t.Parallel()
+
+	t.Run("src is not a symlink", func(t *testing.T) {
+		t.Parallel()
+
+		dir := t.TempDir()
+		notALink := filepath.Join(dir, "plain.txt")
+		writeFiles(t, map[string]string{notALink: "hello\n"})
+
+		if err := copySymlink(notALink, filepath.Join(t.TempDir(), "out")); err == nil {
+			t.Fatal("copySymlink() error = nil, want a non-nil error from os.Readlink on a non-symlink")
+		}
+	})
+
+	t.Run("dst path is blocked by a regular file", func(t *testing.T) {
+		t.Parallel()
+
+		dir := t.TempDir()
+		src := filepath.Join(dir, "link")
+		target := filepath.Join(dir, "target.txt")
+		writeFiles(t, map[string]string{target: "hello\n"})
+
+		if err := os.Symlink(target, src); err != nil {
+			t.Fatalf("creating symlink fixture: %v", err)
+		}
+
+		blocker := filepath.Join(t.TempDir(), "blocker")
+		writeFiles(t, map[string]string{blocker: "not a directory\n"})
+
+		if err := copySymlink(src, filepath.Join(blocker, "sub", "link")); err == nil {
+			t.Fatal("copySymlink() error = nil, want a non-nil error from os.MkdirAll under a regular file")
+		}
+	})
+}
+
+// TestCopyDirFilesErrors covers copyDirFiles' error-propagation points and
+// its non-regular-file skip, none of which the happy-path TestCopyDirFiles
+// above exercises: os.ReadDir failing on a nonexistent src, the inner
+// copySymlink call failing, the inner copyFile call failing, and a named
+// pipe (neither a regular file nor a symlink) being silently skipped.
+func TestCopyDirFilesErrors(t *testing.T) {
+	t.Parallel()
+
+	t.Run("src does not exist", func(t *testing.T) {
+		t.Parallel()
+
+		if err := copyDirFiles(filepath.Join(t.TempDir(), "does-not-exist"), t.TempDir()); err == nil {
+			t.Fatal("copyDirFiles() error = nil, want a non-nil error for a nonexistent src")
+		}
+	})
+
+	t.Run("inner copySymlink fails", func(t *testing.T) {
+		t.Parallel()
+
+		src := t.TempDir()
+		if err := os.Symlink(filepath.Join(src, "target.txt"), filepath.Join(src, "link")); err != nil {
+			t.Fatalf("creating symlink fixture: %v", err)
+		}
+
+		blocker := filepath.Join(t.TempDir(), "blocker")
+		writeFiles(t, map[string]string{blocker: "not a directory\n"})
+
+		if err := copyDirFiles(src, filepath.Join(blocker, "sub")); err == nil {
+			t.Fatal("copyDirFiles() error = nil, want a non-nil error when the inner copySymlink call fails")
+		}
+	})
+
+	t.Run("inner copyFile fails", func(t *testing.T) {
+		t.Parallel()
+
+		src := t.TempDir()
+		writeFiles(t, map[string]string{filepath.Join(src, "a.go"): "package p\n"})
+
+		dst := filepath.Join(t.TempDir(), "out")
+		// Pre-create the destination file as a directory so copyFile's
+		// OpenFile collides with it.
+		if err := os.MkdirAll(filepath.Join(dst, "a.go"), 0o750); err != nil {
+			t.Fatalf("MkdirAll() error = %v", err)
+		}
+
+		if err := copyDirFiles(src, dst); err == nil {
+			t.Fatal("copyDirFiles() error = nil, want a non-nil error when the inner copyFile call fails")
+		}
+	})
+
+	t.Run("a named pipe is silently skipped", func(t *testing.T) {
+		t.Parallel()
+
+		src := t.TempDir()
+		writeFiles(t, map[string]string{filepath.Join(src, "a.go"): "package p\n"})
+
+		fifo := filepath.Join(src, "pipe")
+		if err := runnerMkfifo(fifo, 0o600); err != nil {
+			t.Skipf("mkfifo unsupported on this platform: %v", err)
+		}
+
+		dst := filepath.Join(t.TempDir(), "out")
+
+		if err := copyDirFiles(src, dst); err != nil {
+			t.Fatalf("copyDirFiles() error = %v, want the named pipe silently skipped, not an error", err)
+		}
+
+		if _, err := os.Stat(filepath.Join(dst, "pipe")); !os.IsNotExist(err) {
+			t.Errorf("copyDirFiles() copied the named pipe, want it skipped: stat err = %v", err)
+		}
+
+		if _, err := os.Stat(filepath.Join(dst, "a.go")); err != nil {
+			t.Errorf("copyDirFiles() did not copy the regular file alongside the skipped pipe: %v", err)
+		}
+	})
+}
+
+// TestCopyTreeSymlinksAndSpecialFiles covers two copyTree cases the
+// copyModule-driven TestCopyModuleWithLocalReplace above never exercises
+// directly: a symlink preserved as a symlink (not resolved), and a named
+// pipe silently skipped by the walk's default case — the same "nothing a
+// build reads" contract copyDirFiles already gives its own shallow copy.
+func TestCopyTreeSymlinksAndSpecialFiles(t *testing.T) {
+	t.Parallel()
+
+	src := t.TempDir()
+	writeFiles(t, map[string]string{filepath.Join(src, "sub", "a.go"): "package p\n"})
+
+	link := filepath.Join(src, "sub", "link.go")
+	if err := os.Symlink(filepath.Join(src, "sub", "a.go"), link); err != nil {
+		t.Fatalf("creating symlink fixture: %v", err)
+	}
+
+	fifo := filepath.Join(src, "sub", "pipe")
+
+	fifoCreated := true
+	if err := runnerMkfifo(fifo, 0o600); err != nil {
+		fifoCreated = false
+	}
+
+	dst := t.TempDir()
+
+	if err := copyTree(src, dst); err != nil {
+		t.Fatalf("copyTree() error = %v", err)
+	}
+
+	got, err := os.Readlink(filepath.Join(dst, "sub", "link.go"))
+	if err != nil {
+		t.Fatalf("copyTree() did not preserve link.go as a symlink: %v", err)
+	}
+
+	if want := filepath.Join(src, "sub", "a.go"); got != want {
+		t.Errorf("copyTree() symlink target = %q, want %q", got, want)
+	}
+
+	if fifoCreated {
+		if _, err := os.Stat(filepath.Join(dst, "sub", "pipe")); !os.IsNotExist(err) {
+			t.Errorf("copyTree() copied the named pipe, want it skipped: stat err = %v", err)
+		}
+	}
+}
+
+// TestCopyTreeWalkDirError covers copyTree's own WalkDir-error-propagation
+// branch: a subdirectory with its read permission removed makes
+// filepath.WalkDir hand copyTree's callback a non-nil err directly (rather
+// than a normal DirEntry), which must be returned rather than swallowed.
+func TestCopyTreeWalkDirError(t *testing.T) {
+	t.Parallel()
+
+	src := t.TempDir()
+	blocked := filepath.Join(src, "blocked")
+	writeFiles(t, map[string]string{filepath.Join(blocked, "a.go"): "package p\n"})
+
+	if err := os.Chmod(blocked, 0); err != nil {
+		t.Fatalf("Chmod() error = %v", err)
+	}
+
+	//nolint:gosec // restoring this test's own t.TempDir() fixture to a usable (traversable) directory afterward, not attacker-controlled input
+	t.Cleanup(func() { _ = os.Chmod(blocked, 0o750) })
+
+	if err := copyTree(src, t.TempDir()); err == nil {
+		t.Skip("copyTree() error = nil: running as a user unaffected by directory permissions (e.g. root); skipping")
+	}
+}
+
+// TestCopyFileErrors covers copyFile's error-propagation points: os.Open
+// failing on a nonexistent src, os.MkdirAll failing because a regular file
+// blocks dst's parent directory, os.OpenFile failing because dst is itself
+// an existing directory, and io.Copy failing because src -- opened
+// successfully by os.Open, since a directory is a valid thing to open --
+// cannot actually be read as file content.
+func TestCopyFileErrors(t *testing.T) {
+	t.Parallel()
+
+	t.Run("src does not exist", func(t *testing.T) {
+		t.Parallel()
+
+		if err := copyFile(filepath.Join(t.TempDir(), "does-not-exist"), filepath.Join(t.TempDir(), "out"), 0o600); err == nil {
+			t.Fatal("copyFile() error = nil, want a non-nil error for a nonexistent src")
+		}
+	})
+
+	t.Run("dst parent is blocked by a regular file", func(t *testing.T) {
+		t.Parallel()
+
+		dir := t.TempDir()
+		src := filepath.Join(dir, "a.go")
+		writeFiles(t, map[string]string{src: "package p\n"})
+
+		blocker := filepath.Join(t.TempDir(), "blocker")
+		writeFiles(t, map[string]string{blocker: "not a directory\n"})
+
+		if err := copyFile(src, filepath.Join(blocker, "sub", "a.go"), 0o600); err == nil {
+			t.Fatal("copyFile() error = nil, want a non-nil error from os.MkdirAll under a regular file")
+		}
+	})
+
+	t.Run("dst is an existing directory", func(t *testing.T) {
+		t.Parallel()
+
+		dir := t.TempDir()
+		src := filepath.Join(dir, "a.go")
+		writeFiles(t, map[string]string{src: "package p\n"})
+
+		dst := filepath.Join(t.TempDir(), "out")
+		if err := os.MkdirAll(dst, 0o750); err != nil {
+			t.Fatalf("MkdirAll() error = %v", err)
+		}
+
+		if err := copyFile(src, dst, 0o600); err == nil {
+			t.Fatal("copyFile() error = nil, want a non-nil error opening an existing directory for write")
+		}
+	})
+
+	t.Run("src is a directory: io.Copy cannot read it", func(t *testing.T) {
+		t.Parallel()
+
+		srcDir := t.TempDir()
+
+		if err := copyFile(srcDir, filepath.Join(t.TempDir(), "out"), 0o600); err == nil {
+			t.Fatal("copyFile() error = nil, want a non-nil error reading a directory as file content")
+		}
+	})
+}
+
 // The tests below cover git-worktree execution: gitRepoRoot, gitWorktreeClean,
 // copyWorktree and workspaceFor. Unlike copyModule's tests, these need a
 // real git repository, not just a plain directory — runGit builds one.
@@ -1279,6 +2051,35 @@ func TestGitRepoRoot(t *testing.T) {
 
 	if _, ok := gitRepoRoot(t.Context(), plain); ok {
 		t.Error("gitRepoRoot() ok = true for a plain, non-git directory, want false")
+	}
+}
+
+// TestGitPrefixFailure covers gitPrefix's own error return: a plain,
+// non-git directory has no repository for `git rev-parse --show-prefix` to
+// answer against.
+func TestGitPrefixFailure(t *testing.T) {
+	t.Parallel()
+
+	if _, ok := gitPrefix(t.Context(), t.TempDir()); ok {
+		t.Error("gitPrefix() ok = true for a plain, non-git directory, want false")
+	}
+}
+
+// TestCopyWorktreeAddFailure covers copyWorktree's own `git worktree add`
+// failure branch: with a regular file pre-existing at the exact path
+// copyWorktree would check the worktree out to, `git worktree add` refuses
+// to use it, and copyWorktree must report ok==false rather than a half-built
+// result.
+func TestCopyWorktreeAddFailure(t *testing.T) {
+	t.Parallel()
+
+	repo := gitFixtureModule(t)
+	dst := t.TempDir()
+
+	writeFiles(t, map[string]string{filepath.Join(dst, "wt"): "blocking the worktree checkout path\n"})
+
+	if _, _, ok := copyWorktree(t.Context(), dst, repo); ok {
+		t.Error("copyWorktree() ok = true, want false: `git worktree add` should fail against a path already occupied by a regular file")
 	}
 }
 
@@ -1485,5 +2286,380 @@ func TestWorkspaceForPrefersClosureOverWorktree(t *testing.T) {
 
 	if strings.Count(string(out), "worktree ") != 1 {
 		t.Errorf("workspaceFor() used a git worktree despite a non-nil closure, want the closure copy only:\n%s", out)
+	}
+}
+
+// The tests below cover run()'s own error paths — every one reachable
+// without a real go binary, since each fails before goTest is ever reached
+// (proven the same way TestRunSkipsNoOpMutation already does, with a
+// deliberately unusable goBin) — plus direct unit coverage of a handful of
+// small helpers (cacheLookup, renderNode, testArgs/packagePattern,
+// isTCEEquivalent, decodeTestEvent/parseTestEvents) whose own error/edge
+// branches the tests above never happen to exercise.
+
+// runnerIfMutationFixture builds a small real function with an if-condition
+// mutation that genuinely changes the printed source (so the no-op
+// short-circuit can never be what makes a caller's test pass) — shared by
+// the run()-error-path tests below, none of which expect the mutation to
+// ever actually reach a toolchain call.
+func runnerIfMutationFixture(t *testing.T) (fset *token.FileSet, file *ast.File, baseline []byte, stmt *ast.IfStmt, mutation mutator.Mutation) {
+	t.Helper()
+
+	const src = `package p
+
+func f(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+`
+	fset = token.NewFileSet()
+
+	var err error
+
+	file, err = parser.ParseFile(fset, "p.go", src, parser.ParseComments)
+	if err != nil {
+		t.Fatalf("ParseFile() error = %v", err)
+	}
+
+	var buf bytes.Buffer
+	if err := printer.Fprint(&buf, fset, file); err != nil {
+		t.Fatalf("Fprint() error = %v", err)
+	}
+
+	baseline = buf.Bytes()
+
+	decl := file.Decls[0].(*ast.FuncDecl)
+	stmt = decl.Body.List[0].(*ast.IfStmt)
+	original := stmt.Cond
+
+	mutation = mutator.Mutation{
+		Description: "if -> false",
+		Apply:       func() { stmt.Cond = ast.NewIdent("false") },
+		Revert:      func() { stmt.Cond = original },
+	}
+
+	return fset, file, baseline, stmt, mutation
+}
+
+// TestRunTestArgsError covers run()'s earliest possible error return: when
+// mutant.testArgs() itself fails — here, packagePattern's filepath.Rel
+// erroring on an absolute-vs-relative moduleDir/pkgDir mismatch — run must
+// return the error before ever creating a workspace or touching the
+// toolchain.
+func TestRunTestArgsError(t *testing.T) {
+	t.Parallel()
+
+	fset, file, baseline, stmt, mutation := runnerIfMutationFixture(t)
+
+	r := &runner{goBin: "/nonexistent/go", testTimeout: MinBaselineTimeout}
+
+	_, _, _, err := r.run(t.Context(), mutant{
+		fset:      fset,
+		file:      file,
+		path:      "/nowhere/p.go",
+		baseline:  baseline,
+		moduleDir: filepath.FromSlash("/abs/module"), // absolute
+		pkgDir:    "relative/pkg",                    // relative: filepath.Rel(moduleDir, pkgDir) fails
+		operator:  "control/if",
+		line:      4,
+		scope:     ScopePackage,
+		node:      stmt,
+		mutation:  mutation,
+	})
+	if err == nil {
+		t.Fatal("run() error = nil, want a non-nil error from testArgs()'s packagePattern failing")
+	}
+}
+
+// TestRunWorkspaceCopyError covers workspaceFor's error return inside run():
+// a nonexistent moduleDir makes copyModule's copyTree fail at the very first
+// filepath.WalkDir callback (which also, incidentally, is copyTree's own
+// walk-error-propagation branch — see copyTree's doc comment).
+func TestRunWorkspaceCopyError(t *testing.T) {
+	t.Parallel()
+
+	fset, file, baseline, stmt, mutation := runnerIfMutationFixture(t)
+
+	missing := filepath.Join(t.TempDir(), "does-not-exist")
+
+	r := &runner{goBin: "/nonexistent/go", testTimeout: MinBaselineTimeout}
+
+	_, _, _, err := r.run(t.Context(), mutant{
+		fset:      fset,
+		file:      file,
+		path:      filepath.Join(missing, "p.go"),
+		baseline:  baseline,
+		moduleDir: missing,
+		pkgDir:    missing,
+		operator:  "control/if",
+		line:      4,
+		scope:     ScopePackage,
+		node:      stmt,
+		mutation:  mutation,
+	})
+	if err == nil {
+		t.Fatal("run() error = nil, want a non-nil error from workspaceFor copying a nonexistent moduleDir")
+	}
+}
+
+// TestRunRelocateMutatedFileError covers the filepath.Rel(m.moduleDir,
+// m.path) error return: with a real, valid, absolute moduleDir (so
+// workspaceFor itself succeeds) but a relative m.path, Rel cannot express
+// one in terms of the other.
+func TestRunRelocateMutatedFileError(t *testing.T) {
+	t.Parallel()
+
+	fset, file, baseline, stmt, mutation := runnerIfMutationFixture(t)
+
+	moduleDir := t.TempDir()
+
+	r := &runner{goBin: "/nonexistent/go", testTimeout: MinBaselineTimeout}
+
+	_, _, _, err := r.run(t.Context(), mutant{
+		fset:      fset,
+		file:      file,
+		path:      "p.go", // relative, while moduleDir is absolute
+		baseline:  baseline,
+		moduleDir: moduleDir,
+		pkgDir:    moduleDir,
+		operator:  "control/if",
+		line:      4,
+		scope:     ScopePackage,
+		node:      stmt,
+		mutation:  mutation,
+	})
+	if err == nil {
+		t.Fatal("run() error = nil, want a non-nil error locating a relative path within an absolute moduleDir")
+	}
+}
+
+// TestRunWriteMutatedFileError covers os.WriteFile's error return: the
+// module being copied has a *directory* at the mutated file's own relative
+// path, so writing the mutated source there afterward collides with an
+// existing directory instead of a regular file.
+func TestRunWriteMutatedFileError(t *testing.T) {
+	t.Parallel()
+
+	fset, file, baseline, stmt, mutation := runnerIfMutationFixture(t)
+
+	moduleDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(moduleDir, "p.go"), 0o750); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+
+	r := &runner{goBin: "/nonexistent/go", testTimeout: MinBaselineTimeout}
+
+	_, _, _, err := r.run(t.Context(), mutant{
+		fset:      fset,
+		file:      file,
+		path:      filepath.Join(moduleDir, "p.go"),
+		baseline:  baseline,
+		moduleDir: moduleDir,
+		pkgDir:    moduleDir,
+		operator:  "control/if",
+		line:      4,
+		scope:     ScopePackage,
+		node:      stmt,
+		mutation:  mutation,
+	})
+	if err == nil {
+		t.Fatal("run() error = nil, want a non-nil error writing the mutated file over an existing directory")
+	}
+}
+
+// TestRunMkdirTempError covers os.MkdirTemp's own error return: with TMPDIR
+// pointed at a directory that does not exist, workspace creation fails
+// before any copy or toolchain call is attempted. Not parallel: t.Setenv
+// forbids it (and the whole point is a process-global env var, which is
+// exactly the kind of shared state this project's own convention says not
+// to run in parallel with siblings).
+func TestRunMkdirTempError(t *testing.T) {
+	fset, file, baseline, stmt, mutation := runnerIfMutationFixture(t)
+
+	t.Setenv("TMPDIR", filepath.Join(t.TempDir(), "does-not-exist"))
+
+	r := &runner{goBin: "/nonexistent/go", testTimeout: MinBaselineTimeout}
+
+	_, _, _, err := r.run(t.Context(), mutant{
+		fset:      fset,
+		file:      file,
+		path:      "/nowhere/p.go",
+		baseline:  baseline,
+		moduleDir: "/nowhere",
+		pkgDir:    "/nowhere",
+		operator:  "control/if",
+		line:      4,
+		scope:     ScopePackage,
+		node:      stmt,
+		mutation:  mutation,
+	})
+	if err == nil {
+		t.Fatal("run() error = nil, want a non-nil error from os.MkdirTemp with an unusable TMPDIR")
+	}
+}
+
+// TestCacheLookup covers every branch cacheLookup itself decides on,
+// directly, rather than only incidentally through run(): no cache
+// configured, a replay bypassing even a populated cache, a genuine miss, an
+// ordinary hit (Status/Output filled in from the record), and an
+// equivalent hit (Status/Output left at their zero values, mirroring
+// isTCEEquivalent's own return shape — see cacheLookup's own doc comment).
+func TestCacheLookup(t *testing.T) {
+	t.Parallel()
+
+	const toolchain = "go1.26 darwin/arm64"
+
+	base := mutant{scope: ScopeFull, cacheFingerprint: "fp1", id: "mutant1"}
+	key := base.cacheKey(toolchain)
+	skeleton := MutantResult{ID: base.id, Line: 4}
+
+	tests := map[string]struct {
+		cache      *cacheIndex
+		replay     bool
+		wantHit    bool
+		wantOK     bool
+		wantEquiv  bool
+		wantStatus Status
+		wantOutput string
+	}{
+		"no cache configured": {
+			cache: nil,
+		},
+		"replay bypasses even a populated cache": {
+			cache:  &cacheIndex{records: map[cacheKey]cacheRecord{key: {Key: key, Status: Killed, Output: "boom"}}},
+			replay: true,
+		},
+		"cache miss": {
+			cache: &cacheIndex{records: map[cacheKey]cacheRecord{}},
+		},
+		"ordinary hit fills status and output": {
+			cache:      &cacheIndex{records: map[cacheKey]cacheRecord{key: {Key: key, Status: Killed, Output: "boom"}}},
+			wantHit:    true,
+			wantOK:     true,
+			wantStatus: Killed,
+			wantOutput: "boom",
+		},
+		"equivalent hit leaves status/output zero": {
+			cache:     &cacheIndex{records: map[cacheKey]cacheRecord{key: {Key: key, Equivalent: true}}},
+			wantHit:   true,
+			wantEquiv: true,
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			r := &runner{cache: tt.cache, toolchain: toolchain}
+
+			m := base
+			m.replay = tt.replay
+
+			got, ok, equiv, hit := r.cacheLookup(m, skeleton)
+			if hit != tt.wantHit {
+				t.Fatalf("cacheLookup() hit = %v, want %v", hit, tt.wantHit)
+			}
+
+			if !hit {
+				return
+			}
+
+			if ok != tt.wantOK || equiv != tt.wantEquiv {
+				t.Errorf("cacheLookup() ok = %v, equivalent = %v, want ok=%v, equivalent=%v", ok, equiv, tt.wantOK, tt.wantEquiv)
+			}
+
+			if got.Status != tt.wantStatus || got.Output != tt.wantOutput {
+				t.Errorf("cacheLookup() Status = %v, Output = %q, want %v, %q", got.Status, got.Output, tt.wantStatus, tt.wantOutput)
+			}
+
+			if got.ID != skeleton.ID || got.Line != skeleton.Line {
+				t.Errorf("cacheLookup() did not preserve the caller's result skeleton: got ID=%q Line=%d", got.ID, got.Line)
+			}
+		})
+	}
+}
+
+// TestRenderNodeUnsupportedNodeReturnsError covers renderNode's own error
+// return: *ast.Field satisfies ast.Node (it has Pos/End) but is not an
+// Expr, Stmt, Decl or Spec — none of the shapes go/printer's own printNode
+// dispatch knows how to print — so Fprint takes its documented "unsupported
+// node type" error return rather than panicking.
+func TestRenderNodeUnsupportedNodeReturnsError(t *testing.T) {
+	t.Parallel()
+
+	fset := token.NewFileSet()
+
+	if _, err := renderNode(fset, &ast.Field{}); err == nil {
+		t.Fatal("renderNode() error = nil, want a non-nil error for an unsupported node type")
+	}
+}
+
+// TestIsTCEEquivalentPackagePatternError covers the one isTCEEquivalent
+// branch that never reaches the toolchain at all: packagePattern failing
+// before compileDisassembly is ever called. Unlike every other
+// isTCEEquivalent test (see runner_integration_internal_test.go), this
+// needs no real go binary — goBin is never actually invoked.
+func TestIsTCEEquivalentPackagePatternError(t *testing.T) {
+	t.Parallel()
+
+	m := mutant{
+		moduleDir:   filepath.FromSlash("/abs/module"),
+		pkgDir:      "relative/pkg", // relative: filepath.Rel fails inside packagePattern
+		tceBaseline: []byte("dummy baseline"),
+	}
+
+	if isTCEEquivalent(t.Context(), "/nonexistent/go", m.moduleDir, m) {
+		t.Error("isTCEEquivalent() = true, want false: packagePattern must fail before any compile is attempted")
+	}
+}
+
+func TestDecodeTestEvent(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		line   string
+		wantOK bool
+	}{
+		"valid event":                        {line: `{"Action":"pass","Package":"p"}`, wantOK: true},
+		"not json at all":                    {line: "mathx/mathx.go:5:2: undefined: undefinedVar", wantOK: false},
+		"starts with { but isn't valid json": {line: `{not valid json`, wantOK: false},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			if _, ok := decodeTestEvent(tt.line); ok != tt.wantOK {
+				t.Errorf("decodeTestEvent(%q) ok = %v, want %v", tt.line, ok, tt.wantOK)
+			}
+		})
+	}
+}
+
+// TestParseTestEventsRawNonJSONLines covers the fallback path some
+// toolchains take: a raw compiler diagnostic line interleaved directly into
+// stdout rather than wrapped in a JSON event — decodeTestEvent's own
+// ok==false case, bubbling up into parseTestEvents' raw-output
+// accumulation, which classify's compile-error heuristic then reads.
+func TestParseTestEventsRawNonJSONLines(t *testing.T) {
+	t.Parallel()
+
+	const stdout = `mathx/mathx.go:5:2: undefined: undefinedVar
+{"Action":"fail","Package":"example.com/fixture/mathx"}
+`
+
+	sawTest, testFailed, pkgFailed, buildFail, out := parseTestEvents([]byte(stdout))
+	if sawTest || testFailed || buildFail {
+		t.Errorf("parseTestEvents() sawTest=%v testFailed=%v buildFail=%v, want all false", sawTest, testFailed, buildFail)
+	}
+
+	if !pkgFailed {
+		t.Error("parseTestEvents() pkgFailed = false, want true from the fail event")
+	}
+
+	if !strings.Contains(out, "undefined: undefinedVar") {
+		t.Errorf("parseTestEvents() out = %q, want it to contain the raw diagnostic line", out)
 	}
 }
