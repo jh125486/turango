@@ -20,13 +20,19 @@ on:
     - cron: '0 6 * * 1' # 06:00 UTC every Monday
   workflow_dispatch: {}
 
-permissions:
-  contents: write # required to push the generated badge JSON to gh-pages via peaceiris/actions-gh-pages; cannot be downgraded to read
-
 jobs:
   mutation-score:
     runs-on: ubuntu-latest
     timeout-minutes: 150
+    # contents:write is required to push the generated badge JSON to
+    # gh-pages via peaceiris/actions-gh-pages; cannot be downgraded to read.
+    # Scoped here at job level rather than the workflow's top-level default
+    # — OpenSSF Scorecard's Token-Permissions check flags any write scope
+    # set at the top level regardless of whether it's needed, since a
+    # top-level default is inherited by every job in the file, including
+    # any added later without its own explicit block.
+    permissions:
+      contents: write
     steps:
       - name: Check out code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
