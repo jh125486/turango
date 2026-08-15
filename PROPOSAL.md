@@ -125,38 +125,52 @@ a time), `-mutate` is a broad matcher like `-run`/`-bench`: mutation testing
 naturally wants to mutate every function that matches, not narrow to a
 single one.
 
-Sibling flags, mirroring how `-fuzz` has `-fuzztime`/`-fuzzminimizetime`/
-`-parallel`:
+### Initial `go test` surface
+
+The initial toolchain surface should stay small:
+
+- `-mutate=<regexp>` — enable mutation testing and select functions/methods.
+- `-mutatetimeout=<duration>` — bound one mutant's selected test run. If
+  omitted, the implementation derives a conservative default from an
+  unmutated baseline so an infinite-loop mutant cannot stall a run.
+
+`go test -mutate=. ./...` is therefore a complete, usable invocation. The
+default scope is full-suite execution, so its result has one unambiguous
+meaning: every selected test was run against every viable mutant.
+
+Mutation verdicts should be cached automatically in the Go build cache, like
+fuzzing cache state, with `go clean -mutatecache` to discard them explicitly.
+Cache validity must include the exact mutant, all source and test files in the
+selected test closure, mutation configuration, relevant test flags, toolchain,
+and target platform. A timeout verdict must not be reused after its timeout
+setting changes. This caching is necessary to make repeated or interrupted
+mutation runs practical, but its storage location is not a `go test` option.
+
+### Optional and useful controls
+
+These controls are useful in a mature tool, but are not a commitment for an
+initial Go implementation:
 
 - `-mutatescope=full|package|impact` — how much of the test suite reruns
   per mutant. `full` (default) reruns everything; `package` scopes to the
   mutated file's own package; `impact` builds a per-test coverage map once
-  and only reruns tests that actually cover the mutated line.
+  and only reruns tests that actually cover the mutated line. Narrower scopes
+  trade completeness for cost; their scores must be labeled with the scope.
 - `-mutateoperators=<comma-list>` — restrict which mutation operators run.
 - `-mutateparallel=<n>` — bounded worker-pool size for concurrent mutant
   execution (default `GOMAXPROCS`).
-- `-mutatetimeout=<duration>` — per-mutant budget. Defaults to a baseline
-  measurement (the unmutated suite timed 3×, averaged, scaled by CPU count)
-  so a mutation that produces an infinite loop (a common outcome — e.g.
-  `i++` flipped to `i--`) doesn't stall the run to `go test`'s own
-  ~10-minute default; a timeout is itself treated as a kill.
-- `-mutateoutput=<dir>` — write a JSON report.
+- `-mutateoutput=<dir>` — write a JSON report, in addition to the default
+  human-readable summary.
 - `-mutatemin=<float>` — non-zero exit if the resulting score falls below
   the threshold, for CI gating.
 - `-mutatemutant=<id>` — replay one mutant ID from a previous report. IDs are
   stable across reruns of unchanged source; source-position changes can change
   them.
-- `-mutatetce=true|false` — [Trivial Compiler Equivalence][TCE] (TCE):
-  filter a mutant whose normalized compiler disassembly matches a baseline
-  before it reaches the test suite. Off by default; see "Costs and risks."
-- `-mutateworkspace=copy|worktree` — build each mutant's isolated workspace
-  with a filesystem copy or, when repository state permits, a Git worktree.
-- `-mutateestimate=true|false` — count prospective mutants and sample
-  baseline cost without executing or classifying them.
-- `-mutatecache=<dir>` — persist mutant verdicts. Cache keys include mutant
-  ID, dependent-source fingerprint, scope, TCE setting, and toolchain.
-  Workspace strategy, parallelism, and timeout are deliberately excluded;
-  changing a timeout can therefore reuse an earlier timeout-killed verdict.
+
+Turango also exposes TCE, workspace strategy, estimation, and manual cache
+directory controls. Those are prototype implementation experiments, not
+proposed `go test` flags. A Go implementation can use its normal cache and
+revisit additional controls only after user experience establishes a need.
 
 ### Classification and score
 
@@ -237,21 +251,17 @@ maxUint64` on the real `n1 > maxVal` comparison.
   LLVM-based), and [Stryker] (JavaScript/TypeScript, .NET) — mutation testing
   is provided outside the language toolchain. This proposal would integrate
   that workflow into `go test`.
-- **It gives AI-assisted development a machine-checkable guardrail.** An LLM
-  generating or editing Go code is, in effect, an extremely fast producer of
-  candidate mutants of its own — and coverage alone cannot tell a reviewer
-  (human or automated) whether the tests around a change would actually catch
-  a regression, only whether the changed lines executed. A mutation score
-  turns "the tests still pass" into "the tests would notice if this were
-  wrong," which is the property an AI coding agent needs to iterate against
-  safely without a human re-deriving the failure by hand each time. Dogfooding
-  turango against its own suite surfaced this pattern directly: every fix that
-  raised the score corrected a test that could not distinguish correct
-  behavior from a mutated (wrong) version — a weak assertion, an untested
-  success path, a fixture that referenced the same constant it was meant to
-  verify — never a defect in the code under test. That is precisely the kind
-  of guardrail gap an AI agent, working from coverage alone, would not have
-  had any signal to find or fix.
+- **It adds an AI-era test-quality guardrail.** Go already provides automated
+  guardrails such as `go test`, `go vet`, the race detector, and fuzzing.
+  AI-assisted development increases the volume of code and tests produced per
+  change, making an automated signal about whether tests distinguish plausible
+  wrong behavior more valuable. Coverage only says that changed lines ran;
+  mutation testing adds whether selected tests notice a controlled change.
+  It is a diagnostic, not a certification of quality. Dogfooding has surfaced
+  genuine weak assertions and missing behavioral test cases, as well as
+  survivors that require triage as equivalent or implementation-specific.
+  Claims about effectiveness therefore need reproducible reports and
+  behavior-level tests, not score movement alone.
 
 [PIT]: https://pitest.org/
 [mutmut]: https://pypi.org/project/mutmut/
