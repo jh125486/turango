@@ -72,7 +72,7 @@ func TestIncDecInsideForPost(t *testing.T) {
 	applyRoundTrip(t, fset, loop, mutations[0], "for i := 0; i < n; i-- {\n}")
 }
 
-func TestIncDecIgnoresOtherNodes(t *testing.T) {
+func TestIncDecApplies(t *testing.T) {
 	t.Parallel()
 
 	_, file := parseFunc(t, "a += 1")

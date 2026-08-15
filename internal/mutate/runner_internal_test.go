@@ -2156,7 +2156,19 @@ func TestCopyWorktree(t *testing.T) {
 		t.Fatalf("git worktree list: %v", err)
 	}
 
-	if strings.Contains(string(out), filepath.Base(dst)) {
+	// Checked against the exact "worktree <path>" porcelain line, not a raw
+	// substring search over the whole blob: --porcelain's output always
+	// includes repo's own primary worktree entry first (its own directory,
+	// with a real branch — unlike root/wt's detached checkout), and a
+	// generic Contains(out, filepath.Base(dst)) risks matching that entry's
+	// path by coincidence whenever its numeric t.TempDir() suffix collides
+	// with dst's own (both are small sequential integers drawn from the
+	// same counter, e.g. ".../001" vs ".../002" — confirmed flaky in CI:
+	// https://github.com/jh125486/turango/actions/runs/31759817647). root
+	// is exactly the worktree path copyWorktree registered (moduleDir here
+	// is repo itself, so gitPrefix's rel is empty and root == wt with no
+	// suffix), so this is the only line that removal is being asked about.
+	if strings.Contains(string(out), "worktree "+root+"\n") {
 		t.Errorf("git worktree list still references the removed worktree:\n%s", out)
 	}
 

@@ -72,46 +72,53 @@ func TestBooleanMutate(t *testing.T) {
 	}
 }
 
-func TestBooleanIgnoresOtherIdents(t *testing.T) {
+// TestBooleanApplies covers the two ways a node is not this operator's
+// business: an identifier that isn't a boolean literal, and a node kind
+// (a whole statement) that isn't an identifier at all.
+func TestBooleanApplies(t *testing.T) {
 	t.Parallel()
 
-	_, file := parseFunc(t, "x := 1")
+	t.Run("other idents", func(t *testing.T) {
+		t.Parallel()
 
-	var m literal.BooleanMutator
+		_, file := parseFunc(t, "x := 1")
 
-	// findNode wants exactly one *ast.Ident; "x := 1" has two (x, and the
-	// blank identifier is not present here, so just x). Use findNodes and
-	// check the one that isn't a declaration target incidentally matching.
-	idents := findNodes[*ast.Ident](file)
-	if len(idents) == 0 {
-		t.Fatal("expected at least one identifier in snippet")
-	}
+		var m literal.BooleanMutator
 
-	for _, ident := range idents {
-		if m.Applies(ident) {
-			t.Errorf("Applies(%q) = true, want false", ident.Name)
+		// findNode wants exactly one *ast.Ident; "x := 1" has two (x, and the
+		// blank identifier is not present here, so just x). Use findNodes and
+		// check the one that isn't a declaration target incidentally matching.
+		idents := findNodes[*ast.Ident](file)
+		if len(idents) == 0 {
+			t.Fatal("expected at least one identifier in snippet")
 		}
 
-		if got := m.Mutate(ident); got != nil {
-			t.Errorf("Mutate(%q) = %v, want nil", ident.Name, got)
+		for _, ident := range idents {
+			if m.Applies(ident) {
+				t.Errorf("Applies(%q) = true, want false", ident.Name)
+			}
+
+			if got := m.Mutate(ident); got != nil {
+				t.Errorf("Mutate(%q) = %v, want nil", ident.Name, got)
+			}
 		}
-	}
-}
+	})
 
-func TestBooleanIgnoresOtherNodes(t *testing.T) {
-	t.Parallel()
+	t.Run("other node kinds", func(t *testing.T) {
+		t.Parallel()
 
-	_, file := parseFunc(t, "a := 1")
+		_, file := parseFunc(t, "a := 1")
 
-	var m literal.BooleanMutator
+		var m literal.BooleanMutator
 
-	stmt := findNode[*ast.AssignStmt](t, file)
+		stmt := findNode[*ast.AssignStmt](t, file)
 
-	if m.Applies(stmt) {
-		t.Error("Applies() = true for an assignment statement")
-	}
+		if m.Applies(stmt) {
+			t.Error("Applies() = true for an assignment statement")
+		}
 
-	if got := m.Mutate(stmt); got != nil {
-		t.Errorf("Mutate() = %v, want nil", got)
-	}
+		if got := m.Mutate(stmt); got != nil {
+			t.Errorf("Mutate() = %v, want nil", got)
+		}
+	})
 }

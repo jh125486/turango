@@ -100,7 +100,7 @@ func TestBinaryMutatesEachOperandIndependently(t *testing.T) {
 	}
 }
 
-func TestBinaryIgnoresOtherNodes(t *testing.T) {
+func TestBinaryApplies(t *testing.T) {
 	t.Parallel()
 
 	_, file := parseFunc(t, "a += 1")
