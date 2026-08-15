@@ -76,7 +76,7 @@ func TestAssignmentMutate(t *testing.T) {
 	}
 }
 
-func TestAssignmentIgnoresOtherNodes(t *testing.T) {
+func TestAssignmentApplies(t *testing.T) {
 	t.Parallel()
 
 	_, file := parseFunc(t, "a := b + c")

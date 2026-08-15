@@ -54,47 +54,52 @@ func TestBoundaryMutate(t *testing.T) {
 	}
 }
 
-// TestBoundaryIgnoresNegationOperators checks that boundary does not claim
-// the operators binary's negation swap already covers (==, !=, &&, ||, +,
-// etc.) — the two operators must partition the relational tokens, not
-// overlap.
-func TestBoundaryIgnoresNegationOperators(t *testing.T) {
+// TestBoundaryApplies covers the two ways a node is not this operator's
+// business: a binary operator boundary does not claim (the negation swap
+// binary already covers ==, !=, &&, ||, +, etc. — the two operators must
+// partition the relational tokens, not overlap), and a node kind that isn't
+// a binary expression at all.
+func TestBoundaryApplies(t *testing.T) {
 	t.Parallel()
 
-	m := newMutator(t, "operator/boundary")
+	t.Run("negation operators", func(t *testing.T) {
+		t.Parallel()
 
-	for _, src := range []string{"a == b", "a != b", "a && b", "a || b", "a + b"} {
-		t.Run(src, func(t *testing.T) {
-			t.Parallel()
+		m := newMutator(t, "operator/boundary")
 
-			_, file := parseFunc(t, "_ = "+src)
-			expr := findNode[*ast.BinaryExpr](t, file)
+		for _, src := range []string{"a == b", "a != b", "a && b", "a || b", "a + b"} {
+			t.Run(src, func(t *testing.T) {
+				t.Parallel()
 
-			if m.Applies(expr) {
-				t.Errorf("Applies(%q) = true, want false", src)
-			}
+				_, file := parseFunc(t, "_ = "+src)
+				expr := findNode[*ast.BinaryExpr](t, file)
 
-			if got := m.Mutate(expr); got != nil {
-				t.Errorf("Mutate(%q) = %v, want nil", src, got)
-			}
-		})
-	}
-}
+				if m.Applies(expr) {
+					t.Errorf("Applies(%q) = true, want false", src)
+				}
 
-func TestBoundaryIgnoresOtherNodes(t *testing.T) {
-	t.Parallel()
+				if got := m.Mutate(expr); got != nil {
+					t.Errorf("Mutate(%q) = %v, want nil", src, got)
+				}
+			})
+		}
+	})
 
-	_, file := parseFunc(t, "a += 1")
+	t.Run("other node kinds", func(t *testing.T) {
+		t.Parallel()
 
-	m := newMutator(t, "operator/boundary")
+		_, file := parseFunc(t, "a += 1")
 
-	stmt := findNode[*ast.AssignStmt](t, file)
+		m := newMutator(t, "operator/boundary")
 
-	if m.Applies(stmt) {
-		t.Error("Applies() = true for an assignment statement")
-	}
+		stmt := findNode[*ast.AssignStmt](t, file)
 
-	if got := m.Mutate(stmt); got != nil {
-		t.Errorf("Mutate() = %v, want nil", got)
-	}
+		if m.Applies(stmt) {
+			t.Error("Applies() = true for an assignment statement")
+		}
+
+		if got := m.Mutate(stmt); got != nil {
+			t.Errorf("Mutate() = %v, want nil", got)
+		}
+	})
 }
