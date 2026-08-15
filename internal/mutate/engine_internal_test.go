@@ -1190,164 +1190,115 @@ func TestPlanPrecomputePropagatesErrors(t *testing.T) {
 func TestPlanPackage(t *testing.T) {
 	t.Parallel()
 
-	t.Run("nil module is skipped", func(t *testing.T) {
-		t.Parallel()
+	plain, err := mutator.New("control/if")
+	if err != nil {
+		t.Fatalf("mutator.New(control/if) error = %v", err)
+	}
 
-		jobs, err := planPackage(t.Context(), planner{}, &packages.Package{}, map[string]string{})
-		if err != nil || jobs != nil {
-			t.Errorf("planPackage() = (%v, %v), want (nil, nil) for a package with no module", jobs, err)
-		}
-	})
+	typed, err := mutator.New("identifier/constswap")
+	if err != nil {
+		t.Fatalf("mutator.New(identifier/constswap) error = %v", err)
+	}
 
-	t.Run("empty module dir is skipped", func(t *testing.T) {
-		t.Parallel()
+	pkg := &packages.Package{
+		PkgPath: "example.com/pkg",
+		Module:  &packages.Module{Dir: "/mod"},
+		GoFiles: []string{"/mod/f.go"},
+	}
+	fset := token.NewFileSet()
+	syntax := &ast.File{Name: &ast.Ident{Name: "pkg"}}
 
-		pkg := &packages.Package{Module: &packages.Module{Dir: ""}}
+	tests := []struct {
+		name string
+		run  func(t *testing.T)
+	}{
+		{
+			name: "nil module is skipped",
+			run: func(t *testing.T) {
+				assertPlanPackage(t.Context(), t, planner{}, &packages.Package{}, nil)
+			},
+		},
+		{
+			name: "empty module dir is skipped",
+			run: func(t *testing.T) {
+				assertPlanPackage(t.Context(), t, planner{}, &packages.Package{Module: &packages.Module{}}, nil)
+			},
+		},
+		{
+			name: "only test files is skipped",
+			run: func(t *testing.T) {
+				pkg := &packages.Package{Module: &packages.Module{Dir: "/mod"}, GoFiles: []string{"/mod/foo_test.go"}}
+				assertPlanPackage(t.Context(), t, planner{estimateOnly: true}, pkg, nil)
+			},
+		},
+		{
+			name: "planPrecompute error propagates",
+			run: func(t *testing.T) {
+				ctx, cancel := context.WithCancel(t.Context())
+				cancel()
+				assertPlanPackage(ctx, t, planner{goBin: "/nonexistent/go", opts: Options{CacheDir: "cache"}}, pkg, context.Canceled)
+			},
+		},
+		{
+			name: "no typedPkgs leaves mutators unbound",
+			run: func(t *testing.T) {
+				assertPlanPackageBinding(t, planner{estimateOnly: true, mutators: []mutator.Mutator{plain, typed}}, pkg, []string{plain.Name(), typed.Name()}, nil, nil)
+			},
+		},
+		{
+			name: "IllTyped falls back to unbound",
+			run: func(t *testing.T) {
+				p := planner{estimateOnly: true, mutators: []mutator.Mutator{plain, typed}, typedPkgs: map[string]*packages.Package{pkg.PkgPath: {IllTyped: true}}}
+				assertPlanPackageBinding(t, p, pkg, []string{plain.Name()}, nil, nil)
+			},
+		},
+		{
+			name: "clean resolution populates typed fields",
+			run: func(t *testing.T) {
+				typedPkg := &packages.Package{Fset: fset, CompiledGoFiles: []string{"/mod/f.go"}, Syntax: []*ast.File{syntax}}
+				p := planner{estimateOnly: true, mutators: []mutator.Mutator{plain}, typedPkgs: map[string]*packages.Package{pkg.PkgPath: typedPkg}}
+				assertPlanPackageBinding(t, p, pkg, []string{plain.Name()}, fset, syntax)
+			},
+		},
+	}
 
-		jobs, err := planPackage(t.Context(), planner{}, pkg, map[string]string{})
-		if err != nil || jobs != nil {
-			t.Errorf("planPackage() = (%v, %v), want (nil, nil) for an empty module dir", jobs, err)
-		}
-	})
-
-	t.Run("only test files is skipped", func(t *testing.T) {
-		t.Parallel()
-
-		pkg := &packages.Package{
-			Module:  &packages.Module{Dir: "/mod"},
-			GoFiles: []string{"/mod/foo_test.go"},
-		}
-
-		jobs, err := planPackage(t.Context(), planner{estimateOnly: true}, pkg, map[string]string{})
-		if err != nil || jobs != nil {
-			t.Errorf("planPackage() = (%v, %v), want (nil, nil) when every GoFile is a _test.go", jobs, err)
-		}
-	})
-
-	t.Run("planPrecompute error propagates", func(t *testing.T) {
-		t.Parallel()
-
-		ctx, cancel := context.WithCancel(t.Context())
-		cancel()
-
-		pkg := &packages.Package{
-			Module:  &packages.Module{Dir: "/mod"},
-			GoFiles: []string{"/mod/f.go"},
-		}
-		p := planner{goBin: "/nonexistent/go", opts: Options{CacheDir: "cache"}}
-
-		jobs, err := planPackage(ctx, p, pkg, map[string]string{})
-		if !errors.Is(err, context.Canceled) || jobs != nil {
-			t.Errorf("planPackage() = (%v, %v), want (nil, %v)", jobs, err, context.Canceled)
-		}
-	})
-
-	// The three states of a per-package typed-mutator binding: no
-	// typedPkgs at all (pkgMutators stays the shared, unbound slice),
-	// resolved but IllTyped (falls back the same as not being resolved),
-	// and a clean resolution (bound, and the job's typed fields populated).
-	t.Run("typed-mutator binding", func(t *testing.T) {
-		t.Parallel()
-
-		plain, err := mutator.New("control/if")
-		if err != nil {
-			t.Fatalf("mutator.New(control/if) error = %v", err)
-		}
-
-		typed, err := mutator.New("identifier/constswap")
-		if err != nil {
-			t.Fatalf("mutator.New(identifier/constswap) error = %v", err)
-		}
-
-		mutators := []mutator.Mutator{plain, typed}
-
-		pkg := &packages.Package{
-			PkgPath: "example.com/pkg",
-			Module:  &packages.Module{Dir: "/mod"},
-			GoFiles: []string{"/mod/f.go"},
-		}
-
-		t.Run("no typedPkgs leaves mutators unbound", func(t *testing.T) {
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-
-			p := planner{estimateOnly: true, mutators: mutators}
-
-			jobs, err := planPackage(t.Context(), p, pkg, map[string]string{})
-			if err != nil || len(jobs) != 1 {
-				t.Fatalf("planPackage() = (%v, %v), want one job", jobs, err)
-			}
-
-			if len(jobs[0].mutators) != len(mutators) {
-				t.Errorf("mutators = %d, want %d (the shared, unbound slice)", len(jobs[0].mutators), len(mutators))
-			}
-
-			if jobs[0].typedFset != nil || jobs[0].typedSyntax != nil {
-				t.Errorf("job = %+v, want no typed fields set", jobs[0])
-			}
+			tt.run(t)
 		})
+	}
+}
 
-		t.Run("IllTyped falls back to unbound", func(t *testing.T) {
-			t.Parallel()
+func assertPlanPackage(ctx context.Context, t *testing.T, p planner, pkg *packages.Package, wantErr error) {
+	t.Helper()
 
-			p := planner{
-				estimateOnly: true,
-				mutators:     mutators,
-				typedPkgs:    map[string]*packages.Package{pkg.PkgPath: {IllTyped: true}},
-			}
+	jobs, err := planPackage(ctx, p, pkg, map[string]string{})
+	if !errors.Is(err, wantErr) || jobs != nil {
+		t.Errorf("planPackage() = (%v, %v), want (nil, %v)", jobs, err, wantErr)
+	}
+}
 
-			jobs, err := planPackage(t.Context(), p, pkg, map[string]string{})
-			if err != nil || len(jobs) != 1 {
-				t.Fatalf("planPackage() = (%v, %v), want one job", jobs, err)
-			}
+func assertPlanPackageBinding(t *testing.T, p planner, pkg *packages.Package, wantMutators []string, wantFset *token.FileSet, wantSyntax *ast.File) {
+	t.Helper()
 
-			if len(jobs[0].mutators) != 1 || jobs[0].mutators[0].Name() != plain.Name() {
-				t.Errorf("mutators = %v, want just the plain one (typed dropped, IllTyped)", jobs[0].mutators)
-			}
+	jobs, err := planPackage(t.Context(), p, pkg, map[string]string{})
+	if err != nil || len(jobs) != 1 {
+		t.Fatalf("planPackage() = (%v, %v), want one job", jobs, err)
+	}
 
-			if jobs[0].typedFset != nil || jobs[0].typedSyntax != nil {
-				t.Errorf("job = %+v, want no typed fields set for an IllTyped package", jobs[0])
-			}
-		})
+	gotMutators := make([]string, len(jobs[0].mutators))
+	for i, m := range jobs[0].mutators {
+		gotMutators[i] = m.Name()
+	}
 
-		// No TypedMutator in this subtest's own mutator set (unlike the
-		// other two above): binding one for real needs a *packages.Package
-		// with genuine type-checked info (Types/TypesInfo from a real
-		// go/packages.Load), which is exactly the expensive-to-fabricate
-		// case [TestBindMutators] itself only covers on the typedPkg==nil
-		// side. What's cheap and still worth pinning here is planPackage's
-		// own half of the contract: a resolved, non-IllTyped typedPkg makes
-		// it through to the job's typed fields regardless of which
-		// mutators are selected.
-		t.Run("clean resolution populates typed fields", func(t *testing.T) {
-			t.Parallel()
+	if !reflect.DeepEqual(gotMutators, wantMutators) {
+		t.Errorf("mutators = %v, want %v", gotMutators, wantMutators)
+	}
 
-			fset := token.NewFileSet()
-			syntax := &ast.File{Name: &ast.Ident{Name: "pkg"}}
-			typedPkg := &packages.Package{
-				Fset:            fset,
-				CompiledGoFiles: []string{"/mod/f.go"},
-				Syntax:          []*ast.File{syntax},
-			}
-			p := planner{
-				estimateOnly: true,
-				mutators:     []mutator.Mutator{plain},
-				typedPkgs:    map[string]*packages.Package{pkg.PkgPath: typedPkg},
-			}
-
-			jobs, err := planPackage(t.Context(), p, pkg, map[string]string{})
-			if err != nil || len(jobs) != 1 {
-				t.Fatalf("planPackage() = (%v, %v), want one job", jobs, err)
-			}
-
-			if len(jobs[0].mutators) != 1 {
-				t.Errorf("mutators = %d, want 1 (the plain one, bound but unaffected)", len(jobs[0].mutators))
-			}
-
-			if jobs[0].typedFset != fset || jobs[0].typedSyntax != syntax {
-				t.Errorf("job typed fields = (%v, %v), want (%v, %v)", jobs[0].typedFset, jobs[0].typedSyntax, fset, syntax)
-			}
-		})
-	})
+	if jobs[0].typedFset != wantFset || jobs[0].typedSyntax != wantSyntax {
+		t.Errorf("job typed fields = (%v, %v), want (%v, %v)", jobs[0].typedFset, jobs[0].typedSyntax, wantFset, wantSyntax)
+	}
 }
 
 // TestBindMutators covers the typedPkg==nil half of bindMutators: a
