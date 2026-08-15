@@ -317,6 +317,7 @@ func TestCollectorSorts(t *testing.T) {
 
 			sink.mutant(m)
 			sink.suppression(SuppressionResult{File: m.File, Line: m.Line})
+			sink.equivalent(EquivalentResult{File: m.File, Line: m.Line, Operator: m.Operator})
 		}()
 	}
 
@@ -324,9 +325,9 @@ func TestCollectorSorts(t *testing.T) {
 
 	got := sink.close()
 
-	if len(got.Mutants) != len(mutants) || len(got.Suppressions) != len(mutants) {
-		t.Fatalf("collector kept %d mutants and %d suppressions, want %d of each",
-			len(got.Mutants), len(got.Suppressions), len(mutants))
+	if len(got.Mutants) != len(mutants) || len(got.Suppressions) != len(mutants) || len(got.Equivalents) != len(mutants) {
+		t.Fatalf("collector kept %d mutants, %d suppressions and %d equivalents, want %d of each",
+			len(got.Mutants), len(got.Suppressions), len(got.Equivalents), len(mutants))
 	}
 
 	want := []string{"a.go:2:control/if", "a.go:2:operator/binary", "a.go:9:control/if", "b.go:1:control/if"}
@@ -421,9 +422,17 @@ func TestBaselineTimeoutFailsOnBrokenSuite(t *testing.T) {
 		return 0, wantErr
 	}
 
-	_, err := baselineTimeout(t.Context(), baselineRuns, 4, timer)
+	got, err := baselineTimeout(t.Context(), baselineRuns, 4, timer)
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("baselineTimeout() error = %v, want it to wrap %v", err, wantErr)
+	}
+
+	if got != 0 {
+		t.Errorf("baselineTimeout() = %v, want 0 on a failed baseline run", got)
+	}
+
+	if !strings.Contains(err.Error(), "baseline run 1 of 3") {
+		t.Errorf("baselineTimeout() error = %v, want it to say which run of how many failed", err)
 	}
 
 	if calls != 1 {
@@ -811,12 +820,38 @@ func TestPlanClosure(t *testing.T) {
 
 	const dir = "/some/pkg/dir"
 
+	// resolvableFixture builds a closurePkgs entry that would genuinely
+	// resolve to a non-nil closure — used by "ScopeFull always declines"
+	// below so that guard is falsifiable by a mutant that skips it, not
+	// merely masked by resolveClosure declining anyway for an empty
+	// fixture the way the other decline subtests' fixtures do.
+	resolvableFixture := func(t *testing.T) (targetDir string, closurePkgs map[string][]*packages.Package) {
+		t.Helper()
+
+		moduleDir := t.TempDir()
+		targetDir = filepath.Join(moduleDir, "target")
+
+		writeFiles(t, map[string]string{
+			filepath.Join(moduleDir, "go.mod"):    "module example.com/mod\n\ngo 1.23\n",
+			filepath.Join(targetDir, "target.go"): "package target\n",
+		})
+
+		pkg := &packages.Package{
+			PkgPath: "example.com/mod/target",
+			Module:  &packages.Module{Dir: moduleDir},
+			GoFiles: []string{filepath.Join(targetDir, "target.go")},
+		}
+
+		return targetDir, map[string][]*packages.Package{targetDir: {pkg}}
+	}
+
 	t.Run("ScopeFull always declines", func(t *testing.T) {
 		t.Parallel()
 
-		closurePkgs := map[string][]*packages.Package{dir: {{}}}
-		if got := planClosure(ScopeFull, closurePkgs, dir); got != nil {
-			t.Errorf("planClosure() = %v, want nil under ScopeFull", got)
+		targetDir, closurePkgs := resolvableFixture(t)
+
+		if got := planClosure(ScopeFull, closurePkgs, targetDir); got != nil {
+			t.Errorf("planClosure() = %v, want nil under ScopeFull even for an otherwise-resolvable closure", got)
 		}
 	})
 
@@ -843,6 +878,22 @@ func TestPlanClosure(t *testing.T) {
 		closurePkgs := map[string][]*packages.Package{dir: {{}}}
 		if got := planClosure(ScopePackage, closurePkgs, dir); got != nil {
 			t.Errorf("planClosure() = %v, want nil when resolveClosure declines", got)
+		}
+	})
+
+	// The one success path: every decline check above must actually be
+	// passed through, not just short-circuited, for a clean module to
+	// resolve to its real closure.
+	t.Run("resolves a real closure", func(t *testing.T) {
+		t.Parallel()
+
+		targetDir, closurePkgs := resolvableFixture(t)
+
+		got := planClosure(ScopePackage, closurePkgs, targetDir)
+
+		want := map[string]bool{targetDir: true}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("planClosure() = %v, want %v", got, want)
 		}
 	})
 }
@@ -1082,6 +1133,113 @@ func TestPlanPackage(t *testing.T) {
 			t.Errorf("planPackage() = (%v, %v), want (nil, %v)", jobs, err, context.Canceled)
 		}
 	})
+
+	// The three states of a per-package typed-mutator binding: no
+	// typedPkgs at all (pkgMutators stays the shared, unbound slice),
+	// resolved but IllTyped (falls back the same as not being resolved),
+	// and a clean resolution (bound, and the job's typed fields populated).
+	t.Run("typed-mutator binding", func(t *testing.T) {
+		t.Parallel()
+
+		plain, err := mutator.New("control/if")
+		if err != nil {
+			t.Fatalf("mutator.New(control/if) error = %v", err)
+		}
+
+		typed, err := mutator.New("identifier/constswap")
+		if err != nil {
+			t.Fatalf("mutator.New(identifier/constswap) error = %v", err)
+		}
+
+		mutators := []mutator.Mutator{plain, typed}
+
+		pkg := &packages.Package{
+			PkgPath: "example.com/pkg",
+			Module:  &packages.Module{Dir: "/mod"},
+			GoFiles: []string{"/mod/f.go"},
+		}
+
+		t.Run("no typedPkgs leaves mutators unbound", func(t *testing.T) {
+			t.Parallel()
+
+			p := planner{estimateOnly: true, mutators: mutators}
+
+			jobs, err := planPackage(t.Context(), p, pkg, map[string]string{})
+			if err != nil || len(jobs) != 1 {
+				t.Fatalf("planPackage() = (%v, %v), want one job", jobs, err)
+			}
+
+			if len(jobs[0].mutators) != len(mutators) {
+				t.Errorf("mutators = %d, want %d (the shared, unbound slice)", len(jobs[0].mutators), len(mutators))
+			}
+
+			if jobs[0].typedFset != nil || jobs[0].typedSyntax != nil {
+				t.Errorf("job = %+v, want no typed fields set", jobs[0])
+			}
+		})
+
+		t.Run("IllTyped falls back to unbound", func(t *testing.T) {
+			t.Parallel()
+
+			p := planner{
+				estimateOnly: true,
+				mutators:     mutators,
+				typedPkgs:    map[string]*packages.Package{pkg.PkgPath: {IllTyped: true}},
+			}
+
+			jobs, err := planPackage(t.Context(), p, pkg, map[string]string{})
+			if err != nil || len(jobs) != 1 {
+				t.Fatalf("planPackage() = (%v, %v), want one job", jobs, err)
+			}
+
+			if len(jobs[0].mutators) != 1 || jobs[0].mutators[0].Name() != plain.Name() {
+				t.Errorf("mutators = %v, want just the plain one (typed dropped, IllTyped)", jobs[0].mutators)
+			}
+
+			if jobs[0].typedFset != nil || jobs[0].typedSyntax != nil {
+				t.Errorf("job = %+v, want no typed fields set for an IllTyped package", jobs[0])
+			}
+		})
+
+		// No TypedMutator in this subtest's own mutator set (unlike the
+		// other two above): binding one for real needs a *packages.Package
+		// with genuine type-checked info (Types/TypesInfo from a real
+		// go/packages.Load), which is exactly the expensive-to-fabricate
+		// case [TestBindMutators] itself only covers on the typedPkg==nil
+		// side. What's cheap and still worth pinning here is planPackage's
+		// own half of the contract: a resolved, non-IllTyped typedPkg makes
+		// it through to the job's typed fields regardless of which
+		// mutators are selected.
+		t.Run("clean resolution populates typed fields", func(t *testing.T) {
+			t.Parallel()
+
+			fset := token.NewFileSet()
+			syntax := &ast.File{Name: &ast.Ident{Name: "pkg"}}
+			typedPkg := &packages.Package{
+				Fset:            fset,
+				CompiledGoFiles: []string{"/mod/f.go"},
+				Syntax:          []*ast.File{syntax},
+			}
+			p := planner{
+				estimateOnly: true,
+				mutators:     []mutator.Mutator{plain},
+				typedPkgs:    map[string]*packages.Package{pkg.PkgPath: typedPkg},
+			}
+
+			jobs, err := planPackage(t.Context(), p, pkg, map[string]string{})
+			if err != nil || len(jobs) != 1 {
+				t.Fatalf("planPackage() = (%v, %v), want one job", jobs, err)
+			}
+
+			if len(jobs[0].mutators) != 1 {
+				t.Errorf("mutators = %d, want 1 (the plain one, bound but unaffected)", len(jobs[0].mutators))
+			}
+
+			if jobs[0].typedFset != fset || jobs[0].typedSyntax != syntax {
+				t.Errorf("job typed fields = (%v, %v), want (%v, %v)", jobs[0].typedFset, jobs[0].typedSyntax, fset, syntax)
+			}
+		})
+	})
 }
 
 // TestBindMutators covers the typedPkg==nil half of bindMutators: a
@@ -1125,6 +1283,25 @@ func TestSyntaxForNoMatch(t *testing.T) {
 
 	if got := syntaxFor(typedPkg, "/a/b/target.go"); got != nil {
 		t.Errorf("syntaxFor() = %v, want nil when path is not among CompiledGoFiles", got)
+	}
+}
+
+// TestSyntaxForMatch is [TestSyntaxForNoMatch]'s counterpart: the one
+// success path, including that the returned *ast.File is looked up by the
+// matching index, not merely "some" syntax tree off the package.
+func TestSyntaxForMatch(t *testing.T) {
+	t.Parallel()
+
+	want := &ast.File{Name: &ast.Ident{Name: "target"}}
+	other := &ast.File{Name: &ast.Ident{Name: "other"}}
+
+	typedPkg := &packages.Package{
+		CompiledGoFiles: []string{"/a/b/other.go", "/a/b/target.go"},
+		Syntax:          []*ast.File{other, want},
+	}
+
+	if got := syntaxFor(typedPkg, "/a/b/target.go"); got != want {
+		t.Errorf("syntaxFor() = %v, want the syntax tree at the matching index", got)
 	}
 }
 

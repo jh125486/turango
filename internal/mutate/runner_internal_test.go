@@ -157,7 +157,13 @@ func TestClassifyIgnoresTestOutputThatLooksLikeACompileError(t *testing.T) {
 func TestTruncateKeepsTail(t *testing.T) {
 	t.Parallel()
 
-	long := strings.Repeat("x", maxOutputBytes) + "TAIL"
+	// longLen is a fixed literal, deliberately not expressed in terms of
+	// maxOutputBytes: the assertion below pins that constant's actual
+	// configured value (16<<10), which a size built from the constant
+	// itself could never catch drifting.
+	const longLen = 20000
+
+	long := strings.Repeat("x", longLen) + "TAIL"
 
 	got := truncate(long)
 	if !strings.HasSuffix(got, "TAIL") {
@@ -166,6 +172,11 @@ func TestTruncateKeepsTail(t *testing.T) {
 
 	if !strings.HasPrefix(got, "...(truncated)...") {
 		t.Error("truncate() did not mark the output as truncated")
+	}
+
+	const prefix = "...(truncated)...\n"
+	if want := prefix + long[len(long)-16384:]; got != want {
+		t.Errorf("truncate() kept %d bytes of tail, want exactly 16384 (maxOutputBytes)", len(got)-len(prefix))
 	}
 
 	if short := truncate("short"); short != "short" {
