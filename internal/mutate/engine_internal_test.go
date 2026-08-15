@@ -1539,27 +1539,29 @@ func TestBuildEstimateResultScopeFull(t *testing.T) {
 // instantly on a missing directory, no compilation or test execution)
 // subprocess call, the same "go list is not toolchain execution" precedent
 // [TestWalkForEstimateSpawnsNoSubprocess] already establishes for this file.
-func TestLoadTopLevelError(t *testing.T) {
+func TestLoadersTopLevelError(t *testing.T) {
 	t.Parallel()
 
-	if _, err := load(t.Context(), Options{Dir: "/nonexistent/dir/turango-xyz"}); err == nil {
-		t.Fatal("load() error = nil, want an error for a nonexistent Dir")
+	tests := map[string]struct {
+		load func(context.Context, Options) (any, error)
+	}{
+		"load": {load: func(ctx context.Context, opts Options) (any, error) { return load(ctx, opts) }},
+		"loadTyped": {load: func(ctx context.Context, opts Options) (any, error) {
+			return loadTyped(ctx, opts)
+		}},
+		"loadClosures": {load: func(ctx context.Context, opts Options) (any, error) {
+			return loadClosures(ctx, opts)
+		}},
 	}
-}
 
-func TestLoadTypedTopLevelError(t *testing.T) {
-	t.Parallel()
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
 
-	if _, err := loadTyped(t.Context(), Options{Dir: "/nonexistent/dir/turango-xyz"}); err == nil {
-		t.Fatal("loadTyped() error = nil, want an error for a nonexistent Dir")
-	}
-}
-
-func TestLoadClosuresTopLevelError(t *testing.T) {
-	t.Parallel()
-
-	if _, err := loadClosures(t.Context(), Options{Dir: "/nonexistent/dir/turango-xyz"}); err == nil {
-		t.Fatal("loadClosures() error = nil, want an error for a nonexistent Dir")
+			if _, err := tt.load(t.Context(), Options{Dir: "/nonexistent/dir/turango-xyz"}); err == nil {
+				t.Fatalf("%s() error = nil, want an error for a nonexistent Dir", name)
+			}
+		})
 	}
 }
 
@@ -1607,4 +1609,131 @@ func TestLoadClosuresSkipsFilelessPackage(t *testing.T) {
 			t.Errorf("loadClosures() kept a fileless package variant %+v, want the fileless base variant skipped entirely", pkg)
 		}
 	}
+}
+
+// cascadeSrc has every mutable node nested inside one compound statement: the
+// range loop's body holds the only if statement, the only comparison, the
+// only removable statement, and the only literal in the file. The outer
+// block's own statements are a zero-value variable declaration (deliberately
+// `var total int`, not `total := 0` -- the latter has a literal `0` that
+// literal/number would match) and a return, neither of which any operator
+// touches, so a directive on the loop must leave the walk with nothing at all
+// to do.
+//
+// Duplicated in engine_test.go's identical fixture for
+// TestRunSuppressesCompoundStatement, a blackbox test that only calls the
+// exported Run and so cannot share this whitebox copy.
+const cascadeSrc = `package guard
+
+// Total sums the positive values in vs.
+func Total(vs []int) int {
+	var total int
+	%sfor _, v := range vs {
+		if v > 0 {
+			total += v
+		}
+	}
+	return total
+}
+`
+
+// suppressedLine is the line cascadeSrc's range statement sits on once the
+// directive has been substituted in.
+const suppressedLine = 7
+
+// cascadeModule writes a one-package module holding cascadeSrc, with the
+// directive line substituted in, and returns the module root and the source
+// file's path.
+//
+// writeFiles is defined in runner_internal_test.go; both files compile as
+// part of the same whitebox package mutate, so it needs no local copy here.
+func cascadeModule(t *testing.T, directiveLine string) (root, file string) {
+	t.Helper()
+
+	root = t.TempDir()
+	file = filepath.Join(root, "guard", "guard.go")
+
+	writeFiles(t, map[string]string{
+		filepath.Join(root, "go.mod"): "module example.com/cascade\n\ngo 1.23\n",
+		file:                          fmtSrc(cascadeSrc, directiveLine),
+		filepath.Join(root, "guard", "guard_test.go"): `package guard
+
+import "testing"
+
+func TestTotal(t *testing.T) {
+	if got := Total([]int{1, -2, 3}); got != 4 {
+		t.Fatalf("Total() = %d", got)
+	}
+}
+`,
+	})
+
+	return root, file
+}
+
+// fmtSrc substitutes the directive line into cascadeSrc, keeping the template's
+// tab indentation intact.
+func fmtSrc(template, directiveLine string) string {
+	if directiveLine != "" {
+		directiveLine += "\n\t"
+	}
+
+	return strings.Replace(template, "%s", directiveLine, 1)
+}
+
+// TestMutateFileCascade proves the cascade through the engine's real walk,
+// without a toolchain: the runner's go binary does not exist, so reaching a
+// single mutant is a hard error. A directive on the range statement must
+// therefore produce no error, no mutants and exactly one suppression — and the
+// same file without the directive must fail, which is what makes the first half
+// meaningful rather than vacuous.
+func TestMutateFileCascade(t *testing.T) {
+	t.Parallel()
+
+	run := &runner{goBin: "/nonexistent/go", testTimeout: time.Second}
+
+	t.Run("suppressed compound statement is never descended into", func(t *testing.T) {
+		t.Parallel()
+
+		root, path := cascadeModule(t, "// nomutant: hand-verified")
+
+		sink := newCollector()
+
+		if err := mutateFile(t.Context(), run, &fileJob{moduleDir: root, path: path, mutators: mutator.All()}, sink, nil); err != nil {
+			t.Fatalf("mutateFile() error = %v, want the walk to stop at the suppressed loop", err)
+		}
+
+		result := sink.close()
+
+		if len(result.Mutants) != 0 {
+			t.Errorf("mutateFile() produced %d mutants inside a suppressed statement", len(result.Mutants))
+		}
+
+		want := []SuppressionResult{{File: path, Line: suppressedLine, Reason: "hand-verified"}}
+		if !reflect.DeepEqual(result.Suppressions, want) {
+			t.Errorf("Suppressions = %+v, want %+v", result.Suppressions, want)
+		}
+
+		if result.SuppressedCount() != 1 {
+			t.Errorf("SuppressedCount() = %d, want 1", result.SuppressedCount())
+		}
+	})
+
+	t.Run("without the directive the same nodes are mutated", func(t *testing.T) {
+		t.Parallel()
+
+		root, path := cascadeModule(t, "")
+
+		sink := newCollector()
+
+		if err := mutateFile(t.Context(), run, &fileJob{moduleDir: root, path: path, mutators: mutator.All()}, sink, nil); err == nil {
+			t.Fatal("mutateFile() error = nil: the fixture produced no mutants even unsuppressed")
+		}
+
+		result := sink.close()
+
+		if len(result.Suppressions) != 0 {
+			t.Errorf("Suppressions = %+v, want none for a file with no directives", result.Suppressions)
+		}
+	})
 }

@@ -134,10 +134,10 @@ func f(i int) {
 	})
 }
 
-// TestCaseRejectsForeignNodes locks in the hot-path pre-filter behaviour: Case
-// must reject nodes it does not own. Unlike If and Else, a generic non-empty
+// TestCaseApplies locks in the hot-path pre-filter behaviour: Case must
+// reject nodes it does not own. Unlike If and Else, a generic non-empty
 // *ast.CaseClause is not foreign to Case, so it is excluded here.
-func TestCaseRejectsForeignNodes(t *testing.T) {
+func TestCaseApplies(t *testing.T) {
 	t.Parallel()
 
 	nodes := map[string]ast.Node{

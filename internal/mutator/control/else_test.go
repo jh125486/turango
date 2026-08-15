@@ -93,9 +93,9 @@ func f(c bool) {
 	})
 }
 
-// TestElseRejectsForeignNodes locks in the hot-path pre-filter behaviour: Else
-// must reject nodes it does not own, including other operators' node types.
-func TestElseRejectsForeignNodes(t *testing.T) {
+// TestElseApplies locks in the hot-path pre-filter behaviour: Else must
+// reject nodes it does not own, including other operators' node types.
+func TestElseApplies(t *testing.T) {
 	t.Parallel()
 
 	nodes := map[string]ast.Node{
