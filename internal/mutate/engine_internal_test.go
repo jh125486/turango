@@ -847,14 +847,29 @@ func TestBaselineTimeoutInvalidRunsOrCPUs(t *testing.T) {
 	}
 }
 
-// TestSortResultEquivalentsOrdering is [TestCollectorSorts]'s counterpart
-// for Result.Equivalents: the same file/line/operator/description tie-break
-// chain, but exercised directly against sortResult since collector.consume
-// only ever calls it after every channel is closed.
-func TestSortResultEquivalentsOrdering(t *testing.T) {
+// TestSortResult covers sortResult's full tie-break chain — file, then line,
+// then operator, then description — for all three of Result's sorted
+// slices, exercised directly rather than through the collector: consume
+// only ever calls sortResult after every channel is closed, so a fixture
+// routed through it can't isolate sortResult's own logic from consume's.
+// [TestCollectorSorts] covers that separate concern (the channels actually
+// deliver everything sent) with a shallower ordering check of its own.
+func TestSortResult(t *testing.T) {
 	t.Parallel()
 
 	result := &Result{
+		Mutants: []MutantResult{
+			{File: "b.go", Line: 1, Operator: "control/if", Description: "x"},
+			{File: "a.go", Line: 9, Operator: "control/if", Description: "x"},
+			{File: "a.go", Line: 2, Operator: "operator/binary", Description: "b"},
+			{File: "a.go", Line: 2, Operator: "control/if", Description: "z"},
+			{File: "a.go", Line: 2, Operator: "control/if", Description: "a"},
+		},
+		Suppressions: []SuppressionResult{
+			{File: "b.go", Line: 1},
+			{File: "a.go", Line: 9},
+			{File: "a.go", Line: 2},
+		},
 		Equivalents: []EquivalentResult{
 			{File: "b.go", Line: 1, Operator: "control/if", Description: "x"},
 			{File: "a.go", Line: 9, Operator: "control/if", Description: "x"},
@@ -866,7 +881,7 @@ func TestSortResultEquivalentsOrdering(t *testing.T) {
 
 	sortResult(result)
 
-	want := []string{
+	wantMutantsAndEquivalents := []string{
 		"a.go:2:control/if:a",
 		"a.go:2:control/if:z",
 		"a.go:2:operator/binary:b",
@@ -874,9 +889,23 @@ func TestSortResultEquivalentsOrdering(t *testing.T) {
 		"b.go:1:control/if:x",
 	}
 
+	for i, m := range result.Mutants {
+		if key := fmt.Sprintf("%s:%d:%s:%s", m.File, m.Line, m.Operator, m.Description); key != wantMutantsAndEquivalents[i] {
+			t.Errorf("Mutants[%d] = %s, want %s", i, key, wantMutantsAndEquivalents[i])
+		}
+	}
+
 	for i, e := range result.Equivalents {
-		if key := fmt.Sprintf("%s:%d:%s:%s", e.File, e.Line, e.Operator, e.Description); key != want[i] {
-			t.Errorf("equivalent %d = %s, want %s", i, key, want[i])
+		if key := fmt.Sprintf("%s:%d:%s:%s", e.File, e.Line, e.Operator, e.Description); key != wantMutantsAndEquivalents[i] {
+			t.Errorf("Equivalents[%d] = %s, want %s", i, key, wantMutantsAndEquivalents[i])
+		}
+	}
+
+	wantSuppressions := []string{"a.go:2", "a.go:9", "b.go:1"}
+
+	for i, s := range result.Suppressions {
+		if key := fmt.Sprintf("%s:%d", s.File, s.Line); key != wantSuppressions[i] {
+			t.Errorf("Suppressions[%d] = %s, want %s", i, key, wantSuppressions[i])
 		}
 	}
 }
