@@ -65,47 +65,51 @@ func TestNumberMutate(t *testing.T) {
 	}
 }
 
-// TestNumberIgnoresOtherLiterals checks that string, char, and imaginary
-// literals, which have their own distinct mutation concerns not handled
-// here (or none at all), are left alone. Int and float are the only two
-// BasicLit kinds NumberMutator applies to.
-func TestNumberIgnoresOtherLiterals(t *testing.T) {
+// TestNumberApplies covers the two ways a node is not this operator's
+// business: a BasicLit kind other than int/float (string, char, imaginary —
+// each has its own distinct mutation concerns, or none at all), and a node
+// kind that isn't a BasicLit at all.
+func TestNumberApplies(t *testing.T) {
 	t.Parallel()
 
-	var m literal.NumberMutator
+	t.Run("other literal kinds", func(t *testing.T) {
+		t.Parallel()
 
-	for _, src := range []string{`"hello"`, "'a'", "3.14i"} {
-		t.Run(src, func(t *testing.T) {
-			t.Parallel()
+		var m literal.NumberMutator
 
-			_, file := parseFunc(t, "_ = "+src)
-			lit := findNode[*ast.BasicLit](t, file)
+		for _, src := range []string{`"hello"`, "'a'", "3.14i"} {
+			t.Run(src, func(t *testing.T) {
+				t.Parallel()
 
-			if m.Applies(lit) {
-				t.Errorf("Applies(%q) = true, want false", src)
-			}
+				_, file := parseFunc(t, "_ = "+src)
+				lit := findNode[*ast.BasicLit](t, file)
 
-			if got := m.Mutate(lit); got != nil {
-				t.Errorf("Mutate(%q) = %v, want nil", src, got)
-			}
-		})
-	}
-}
+				if m.Applies(lit) {
+					t.Errorf("Applies(%q) = true, want false", src)
+				}
 
-func TestNumberIgnoresOtherNodes(t *testing.T) {
-	t.Parallel()
+				if got := m.Mutate(lit); got != nil {
+					t.Errorf("Mutate(%q) = %v, want nil", src, got)
+				}
+			})
+		}
+	})
 
-	_, file := parseFunc(t, "a := 1")
+	t.Run("other node kinds", func(t *testing.T) {
+		t.Parallel()
 
-	var m literal.NumberMutator
+		_, file := parseFunc(t, "a := 1")
 
-	stmt := findNode[*ast.AssignStmt](t, file)
+		var m literal.NumberMutator
 
-	if m.Applies(stmt) {
-		t.Error("Applies() = true for an assignment statement")
-	}
+		stmt := findNode[*ast.AssignStmt](t, file)
 
-	if got := m.Mutate(stmt); got != nil {
-		t.Errorf("Mutate() = %v, want nil", got)
-	}
+		if m.Applies(stmt) {
+			t.Error("Applies() = true for an assignment statement")
+		}
+
+		if got := m.Mutate(stmt); got != nil {
+			t.Errorf("Mutate() = %v, want nil", got)
+		}
+	})
 }
