@@ -86,36 +86,7 @@ func TestParseMutateFlagsValues(t *testing.T) {
 			t.Fatalf("parseMutateFlags() error = %v", err)
 		}
 
-		switch {
-		case cfg.options.FuncPattern != ".":
-			t.Errorf("FuncPattern = %q, want \".\"", cfg.options.FuncPattern)
-		case len(cfg.options.Packages) != 0:
-			// No trailing positional args were given, mirroring -run/-bench/
-			// -fuzz's own default: an absent package pattern means "." (the
-			// package in Dir), resolved later by Options.patterns(), not
-			// injected here.
-			t.Errorf("Packages = %v, want none", cfg.options.Packages)
-		case cfg.options.Scope != mutate.ScopeFull:
-			t.Errorf("Scope = %v, want %v", cfg.options.Scope, mutate.ScopeFull)
-		case cfg.options.Parallel != runtime.GOMAXPROCS(0):
-			t.Errorf("Parallel = %d, want GOMAXPROCS (%d)", cfg.options.Parallel, runtime.GOMAXPROCS(0))
-		case cfg.options.Operators != nil:
-			t.Errorf("Operators = %v, want nil (every operator)", cfg.options.Operators)
-		case cfg.options.TestTimeout != 0:
-			t.Errorf("TestTimeout = %v, want 0 (derive it)", cfg.options.TestTimeout)
-		case cfg.output != "":
-			t.Errorf("output = %q, want empty (no report)", cfg.output)
-		case cfg.hasMin:
-			t.Errorf("hasMin = true, want false (no gate)")
-		case cfg.options.TCE:
-			t.Errorf("TCE = true, want false")
-		case cfg.options.Workspace != mutate.WorkspaceCopy:
-			t.Errorf("Workspace = %v, want %v", cfg.options.Workspace, mutate.WorkspaceCopy)
-		case cfg.estimate:
-			t.Errorf("estimate = true, want false")
-		case cfg.options.CacheDir != "":
-			t.Errorf("CacheDir = %q, want empty (caching disabled)", cfg.options.CacheDir)
-		}
+		assertDefaultMutateConfig(t, cfg)
 	})
 
 	t.Run("every flag set", func(t *testing.T) {
@@ -146,32 +117,7 @@ func TestParseMutateFlagsValues(t *testing.T) {
 			t.Fatalf("parseMutateFlags() error = %v", err)
 		}
 
-		switch {
-		case cfg.options.FuncPattern != "Foo.*":
-			t.Errorf("FuncPattern = %q, want \"Foo.*\"", cfg.options.FuncPattern)
-		case !reflect.DeepEqual(cfg.options.Packages, []string{"./internal/..."}):
-			t.Errorf("Packages = %v", cfg.options.Packages)
-		case cfg.options.Scope != mutate.ScopeImpact:
-			t.Errorf("Scope = %v, want impact", cfg.options.Scope)
-		case !reflect.DeepEqual(cfg.options.Operators, []string{"control/if", "operator/binary"}):
-			t.Errorf("Operators = %v", cfg.options.Operators)
-		case cfg.options.Parallel != 3:
-			t.Errorf("Parallel = %d, want 3", cfg.options.Parallel)
-		case cfg.options.TestTimeout != 90*time.Second:
-			t.Errorf("TestTimeout = %v, want 90s", cfg.options.TestTimeout)
-		case cfg.output != "/tmp/reports":
-			t.Errorf("output = %q", cfg.output)
-		case !cfg.hasMin || cfg.min != 0.75:
-			t.Errorf("min = %v, %v; want 0.75, true", cfg.min, cfg.hasMin)
-		case cfg.options.MutantID != "a1b2c3d4e5f6":
-			t.Errorf("MutantID = %q, want %q", cfg.options.MutantID, "a1b2c3d4e5f6")
-		case !cfg.options.TCE:
-			t.Errorf("TCE = false, want true")
-		case cfg.options.Workspace != mutate.WorkspaceWorktree:
-			t.Errorf("Workspace = %v, want %v", cfg.options.Workspace, mutate.WorkspaceWorktree)
-		case cfg.options.CacheDir != "/tmp/cache":
-			t.Errorf("CacheDir = %q, want %q", cfg.options.CacheDir, "/tmp/cache")
-		}
+		assertFullMutateConfig(t, cfg)
 	})
 
 	t.Run("estimate flag", func(t *testing.T) {
@@ -276,6 +222,22 @@ func TestParseMutateFlagsValues(t *testing.T) {
 			t.Errorf("Packages = %v, want %v", cfg.options.Packages, want)
 		}
 	})
+}
+
+func assertDefaultMutateConfig(t *testing.T, cfg mutateConfig) {
+	t.Helper()
+
+	if cfg.options.FuncPattern != "." || len(cfg.options.Packages) != 0 || cfg.options.Scope != mutate.ScopeFull || cfg.options.Parallel != runtime.GOMAXPROCS(0) || cfg.options.Operators != nil || cfg.options.TestTimeout != 0 || cfg.output != "" || cfg.hasMin || cfg.options.TCE || cfg.options.Workspace != mutate.WorkspaceCopy || cfg.estimate || cfg.options.CacheDir != "" {
+		t.Errorf("defaults = %+v, want function pattern ., no packages, full scope, GOMAXPROCS workers, all operators, no timeout/output/gate/TCE/estimate/cache, and copy workspace", cfg)
+	}
+}
+
+func assertFullMutateConfig(t *testing.T, cfg mutateConfig) {
+	t.Helper()
+
+	if cfg.options.FuncPattern != "Foo.*" || !reflect.DeepEqual(cfg.options.Packages, []string{"./internal/..."}) || cfg.options.Scope != mutate.ScopeImpact || !reflect.DeepEqual(cfg.options.Operators, []string{"control/if", "operator/binary"}) || cfg.options.Parallel != 3 || cfg.options.TestTimeout != 90*time.Second || cfg.output != "/tmp/reports" || !cfg.hasMin || cfg.min != 0.75 || cfg.options.MutantID != "a1b2c3d4e5f6" || !cfg.options.TCE || cfg.options.Workspace != mutate.WorkspaceWorktree || cfg.options.CacheDir != "/tmp/cache" {
+		t.Errorf("full config = %+v, want every accepted mutation flag set", cfg)
+	}
 }
 
 // TestParseMutateFlagsErrors covers everything turango refuses to guess at.
