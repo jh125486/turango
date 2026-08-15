@@ -17,6 +17,20 @@ import (
 	"github.com/jh125486/turango/internal/mutate"
 )
 
+// TestExitCodesAreStable makes the command's documented process-status
+// contract explicit. Scripts distinguish a bad invocation, a run failure,
+// and a score-gate failure, so these values must not drift or overlap.
+func TestExitCodesAreStable(t *testing.T) {
+	t.Parallel()
+
+	got := []int{exitOK, exitFailure, exitUsage, exitBelowThreshold}
+	want := []int{0, 1, 2, 3}
+
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("exit codes = %v, want %v", got, want)
+	}
+}
+
 // TestParseMutateFlagsRecognition covers the one question asked of every
 // `turango test` invocation: is this a mutation request, or the real go
 // command's business?
@@ -275,34 +289,37 @@ func TestParseMutateFlagsErrors(t *testing.T) {
 		"bare -mutate":         {args: []string{"-mutate", "."}, want: "= form"},
 		"bare -mutatescope":    {args: []string{"-mutate=.", "-mutatescope"}, want: "= form"},
 		"bare -mutateparallel": {args: []string{"-mutateparallel"}, want: "= form"},
-		"invalid regexp":       {args: []string{"-mutate=(unclosed"}, want: "mutate"},
+		"invalid regexp":       {args: []string{"-mutate=(unclosed"}, want: "-mutate="},
 		"unknown mutate flag":  {args: []string{"-mutate=.", "-mutatescopes=full"}, want: "unknown flag"},
 		"unknown scope":        {args: []string{"-mutate=.", "-mutatescope=module"}, want: "unknown scope"},
-		"non-numeric parallel": {args: []string{"-mutate=.", "-mutateparallel=lots"}, want: "positive integer"},
-		"zero parallel":        {args: []string{"-mutate=.", "-mutateparallel=0"}, want: "positive integer"},
+		"non-numeric parallel": {args: []string{"-mutate=.", "-mutateparallel=lots"}, want: "-mutateparallel=\"lots\": want a positive integer"},
+		"zero parallel":        {args: []string{"-mutate=.", "-mutateparallel=0"}, want: "-mutateparallel=\"0\": want a positive integer"},
 		"bad duration":         {args: []string{"-mutate=.", "-mutatetimeout=30"}, want: "mutatetimeout"},
-		"negative duration":    {args: []string{"-mutate=.", "-mutatetimeout=-5s"}, want: "positive duration"},
-		"empty output":         {args: []string{"-mutate=.", "-mutateoutput="}, want: "requires a directory"},
-		"empty cache":          {args: []string{"-mutate=.", "-mutatecache="}, want: "requires a directory"},
+		"negative duration":    {args: []string{"-mutate=.", "-mutatetimeout=-5s"}, want: "-mutatetimeout=\"-5s\": want a positive duration"},
+		"empty output":         {args: []string{"-mutate=.", "-mutateoutput="}, want: "-mutateoutput= requires a directory"},
+		"empty cache":          {args: []string{"-mutate=.", "-mutatecache="}, want: "-mutatecache= requires a directory"},
 		"non-numeric min":      {args: []string{"-mutate=.", "-mutatemin=high"}, want: "mutatemin"},
 		"empty mutant id":      {args: []string{"-mutate=.", "-mutatemutant="}, want: "mutatemutant"},
 		"uppercase mutant id":  {args: []string{"-mutate=.", "-mutatemutant=A1B2C3"}, want: "mutatemutant"},
 		"non-hex mutant id":    {args: []string{"-mutate=.", "-mutatemutant=not-hex!"}, want: "mutatemutant"},
-		"non-bool tce":         {args: []string{"-mutate=.", "-mutatetce=sometimes"}, want: "want true or false"},
+		"non-bool tce":         {args: []string{"-mutate=.", "-mutatetce=sometimes"}, want: "-mutatetce=\"sometimes\": want true or false"},
 		"unknown workspace":    {args: []string{"-mutate=.", "-mutateworkspace=network"}, want: "unknown workspace"},
-		"non-bool estimate":    {args: []string{"-mutate=.", "-mutateestimate=maybe"}, want: "want true or false"},
+		"non-bool estimate":    {args: []string{"-mutate=.", "-mutateestimate=maybe"}, want: "-mutateestimate=\"maybe\": want true or false"},
 		"estimate with output": {
-			args: []string{"-mutate=.", "-mutateestimate=true", "-mutateoutput=/tmp/reports"}, want: "no effect on",
+			args: []string{"-mutate=.", "-mutateestimate=true", "-mutateoutput=/tmp/reports"},
+			want: "-mutateoutput, -mutatemin and -mutatecache have no effect on -mutateestimate=true",
 		},
 		"estimate with min": {
-			args: []string{"-mutate=.", "-mutateestimate=true", "-mutatemin=0.5"}, want: "no effect on",
+			args: []string{"-mutate=.", "-mutateestimate=true", "-mutatemin=0.5"},
+			want: "-mutateoutput, -mutatemin and -mutatecache have no effect on -mutateestimate=true",
 		},
 		"estimate with cache": {
-			args: []string{"-mutate=.", "-mutateestimate=true", "-mutatecache=/tmp/cache"}, want: "no effect on",
+			args: []string{"-mutate=.", "-mutateestimate=true", "-mutatecache=/tmp/cache"},
+			want: "-mutateoutput, -mutatemin and -mutatecache have no effect on -mutateestimate=true",
 		},
-		"leftover go test flag": {args: []string{"-mutate=.", "-v"}, want: "unsupported flag"},
+		"leftover go test flag": {args: []string{"-mutate=.", "-v"}, want: "unsupported flag \"-v\" alongside -mutate:"},
 		"leftover before the flag": {
-			args: []string{"-count=1", "-mutate=."}, want: "unsupported flag",
+			args: []string{"-count=1", "-mutate=."}, want: "unsupported flag \"-count=1\" alongside -mutate:",
 		},
 	}
 
@@ -330,13 +347,65 @@ func TestRunRejectsBadFlags(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 
-	code := run(t.Context(), []string{"turango", "test", "-mutate=.", "-v"}, &stdout, &stderr)
+	code := run(t.Context(), []string{"turango", subcommandTest, "-mutate=.", "-v"}, &stdout, &stderr)
 	if code != exitUsage {
 		t.Errorf("exit code = %d, want %d", code, exitUsage)
 	}
 
 	if !strings.Contains(stderr.String(), "unsupported flag") {
 		t.Errorf("stderr = %q, want it to name the unsupported flag", stderr.String())
+	}
+}
+
+// TestRunMissingArgv0 covers the one case args itself can't supply enough
+// information to even look at argv[0].
+func TestRunMissingArgv0(t *testing.T) {
+	t.Parallel()
+
+	var stdout, stderr bytes.Buffer
+
+	code := run(t.Context(), nil, &stdout, &stderr)
+	if code != exitUsage {
+		t.Errorf("exit code = %d, want %d", code, exitUsage)
+	}
+
+	if !strings.Contains(stderr.String(), "missing argv[0]") {
+		t.Errorf("stderr = %q, want it to mention the missing argv[0]", stderr.String())
+	}
+}
+
+// TestMutateRunReportsRunFailure covers mutateRun's result==nil branch: a
+// run that fails before producing any [mutate.Result] at all must not fall
+// through to writeSummary/writeReport/gate, which all assume a result exists.
+func TestMutateRunReportsRunFailure(t *testing.T) {
+	t.Parallel()
+
+	var stdout, stderr bytes.Buffer
+
+	cfg := &mutateConfig{options: mutate.Options{Operators: []string{"no/such/operator"}}}
+
+	code := mutateRun(t.Context(), cfg, &stdout, &stderr)
+	if code != exitFailure {
+		t.Errorf("exit code = %d, want %d", code, exitFailure)
+	}
+
+	if !strings.Contains(stderr.String(), "turango:") {
+		t.Errorf("stderr = %q, want it to report the run error", stderr.String())
+	}
+}
+
+// TestEstimateRunReportsRunFailure is [TestMutateRunReportsRunFailure]'s
+// counterpart for estimateRun.
+func TestEstimateRunReportsRunFailure(t *testing.T) {
+	t.Parallel()
+
+	var stdout, stderr bytes.Buffer
+
+	cfg := &mutateConfig{options: mutate.Options{Operators: []string{"no/such/operator"}}}
+
+	code := estimateRun(t.Context(), cfg, &stdout, &stderr)
+	if code != exitFailure {
+		t.Errorf("exit code = %d, want %d", code, exitFailure)
 	}
 }
 
@@ -492,13 +561,13 @@ func TestGate(t *testing.T) {
 			cfg:      &mutateConfig{min: 0.9, hasMin: true},
 			result:   killed,
 			wantCode: exitBelowThreshold,
-			wantErr:  "below",
+			wantErr:  "is below -mutatemin=0.9",
 		},
 		"nothing to score": {
 			cfg:      &mutateConfig{min: 0.9, hasMin: true},
 			result:   &mutate.Result{},
 			wantCode: exitOK,
-			wantErr:  "no viable mutants",
+			wantErr:  "-mutatemin=0.9 not evaluated: the run produced no viable mutants",
 		},
 	}
 
@@ -557,8 +626,8 @@ func TestRunRefusesAliasWithoutOptIn(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 
 	code := run(t.Context(), []string{"/usr/local/bin/go", "version"}, &stdout, &stderr)
-	if code == 0 {
-		t.Error("exit code = 0, want non-zero when aliased without opt-in")
+	if code != exitUsage {
+		t.Errorf("exit code = %d, want %d", code, exitUsage)
 	}
 	if got := stderr.String(); !strings.Contains(got, "experimental") {
 		t.Errorf("stderr = %q, want an explanation of the experimental mode", got)

@@ -72,6 +72,10 @@ const (
 // interpret. See parseMutateFlags.
 const flagArgsSeparator = "-args"
 
+// subcommandTest is the one go subcommand turango ever inspects itself;
+// everything else is forwarded to the real toolchain untouched.
+const subcommandTest = "test"
+
 // mutateFlags is the recognised set, in the order they are documented.
 var mutateFlags = []string{
 	flagMutate, flagScope, flagOperators, flagParallel, flagTimeout, flagOutput, flagMin, flagMutant, flagTCE,
@@ -81,6 +85,7 @@ var mutateFlags = []string{
 // reportFile is the name of the JSON report written into -mutateoutput.
 const reportFile = "mutate-report.json"
 
+// nomutant: calling the real main() would replace the test process itself; mainRun is what's tested
 func main() {
 	os.Exit(mainRun())
 }
@@ -115,7 +120,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 
 	rest := args[1:]
 
-	if len(rest) > 0 && rest[0] == "test" {
+	if len(rest) > 0 && rest[0] == subcommandTest {
 		cfg, found, err := parseMutateFlags(rest[1:])
 		if err != nil {
 			fmt.Fprintf(stderr, "%v\n", err)
