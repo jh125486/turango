@@ -25,6 +25,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"golang.org/x/tools/go/packages"
@@ -317,6 +318,7 @@ func TestCollectorSorts(t *testing.T) {
 
 			sink.mutant(m)
 			sink.suppression(SuppressionResult{File: m.File, Line: m.Line})
+			sink.equivalent(EquivalentResult{File: m.File, Line: m.Line, Operator: m.Operator})
 		}()
 	}
 
@@ -324,9 +326,9 @@ func TestCollectorSorts(t *testing.T) {
 
 	got := sink.close()
 
-	if len(got.Mutants) != len(mutants) || len(got.Suppressions) != len(mutants) {
-		t.Fatalf("collector kept %d mutants and %d suppressions, want %d of each",
-			len(got.Mutants), len(got.Suppressions), len(mutants))
+	if len(got.Mutants) != len(mutants) || len(got.Suppressions) != len(mutants) || len(got.Equivalents) != len(mutants) {
+		t.Fatalf("collector kept %d mutants, %d suppressions and %d equivalents, want %d of each",
+			len(got.Mutants), len(got.Suppressions), len(got.Equivalents), len(mutants))
 	}
 
 	want := []string{"a.go:2:control/if", "a.go:2:operator/binary", "a.go:9:control/if", "b.go:1:control/if"}
@@ -336,6 +338,84 @@ func TestCollectorSorts(t *testing.T) {
 			t.Errorf("mutant %d = %s, want %s", i, key, want[i])
 		}
 	}
+}
+
+// TestConsumeDrainsIndependentlyOfChannelOrder proves consume's loop
+// condition tracks each of the three channels independently, rather than
+// only being reachable through TestCollectorSorts' shape: every producer
+// finished before close() ever runs there, so every send had already been
+// received before any channel went nil, and a mutant that shortens the
+// loop condition loses no data — the mutation is invisible.
+//
+// Each scenario here closes two channels first, then sends on the survivor,
+// then closes it too. A mutant that makes the loop exit before that late
+// send is received turns the send into a permanent block; synctest's bubble
+// reports that as a deadlock instead of actually hanging.
+func TestConsumeDrainsIndependentlyOfChannelOrder(t *testing.T) {
+	t.Parallel()
+
+	t.Run("mutants sent last", func(t *testing.T) {
+		t.Parallel()
+
+		synctest.Test(t, func(t *testing.T) {
+			c := newCollector()
+
+			close(c.suppressions)
+			close(c.equivalents)
+
+			want := MutantResult{File: "a.go", Line: 1, Operator: "control/if"}
+			c.mutant(want)
+			close(c.mutants)
+
+			result := <-c.done
+
+			if len(result.Mutants) != 1 || result.Mutants[0] != want {
+				t.Errorf("Mutants = %+v, want [%+v]", result.Mutants, want)
+			}
+		})
+	})
+
+	t.Run("suppressions sent last", func(t *testing.T) {
+		t.Parallel()
+
+		synctest.Test(t, func(t *testing.T) {
+			c := newCollector()
+
+			close(c.mutants)
+			close(c.equivalents)
+
+			want := SuppressionResult{File: "a.go", Line: 1}
+			c.suppression(want)
+			close(c.suppressions)
+
+			result := <-c.done
+
+			if len(result.Suppressions) != 1 || result.Suppressions[0] != want {
+				t.Errorf("Suppressions = %+v, want [%+v]", result.Suppressions, want)
+			}
+		})
+	})
+
+	t.Run("equivalents sent last", func(t *testing.T) {
+		t.Parallel()
+
+		synctest.Test(t, func(t *testing.T) {
+			c := newCollector()
+
+			close(c.mutants)
+			close(c.suppressions)
+
+			want := EquivalentResult{File: "a.go", Line: 1, Operator: "control/if"}
+			c.equivalent(want)
+			close(c.equivalents)
+
+			result := <-c.done
+
+			if len(result.Equivalents) != 1 || result.Equivalents[0] != want {
+				t.Errorf("Equivalents = %+v, want [%+v]", result.Equivalents, want)
+			}
+		})
+	})
 }
 
 // TestBaselineTimeout covers the derivation itself: the mean of the timed runs,
