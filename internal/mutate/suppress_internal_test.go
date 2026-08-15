@@ -379,4 +379,3 @@ func f(i int) {
 		t.Error("anchored(*ast.FuncDecl) = false for a directive on the line above it")
 	}
 }
-
