@@ -169,6 +169,39 @@ type literalFixture struct {
 	mutation   mutator.Mutation
 }
 
+func mustFingerprint(t *testing.T, root string) string {
+	t.Helper()
+
+	fingerprint, err := cacheFingerprint(root, nil)
+	if err != nil {
+		t.Fatalf("cacheFingerprint(%s) error = %v", root, err)
+	}
+
+	return fingerprint
+}
+
+func mustCacheStore(t *testing.T, path string) *cacheStore {
+	t.Helper()
+
+	store, err := newCacheStore(path)
+	if err != nil {
+		t.Fatalf("newCacheStore() error = %v", err)
+	}
+
+	return store
+}
+
+func mustRun(t *testing.T, r *runner, m mutant, variant string) (result, bool, bool) {
+	t.Helper()
+
+	got, ok, equivalent, err := r.run(t.Context(), m)
+	if err != nil {
+		t.Fatalf("run(%s) error = %v", variant, err)
+	}
+
+	return got, ok, equivalent
+}
+
 // literalMutationModule builds a real, tiny module containing one function
 // `func F() int { return <literal> }`, optionally with a test asserting
 // F() == <literal>, and returns a [literalFixture] carrying a
@@ -319,15 +352,8 @@ func TestRunClosesSameMutantIDDifferentContentCollision(t *testing.T) {
 	fixtureA := literalMutationModule(t, 1, true)
 	fixtureB := literalMutationModule(t, 1, false)
 
-	fpA, err := cacheFingerprint(fixtureA.root, nil)
-	if err != nil {
-		t.Fatalf("cacheFingerprint(A) error = %v", err)
-	}
-
-	fpB, err := cacheFingerprint(fixtureB.root, nil)
-	if err != nil {
-		t.Fatalf("cacheFingerprint(B) error = %v", err)
-	}
+	fpA := mustFingerprint(t, fixtureA.root)
+	fpB := mustFingerprint(t, fixtureB.root)
 
 	if fpA == fpB {
 		t.Fatal("test setup problem: variant A and B produced the same fingerprint, want different (they are different modules)")
@@ -337,10 +363,7 @@ func TestRunClosesSameMutantIDDifferentContentCollision(t *testing.T) {
 
 	// "Populate the cache against variant A": a first runner, with no
 	// pre-existing cache to read from, records A's real verdict.
-	storeA, err := newCacheStore(cachePath(cacheDir))
-	if err != nil {
-		t.Fatalf("newCacheStore() error = %v", err)
-	}
+	storeA := mustCacheStore(t, cachePath(cacheDir))
 
 	rA := &runner{goBin: "go", testTimeout: time.Minute, toolchain: "test-toolchain", store: storeA}
 
@@ -350,10 +373,7 @@ func TestRunClosesSameMutantIDDifferentContentCollision(t *testing.T) {
 		id: sharedID, cacheFingerprint: fpA, mutation: fixtureA.mutation,
 	}
 
-	resA, okA, eqA, err := rA.run(t.Context(), mA)
-	if err != nil {
-		t.Fatalf("run(A) error = %v", err)
-	}
+	resA, okA, eqA := mustRun(t, rA, mA, "A")
 
 	if !okA || eqA {
 		t.Fatalf("run(A) ok = %v, equivalent = %v, want ok=true, equivalent=false", okA, eqA)
@@ -375,10 +395,7 @@ func TestRunClosesSameMutantIDDifferentContentCollision(t *testing.T) {
 		t.Fatalf("loadCacheIndex() error = %v", err)
 	}
 
-	storeB, err := newCacheStore(cachePath(cacheDir))
-	if err != nil {
-		t.Fatalf("newCacheStore() (second open) error = %v", err)
-	}
+	storeB := mustCacheStore(t, cachePath(cacheDir))
 
 	defer func() { _ = storeB.close() }()
 
@@ -392,10 +409,7 @@ func TestRunClosesSameMutantIDDifferentContentCollision(t *testing.T) {
 
 	before := execCalls.Load()
 
-	resB, okB, eqB, err := rB.run(t.Context(), mB)
-	if err != nil {
-		t.Fatalf("run(B) error = %v", err)
-	}
+	resB, okB, eqB := mustRun(t, rB, mB, "B")
 
 	after := execCalls.Load()
 

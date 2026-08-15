@@ -351,102 +351,28 @@ func TestMutate(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name   string
-		src    string
-		clause func(*testing.T, *ast.File) ast.Node
-		want   []string
+		name string
+		src  string
+		node func(*testing.T, *ast.File) ast.Node
+		want []string
 	}{
-		{
-			name: "block",
-			src:  mixedSrc,
-			clause: func(t *testing.T, file *ast.File) ast.Node {
-				return funcBody(t, file)
-			},
-			want: []string{
-				"remove statement: x++",
-				"remove statement: foo()",
-				"remove statement: x = 2",
-				"remove statement: x += 3",
-				"remove statement: y--",
-			},
-		},
-		{
-			name: "nested block",
-			src:  mixedSrc,
-			clause: func(t *testing.T, file *ast.File) ast.Node {
-				return findNode(t, file, func(n ast.Node) bool {
-					ifStmt, ok := n.(*ast.IfStmt)
-					if !ok {
-						return false
-					}
-
-					return ifStmt.Body != nil
-				}).(*ast.IfStmt).Body
-			},
-			want: []string{"remove statement: bar()"},
-		},
-		{
-			name: "case clause",
-			src:  switchSrc,
-			clause: func(t *testing.T, file *ast.File) ast.Node {
-				return caseClause(t, file, 0)
-			},
-			want: []string{
-				"remove statement: foo()",
-				"remove statement: x++",
-			},
-		},
-		{
-			name: "default clause with only a short var decl and a blank assign",
-			src:  switchSrc,
-			clause: func(t *testing.T, file *ast.File) ast.Node {
-				return caseClause(t, file, 1)
-			},
-			// _ = z is a plain assignment, so it is removable; z := 0 is not.
-			want: []string{"remove statement: _ = z"},
-		},
+		{name: "block", src: mixedSrc, node: func(t *testing.T, f *ast.File) ast.Node { return funcBody(t, f) }, want: []string{"remove statement: x++", "remove statement: foo()", "remove statement: x = 2", "remove statement: x += 3", "remove statement: y--"}},
+		{name: "nested block", src: mixedSrc, node: func(t *testing.T, f *ast.File) ast.Node {
+			return findNode(t, f, func(n ast.Node) bool { _, ok := n.(*ast.IfStmt); return ok }).(*ast.IfStmt).Body
+		}, want: []string{"remove statement: bar()"}},
+		{name: "case clause", src: switchSrc, node: func(t *testing.T, f *ast.File) ast.Node { return caseClause(t, f, 0) }, want: []string{"remove statement: foo()", "remove statement: x++"}},
+		{name: "default clause with only a short var decl and a blank assign", src: switchSrc, node: func(t *testing.T, f *ast.File) ast.Node { return caseClause(t, f, 1) }, want: []string{"remove statement: _ = z"}},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			_, file := parseSrc(t, tt.src)
-			node := tt.clause(t, file)
-
-			m := &statement.Remover{}
-
-			if !m.Applies(node) {
-				t.Fatalf("Applies(%T) = false, want true", node)
-			}
-
-			got := descriptions(m.Mutate(node))
-			if !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("Mutate() descriptions =\n%v\nwant\n%v", got, tt.want)
-			}
+			testStatementMutationCase(t, tt.src, tt.node, tt.want)
 		})
 	}
 
-	t.Run("does not touch the AST", func(t *testing.T) {
-		t.Parallel()
-
-		fset, file := parseSrc(t, mixedSrc)
-		block := funcBody(t, file)
-
-		before := append([]ast.Stmt(nil), block.List...)
-
-		if mutations := (&statement.Remover{}).Mutate(block); len(mutations) == 0 {
-			t.Fatal("Mutate() returned no mutations")
-		}
-
-		if !reflect.DeepEqual(block.List, before) {
-			t.Error("Mutate() modified the statement list")
-		}
-
-		if got := render(t, fset, file); got != mixedSrc {
-			t.Errorf("Mutate() changed the printed source:\n%s", got)
-		}
-	})
+	t.Run("does not touch the AST", testStatementMutationUntouched)
 
 	// "apply revert round trip" applies each mutation independently, compares
 	// the printed mutant against the source with exactly that line removed,
@@ -456,115 +382,112 @@ func TestMutate(t *testing.T) {
 	// apply and revert in sequence against that one shared AST — running them
 	// concurrently would let one goroutine's render() observe another's
 	// half-applied mutation.
-	t.Run("apply revert round trip", func(t *testing.T) {
-		t.Parallel()
-
-		tests := []struct {
-			name   string
-			src    string
-			node   func(*testing.T, *ast.File) ast.Node
-			blanks []string
-		}{
-			{
-				name: "block",
-				src:  mixedSrc,
-				node: func(t *testing.T, file *ast.File) ast.Node {
-					return funcBody(t, file)
-				},
-				blanks: []string{"x++", "foo()", "x = 2", "x += 3", "y--"},
-			},
-			{
-				name: "case clause",
-				src:  switchSrc,
-				node: func(t *testing.T, file *ast.File) ast.Node {
-					return caseClause(t, file, 0)
-				},
-				blanks: []string{"foo()", "x++"},
-			},
-		}
-
-		for _, tt := range tests {
-			t.Run(tt.name, func(t *testing.T) {
-				t.Parallel()
-
-				fset, file := parseSrc(t, tt.src)
-
-				mutations := (&statement.Remover{}).Mutate(tt.node(t, file))
-				if len(mutations) != len(tt.blanks) {
-					t.Fatalf("Mutate() returned %d mutations, want %d", len(mutations), len(tt.blanks))
-				}
-
-				for i, m := range mutations {
-					// Not t.Parallel(): each iteration applies and reverts
-					// against the file shared with every other iteration.
-					t.Run(tt.blanks[i], func(t *testing.T) {
-						want := blankLine(t, tt.src, tt.blanks[i])
-
-						m.Apply()
-
-						if got := render(t, fset, file); got != want {
-							t.Errorf("after Apply, source =\n%q\nwant\n%q", got, want)
-						}
-
-						m.Revert()
-
-						if got := render(t, fset, file); got != tt.src {
-							t.Errorf("after Revert, source =\n%q\nwant\n%q", got, tt.src)
-						}
-					})
-				}
-			})
-		}
-	})
+	t.Run("apply revert round trip", testStatementMutationRoundTrip)
 
 	// "apply revert is repeatable" confirms a mutation can be cycled more than
 	// once, since the engine reuses one AST for a whole walk.
-	t.Run("apply revert is repeatable", func(t *testing.T) {
-		t.Parallel()
-
-		fset, file := parseSrc(t, mixedSrc)
-
-		mutations := (&statement.Remover{}).Mutate(funcBody(t, file))
-		want := blankLine(t, mixedSrc, "foo()")
-
-		for range 3 {
-			mutations[1].Apply()
-
-			if got := render(t, fset, file); got != want {
-				t.Fatalf("after Apply, source =\n%q\nwant\n%q", got, want)
-			}
-
-			mutations[1].Revert()
-
-			if got := render(t, fset, file); got != mixedSrc {
-				t.Fatalf("after Revert, source =\n%q\nwant\n%q", got, mixedSrc)
-			}
-		}
-	})
+	t.Run("apply revert is repeatable", testStatementMutationRepeatable)
 
 	// "truncates long statements" keeps a pathological line from swamping a
 	// report row.
-	t.Run("truncates long statements", func(t *testing.T) {
-		t.Parallel()
+	t.Run("truncates long statements", testStatementMutationTruncation)
+}
 
-		src := "package p\n\nfunc f() {\n\tfoo(\"" + strings.Repeat("a", 200) + "\")\n}\n"
+func testStatementMutationCase(t *testing.T, src string, node func(*testing.T, *ast.File) ast.Node, want []string) {
+	t.Helper()
+	_, file := parseSrc(t, src)
+	target := node(t, file)
+	m := &statement.Remover{}
+	if !m.Applies(target) {
+		t.Fatalf("Applies(%T) = false, want true", target)
+	}
+	if got := descriptions(m.Mutate(target)); !reflect.DeepEqual(got, want) {
+		t.Errorf("Mutate() descriptions =\n%v\nwant\n%v", got, want)
+	}
+}
 
-		_, file := parseSrc(t, src)
+func testStatementMutationUntouched(t *testing.T) {
+	t.Parallel()
+	fset, file := parseSrc(t, mixedSrc)
+	block := funcBody(t, file)
+	before := append([]ast.Stmt(nil), block.List...)
+	if mutations := (&statement.Remover{}).Mutate(block); len(mutations) == 0 {
+		t.Fatal("Mutate() returned no mutations")
+	}
+	if !reflect.DeepEqual(block.List, before) {
+		t.Error("Mutate() modified the statement list")
+	}
+	if got := render(t, fset, file); got != mixedSrc {
+		t.Errorf("Mutate() changed the printed source:\n%s", got)
+	}
+}
 
-		mutations := (&statement.Remover{}).Mutate(funcBody(t, file))
-		if len(mutations) != 1 {
-			t.Fatalf("Mutate() returned %d mutations, want 1", len(mutations))
+func testStatementMutationRoundTrip(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name, src string
+		node      func(*testing.T, *ast.File) ast.Node
+		blanks    []string
+	}{
+		{name: "block", src: mixedSrc, node: func(t *testing.T, f *ast.File) ast.Node { return funcBody(t, f) }, blanks: []string{"x++", "foo()", "x = 2", "x += 3", "y--"}},
+		{name: "case clause", src: switchSrc, node: func(t *testing.T, f *ast.File) ast.Node { return caseClause(t, f, 0) }, blanks: []string{"foo()", "x++"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) { t.Parallel(); testStatementMutationRoundTripCase(t, tc.src, tc.node, tc.blanks) })
+	}
+}
+
+func testStatementMutationRoundTripCase(t *testing.T, src string, node func(*testing.T, *ast.File) ast.Node, blanks []string) {
+	t.Helper()
+	fset, file := parseSrc(t, src)
+	mutations := (&statement.Remover{}).Mutate(node(t, file))
+	if len(mutations) != len(blanks) {
+		t.Fatalf("Mutate() returned %d mutations, want %d", len(mutations), len(blanks))
+	}
+	for i, mutation := range mutations {
+		want := blankLine(t, src, blanks[i])
+		mutation.Apply()
+		if got := render(t, fset, file); got != want {
+			t.Errorf("after Apply, source =\n%q\nwant\n%q", got, want)
 		}
-
-		got := mutations[0].Description
-
-		if !strings.HasSuffix(got, "...") {
-			t.Errorf("Description = %q, want a truncated value ending in %q", got, "...")
+		mutation.Revert()
+		if got := render(t, fset, file); got != src {
+			t.Errorf("after Revert, source =\n%q\nwant\n%q", got, src)
 		}
+	}
+}
 
-		const descriptionLimit = 60
-		if want := len("remove statement: ") + descriptionLimit + len("..."); len(got) != want {
-			t.Errorf("len(Description) = %d, want %d", len(got), want)
+func testStatementMutationRepeatable(t *testing.T) {
+	t.Parallel()
+	fset, file := parseSrc(t, mixedSrc)
+	mutations := (&statement.Remover{}).Mutate(funcBody(t, file))
+	want := blankLine(t, mixedSrc, "foo()")
+	for range 3 {
+		mutations[1].Apply()
+		if got := render(t, fset, file); got != want {
+			t.Fatalf("after Apply, source =\n%q\nwant\n%q", got, want)
 		}
-	})
+		mutations[1].Revert()
+		if got := render(t, fset, file); got != mixedSrc {
+			t.Fatalf("after Revert, source =\n%q\nwant\n%q", got, mixedSrc)
+		}
+	}
+}
+
+func testStatementMutationTruncation(t *testing.T) {
+	t.Parallel()
+	src := "package p\n\nfunc f() {\n\tfoo(\"" + strings.Repeat("a", 200) + "\")\n}\n"
+	_, file := parseSrc(t, src)
+	mutations := (&statement.Remover{}).Mutate(funcBody(t, file))
+	if len(mutations) != 1 {
+		t.Fatalf("Mutate() returned %d mutations, want 1", len(mutations))
+	}
+	got := mutations[0].Description
+	if !strings.HasSuffix(got, "...") {
+		t.Errorf("Description = %q, want a truncated value ending in %q", got, "...")
+	}
+	const descriptionLimit = 60
+	if want := len("remove statement: ") + descriptionLimit + len("..."); len(got) != want {
+		t.Errorf("len(Description) = %d, want %d", len(got), want)
+	}
 }
