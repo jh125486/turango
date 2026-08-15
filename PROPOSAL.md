@@ -237,6 +237,21 @@ maxUint64` on the real `n1 > maxVal` comparison.
   LLVM-based), and [Stryker] (JavaScript/TypeScript, .NET) — mutation testing
   is provided outside the language toolchain. This proposal would integrate
   that workflow into `go test`.
+- **It gives AI-assisted development a machine-checkable guardrail.** An LLM
+  generating or editing Go code is, in effect, an extremely fast producer of
+  candidate mutants of its own — and coverage alone cannot tell a reviewer
+  (human or automated) whether the tests around a change would actually catch
+  a regression, only whether the changed lines executed. A mutation score
+  turns "the tests still pass" into "the tests would notice if this were
+  wrong," which is the property an AI coding agent needs to iterate against
+  safely without a human re-deriving the failure by hand each time. Dogfooding
+  turango against its own suite surfaced this pattern directly: every fix that
+  raised the score corrected a test that could not distinguish correct
+  behavior from a mutated (wrong) version — a weak assertion, an untested
+  success path, a fixture that referenced the same constant it was meant to
+  verify — never a defect in the code under test. That is precisely the kind
+  of guardrail gap an AI agent, working from coverage alone, would not have
+  had any signal to find or fix.
 
 [PIT]: https://pitest.org/
 [mutmut]: https://pypi.org/project/mutmut/
