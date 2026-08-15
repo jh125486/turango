@@ -85,7 +85,7 @@ var mutateFlags = []string{
 // reportFile is the name of the JSON report written into -mutateoutput.
 const reportFile = "mutate-report.json"
 
-//nomutant: calling the real main() would replace the test process itself; mainRun is what's tested
+// nomutant: calling the real main() would replace the test process itself; mainRun is what's tested
 func main() {
 	os.Exit(mainRun())
 }
