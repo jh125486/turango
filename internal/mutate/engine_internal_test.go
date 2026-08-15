@@ -25,6 +25,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"golang.org/x/tools/go/packages"
@@ -337,6 +338,84 @@ func TestCollectorSorts(t *testing.T) {
 			t.Errorf("mutant %d = %s, want %s", i, key, want[i])
 		}
 	}
+}
+
+// TestConsumeDrainsIndependentlyOfChannelOrder proves consume's loop
+// condition tracks each of the three channels independently, rather than
+// only being reachable through TestCollectorSorts' shape: every producer
+// finished before close() ever runs there, so every send had already been
+// received before any channel went nil, and a mutant that shortens the
+// loop condition loses no data — the mutation is invisible.
+//
+// Each scenario here closes two channels first, then sends on the survivor,
+// then closes it too. A mutant that makes the loop exit before that late
+// send is received turns the send into a permanent block; synctest's bubble
+// reports that as a deadlock instead of actually hanging.
+func TestConsumeDrainsIndependentlyOfChannelOrder(t *testing.T) {
+	t.Parallel()
+
+	t.Run("mutants sent last", func(t *testing.T) {
+		t.Parallel()
+
+		synctest.Test(t, func(t *testing.T) {
+			c := newCollector()
+
+			close(c.suppressions)
+			close(c.equivalents)
+
+			want := MutantResult{File: "a.go", Line: 1, Operator: "control/if"}
+			c.mutant(want)
+			close(c.mutants)
+
+			result := <-c.done
+
+			if len(result.Mutants) != 1 || result.Mutants[0] != want {
+				t.Errorf("Mutants = %+v, want [%+v]", result.Mutants, want)
+			}
+		})
+	})
+
+	t.Run("suppressions sent last", func(t *testing.T) {
+		t.Parallel()
+
+		synctest.Test(t, func(t *testing.T) {
+			c := newCollector()
+
+			close(c.mutants)
+			close(c.equivalents)
+
+			want := SuppressionResult{File: "a.go", Line: 1}
+			c.suppression(want)
+			close(c.suppressions)
+
+			result := <-c.done
+
+			if len(result.Suppressions) != 1 || result.Suppressions[0] != want {
+				t.Errorf("Suppressions = %+v, want [%+v]", result.Suppressions, want)
+			}
+		})
+	})
+
+	t.Run("equivalents sent last", func(t *testing.T) {
+		t.Parallel()
+
+		synctest.Test(t, func(t *testing.T) {
+			c := newCollector()
+
+			close(c.mutants)
+			close(c.suppressions)
+
+			want := EquivalentResult{File: "a.go", Line: 1, Operator: "control/if"}
+			c.equivalent(want)
+			close(c.equivalents)
+
+			result := <-c.done
+
+			if len(result.Equivalents) != 1 || result.Equivalents[0] != want {
+				t.Errorf("Equivalents = %+v, want [%+v]", result.Equivalents, want)
+			}
+		})
+	})
 }
 
 // TestBaselineTimeout covers the derivation itself: the mean of the timed runs,
@@ -776,14 +855,29 @@ func TestBaselineTimeoutInvalidRunsOrCPUs(t *testing.T) {
 	}
 }
 
-// TestSortResultEquivalentsOrdering is [TestCollectorSorts]'s counterpart
-// for Result.Equivalents: the same file/line/operator/description tie-break
-// chain, but exercised directly against sortResult since collector.consume
-// only ever calls it after every channel is closed.
-func TestSortResultEquivalentsOrdering(t *testing.T) {
+// TestSortResult covers sortResult's full tie-break chain — file, then line,
+// then operator, then description — for all three of Result's sorted
+// slices, exercised directly rather than through the collector: consume
+// only ever calls sortResult after every channel is closed, so a fixture
+// routed through it can't isolate sortResult's own logic from consume's.
+// [TestCollectorSorts] covers that separate concern (the channels actually
+// deliver everything sent) with a shallower ordering check of its own.
+func TestSortResult(t *testing.T) {
 	t.Parallel()
 
 	result := &Result{
+		Mutants: []MutantResult{
+			{File: "b.go", Line: 1, Operator: "control/if", Description: "x"},
+			{File: "a.go", Line: 9, Operator: "control/if", Description: "x"},
+			{File: "a.go", Line: 2, Operator: "operator/binary", Description: "b"},
+			{File: "a.go", Line: 2, Operator: "control/if", Description: "z"},
+			{File: "a.go", Line: 2, Operator: "control/if", Description: "a"},
+		},
+		Suppressions: []SuppressionResult{
+			{File: "b.go", Line: 1},
+			{File: "a.go", Line: 9},
+			{File: "a.go", Line: 2},
+		},
 		Equivalents: []EquivalentResult{
 			{File: "b.go", Line: 1, Operator: "control/if", Description: "x"},
 			{File: "a.go", Line: 9, Operator: "control/if", Description: "x"},
@@ -795,7 +889,7 @@ func TestSortResultEquivalentsOrdering(t *testing.T) {
 
 	sortResult(result)
 
-	want := []string{
+	wantMutantsAndEquivalents := []string{
 		"a.go:2:control/if:a",
 		"a.go:2:control/if:z",
 		"a.go:2:operator/binary:b",
@@ -803,9 +897,23 @@ func TestSortResultEquivalentsOrdering(t *testing.T) {
 		"b.go:1:control/if:x",
 	}
 
+	for i, m := range result.Mutants {
+		if key := fmt.Sprintf("%s:%d:%s:%s", m.File, m.Line, m.Operator, m.Description); key != wantMutantsAndEquivalents[i] {
+			t.Errorf("Mutants[%d] = %s, want %s", i, key, wantMutantsAndEquivalents[i])
+		}
+	}
+
 	for i, e := range result.Equivalents {
-		if key := fmt.Sprintf("%s:%d:%s:%s", e.File, e.Line, e.Operator, e.Description); key != want[i] {
-			t.Errorf("equivalent %d = %s, want %s", i, key, want[i])
+		if key := fmt.Sprintf("%s:%d:%s:%s", e.File, e.Line, e.Operator, e.Description); key != wantMutantsAndEquivalents[i] {
+			t.Errorf("Equivalents[%d] = %s, want %s", i, key, wantMutantsAndEquivalents[i])
+		}
+	}
+
+	wantSuppressions := []string{"a.go:2", "a.go:9", "b.go:1"}
+
+	for i, s := range result.Suppressions {
+		if key := fmt.Sprintf("%s:%d", s.File, s.Line); key != wantSuppressions[i] {
+			t.Errorf("Suppressions[%d] = %s, want %s", i, key, wantSuppressions[i])
 		}
 	}
 }
