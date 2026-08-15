@@ -469,6 +469,8 @@ instead.
 - [`PROPOSAL.md`](PROPOSAL.md) — the case for adding `-mutate` to `go test`
   itself, modeled on the real `-fuzz` design draft, with crypto-package
   evidence and a historical-bug validation case study.
+- [Go proposal issue #80892](https://github.com/golang/go/issues/80892) —
+  exploratory discussion of opt-in mutation testing in `go test`.
 - [`BENCHMARKS.md`](BENCHMARKS.md) — a real, captured `go test -bench`
   transcript of `-mutatescope`/`-mutatetce`/`-mutateparallel`'s actual
   cost, including the full data behind the TCE cost-tradeoff numbers cited
