@@ -191,7 +191,7 @@ func mustCacheStore(t *testing.T, path string) *cacheStore {
 	return store
 }
 
-func mustRun(t *testing.T, r *runner, m mutant, variant string) (result, bool, bool) {
+func mustRun(t *testing.T, r *runner, m mutant, variant string) (MutantResult, bool, bool) {
 	t.Helper()
 
 	got, ok, equivalent, err := r.run(t.Context(), m)
