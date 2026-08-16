@@ -259,6 +259,155 @@ func TestCacheFingerprint(t *testing.T) {
 func TestLoadCacheIndex(t *testing.T) {
 	t.Parallel()
 
+	tests := map[string]func(*testing.T){
+		"missing file is an empty index, not an error":                              testLoadCacheMissing,
+		"nil index answers every lookup with ok=false":                              testLoadCacheNil,
+		"complete records round-trip, and recovery truncates a torn trailing write": testLoadCacheRecovery,
+		"a later record for the same key wins":                                      testLoadCacheLatestRecord,
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			test(t)
+		})
+	}
+}
+
+func testLoadCacheMissing(t *testing.T) {
+	t.Helper()
+
+	idx, err := loadCacheIndex(filepath.Join(t.TempDir(), "mutate-cache.jsonl"))
+	if err != nil {
+		t.Fatalf("loadCacheIndex() error = %v", err)
+	}
+	if _, ok := idx.get(cacheKey{MutantID: "whatever"}); ok {
+		t.Error("loadCacheIndex() on a missing file answered a lookup with ok=true, want false")
+	}
+}
+
+func testLoadCacheNil(t *testing.T) {
+	t.Helper()
+	var idx *cacheIndex
+	if _, ok := idx.get(cacheKey{}); ok {
+		t.Error("(*cacheIndex)(nil).get() ok = true, want false")
+	}
+}
+
+func testLoadCacheRecovery(t *testing.T) {
+	t.Helper()
+
+	path := filepath.Join(t.TempDir(), "mutate-cache.jsonl")
+	store, err := newCacheStore(path)
+	if err != nil {
+		t.Fatalf("newCacheStore() error = %v", err)
+	}
+	want := []cacheRecord{
+		{Key: cacheKey{MutantID: "a", Fingerprint: "f1"}, Status: Killed, Output: "boom"},
+		{Key: cacheKey{MutantID: "b", Fingerprint: "f1"}, Status: Survived},
+		{Key: cacheKey{MutantID: "c", Fingerprint: "f1"}, Equivalent: true},
+	}
+	for _, rec := range want {
+		store.record(rec)
+	}
+	if err := store.close(); err != nil {
+		t.Fatalf("cacheStore.close() error = %v", err)
+	}
+	clean, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile(%s) error = %v", path, err)
+	}
+	appendCacheTornWrite(t, path)
+
+	idx, err := loadCacheIndex(path)
+	if err != nil {
+		t.Fatalf("loadCacheIndex() error = %v", err)
+	}
+	assertCacheRecords(t, idx, want)
+	if _, ok := idx.get(cacheKey{MutantID: "d"}); ok {
+		t.Error("loadCacheIndex() recovered the torn trailing record, want it dropped")
+	}
+	gotFile, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile(%s) error = %v", path, err)
+	}
+	if !bytes.Equal(gotFile, clean) {
+		t.Errorf("loadCacheIndex() did not truncate torn write: got %q want %q", gotFile, clean)
+	}
+
+	store2, err := newCacheStore(path)
+	if err != nil {
+		t.Fatalf("newCacheStore() (second open) error = %v", err)
+	}
+	store2.record(cacheRecord{Key: cacheKey{MutantID: "e"}, Status: Killed})
+	if err := store2.close(); err != nil {
+		t.Fatalf("cacheStore.close() (second store) error = %v", err)
+	}
+	idx2, err := loadCacheIndex(path)
+	if err != nil {
+		t.Fatalf("loadCacheIndex() (after second append) error = %v", err)
+	}
+	assertCacheRecords(t, idx2, want)
+	if _, ok := idx2.get(cacheKey{MutantID: "e"}); !ok {
+		t.Error("loadCacheIndex() did not see record appended after recovery")
+	}
+}
+
+func appendCacheTornWrite(t *testing.T, path string) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatalf("OpenFile(%s) error = %v", path, err)
+	}
+	if _, err := f.WriteString("{\"Key\":{\"MutantID\":\"d\"},\"Stat"); err != nil {
+		t.Fatalf("WriteString() error = %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+}
+
+func assertCacheRecords(t *testing.T, idx *cacheIndex, want []cacheRecord) {
+	t.Helper()
+	for _, rec := range want {
+		got, ok := idx.get(rec.Key)
+		if !ok {
+			t.Errorf("loadCacheIndex() missing record for key %+v", rec.Key)
+			continue
+		}
+		if got != rec {
+			t.Errorf("loadCacheIndex() record for key %+v = %+v, want %v", rec.Key, got, rec)
+		}
+	}
+}
+
+func testLoadCacheLatestRecord(t *testing.T) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "mutate-cache.jsonl")
+	store, err := newCacheStore(path)
+	if err != nil {
+		t.Fatalf("newCacheStore() error = %v", err)
+	}
+	key := cacheKey{MutantID: "same", Fingerprint: "f1"}
+	store.record(cacheRecord{Key: key, Status: Survived})
+	store.record(cacheRecord{Key: key, Status: Killed, Output: "later"})
+	if err := store.close(); err != nil {
+		t.Fatalf("cacheStore.close() error = %v", err)
+	}
+	idx, err := loadCacheIndex(path)
+	if err != nil {
+		t.Fatalf("loadCacheIndex() error = %v", err)
+	}
+	got, ok := idx.get(key)
+	if !ok {
+		t.Fatal("loadCacheIndex() missing the record entirely")
+	}
+	if got.Status != Killed || got.Output != "later" {
+		t.Errorf("loadCacheIndex() kept earlier record: got %+v", got)
+	}
+}
+
+/*
+
 	t.Run("missing file is an empty index, not an error", func(t *testing.T) {
 		t.Parallel()
 
@@ -428,6 +577,7 @@ func TestLoadCacheIndex(t *testing.T) {
 		}
 	})
 }
+*/
 
 // TestCacheRecordJSONRoundTrip pins the wire shape loadCacheIndex/cacheStore
 // depend on: a record — in both its ordinary-verdict and Equivalent
@@ -514,6 +664,16 @@ func (w *cacheFailAfterNWriter) Write(p []byte) (int, error) {
 // and all three h.Write error-propagation branches, unreachable through the
 // real sha256.Writer every other caller uses.
 func TestFingerprintFile(t *testing.T) {
+	t.Parallel()
+	tests := map[string]func(*testing.T){"fingerprint file cases": runFingerprintFileCases}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			test(t)
+		})
+	}
+}
+
+func runFingerprintFileCases(t *testing.T) {
 	t.Parallel()
 
 	realFile := filepath.Join(t.TempDir(), "real.txt")

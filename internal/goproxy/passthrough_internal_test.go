@@ -89,6 +89,20 @@ func chdir(t *testing.T, dir string) {
 	})
 }
 
+func assertResolve(t *testing.T, r resolver, want, message string) string {
+	t.Helper()
+
+	got, err := r.resolve()
+	if err != nil {
+		t.Fatalf("resolve() error = %v", err)
+	}
+	if got != want {
+		t.Errorf("resolve() = %q, want %s %q", got, message, want)
+	}
+
+	return got
+}
+
 // TestResolverResolve covers resolver.resolve()'s discovery-order rules: each
 // case builds a resolver from fake goroot/path/fallback/self fields (never the
 // real process environment) and asserts on the result. All cases but
@@ -122,13 +136,7 @@ func TestResolverResolve(t *testing.T) {
 					binName:  goBinaryName,
 				}
 
-				got, err := r.resolve()
-				if err != nil {
-					t.Fatalf("resolve() error = %v", err)
-				}
-				if got != want {
-					t.Errorf("resolve() = %q, want the GOROOT env candidate %q", got, want)
-				}
+				assertResolve(t, r, want, "the GOROOT env candidate")
 			},
 		},
 		{
@@ -152,15 +160,9 @@ func TestResolverResolve(t *testing.T) {
 					binName:  goBinaryName,
 				}
 
-				got, err := r.resolve()
-				if err != nil {
-					t.Fatalf("resolve() error = %v", err)
-				}
+				got := assertResolve(t, r, want, "the PATH candidate")
 				if got == notWant {
 					t.Fatalf("resolve() = %q, but runtime.GOROOT() must only be a last resort", got)
-				}
-				if got != want {
-					t.Errorf("resolve() = %q, want the PATH candidate %q", got, want)
 				}
 			},
 		},
@@ -179,13 +181,7 @@ func TestResolverResolve(t *testing.T) {
 					binName: goBinaryName,
 				}
 
-				got, err := r.resolve()
-				if err != nil {
-					t.Fatalf("resolve() error = %v", err)
-				}
-				if got != want {
-					t.Errorf("resolve() = %q, want %q", got, want)
-				}
+				assertResolve(t, r, want, "")
 			},
 		},
 		{
@@ -207,15 +203,9 @@ func TestResolverResolve(t *testing.T) {
 					binName: goBinaryName,
 				}
 
-				got, err := r.resolve()
-				if err != nil {
-					t.Fatalf("resolve() error = %v", err)
-				}
+				got := assertResolve(t, r, want, "")
 				if got == self {
 					t.Fatal("resolve() returned turango's own executable; passthrough would recurse")
-				}
-				if got != want {
-					t.Errorf("resolve() = %q, want %q", got, want)
 				}
 			},
 		},
@@ -252,13 +242,7 @@ func TestResolverResolve(t *testing.T) {
 					binName: goBinaryName,
 				}
 
-				got, err := r.resolve()
-				if err != nil {
-					t.Fatalf("resolve() error = %v", err)
-				}
-				if got != want {
-					t.Errorf("resolve() = %q, want %q (symlink to self must be skipped)", got, want)
-				}
+				assertResolve(t, r, want, "(symlink to self must be skipped)")
 			},
 		},
 		{
@@ -276,13 +260,7 @@ func TestResolverResolve(t *testing.T) {
 					binName:  goBinaryName,
 				}
 
-				got, err := r.resolve()
-				if err != nil {
-					t.Fatalf("resolve() error = %v", err)
-				}
-				if got != want {
-					t.Errorf("resolve() = %q, want the runtime.GOROOT() fallback %q", got, want)
-				}
+				assertResolve(t, r, want, "the runtime.GOROOT() fallback")
 			},
 		},
 		{
@@ -301,13 +279,7 @@ func TestResolverResolve(t *testing.T) {
 					binName: goBinaryName,
 				}
 
-				got, err := r.resolve()
-				if err != nil {
-					t.Fatalf("resolve() error = %v", err)
-				}
-				if got != want {
-					t.Errorf("resolve() = %q, want %q", got, want)
-				}
+				assertResolve(t, r, want, "")
 			},
 		},
 		{
@@ -328,13 +300,7 @@ func TestResolverResolve(t *testing.T) {
 					binName: goBinaryName,
 				}
 
-				got, err := r.resolve()
-				if err != nil {
-					t.Fatalf("resolve() error = %v", err)
-				}
-				if got != want {
-					t.Errorf("resolve() = %q, want %q", got, want)
-				}
+				assertResolve(t, r, want, "")
 			},
 		},
 		{
@@ -370,13 +336,7 @@ func TestResolverResolve(t *testing.T) {
 					binName: goBinaryName,
 				}
 
-				got, err := r.resolve()
-				if err != nil {
-					t.Fatalf("resolve() error = %v", err)
-				}
-				if got != want {
-					t.Errorf("resolve() = %q, want %q", got, want)
-				}
+				assertResolve(t, r, want, "")
 			},
 		},
 	}

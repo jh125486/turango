@@ -144,7 +144,6 @@ func TestApplies(t *testing.T) {
 // *ast.Ident rather than an *ast.BasicLit.
 func TestMutate(t *testing.T) {
 	t.Parallel()
-
 	tests := []struct {
 		name      string
 		src       string
@@ -213,110 +212,94 @@ func TestMutate(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-
-			fset, expr := parseExpr(t, tt.src)
-
-			binary, ok := expr.(*ast.BinaryExpr)
-			if !ok {
-				t.Fatalf("parsed %s as %T, want *ast.BinaryExpr", tt.src, expr)
-			}
-
-			originalX, originalY := binary.X, binary.Y
-			before := render(t, fset, expr)
-
-			mutations := m.Mutate(expr)
-			if len(mutations) != 2 {
-				t.Fatalf("Mutate(%s) returned %d mutations, want 2", tt.src, len(mutations))
-			}
-
-			if got := render(t, fset, expr); got != before {
-				t.Errorf("Mutate mutated the AST: got %q, want %q untouched", got, before)
-			}
-
-			for i, want := range []string{tt.wantLeft, tt.wantRight} {
-				if got := mutations[i].Description; got != tt.wantDescs[i] {
-					t.Errorf("mutations[%d].Description = %q, want %q", i, got, tt.wantDescs[i])
-				}
-
-				mutations[i].Apply()
-
-				if got := render(t, fset, expr); got != want {
-					t.Errorf("after mutations[%d].Apply(): %q, want %q", i, got, want)
-				}
-
-				mutations[i].Revert()
-
-				if got := render(t, fset, expr); got != before {
-					t.Errorf("after mutations[%d].Revert(): %q, want %q", i, got, before)
-				}
-			}
-
-			// Revert must restore the exact prior ast.Expr values, not merely
-			// equivalent ones, since the engine reuses this AST for the rest of
-			// the walk.
-			if binary.X != originalX {
-				t.Errorf("X = %p after revert, want the original %p", binary.X, originalX)
-			}
-
-			if binary.Y != originalY {
-				t.Errorf("Y = %p after revert, want the original %p", binary.Y, originalY)
-			}
+			testExpressionMutationCase(t, m, tt.src, tt.wantDescs, tt.wantLeft, tt.wantRight)
 		})
 	}
 
 	// TestMutationsAreIndependent (folded in): applies the right-operand
 	// mutation first to prove neither mutation depends on the other having
 	// run.
-	t.Run("mutations are independent", func(t *testing.T) {
-		t.Parallel()
-
-		fset, expr := parseExpr(t, "a && b")
-		before := render(t, fset, expr)
-
-		mutations := (&expression.RemoveMutator{}).Mutate(expr)
-		if len(mutations) != 2 {
-			t.Fatalf("Mutate returned %d mutations, want 2", len(mutations))
-		}
-
-		for _, i := range []int{1, 0} {
-			mutations[i].Apply()
-			mutations[i].Revert()
-		}
-
-		if got := render(t, fset, expr); got != before {
-			t.Errorf("after out-of-order apply/revert: %q, want %q", got, before)
-		}
-	})
+	t.Run("mutations are independent", testExpressionMutationsIndependent)
 
 	// TestReplacementIsAnIdent (folded in): pins the boolean literal's node
 	// type: true and false are predeclared identifiers in Go, not
 	// *ast.BasicLit values.
-	t.Run("replacement is an ident", func(t *testing.T) {
-		t.Parallel()
+	t.Run("replacement is an ident", testExpressionReplacementIdent)
+}
 
-		_, expr := parseExpr(t, "a || b")
-
-		binary, ok := expr.(*ast.BinaryExpr)
-		if !ok {
-			t.Fatalf("parsed as %T, want *ast.BinaryExpr", expr)
+func testExpressionMutationCase(t *testing.T, m *expression.RemoveMutator, src string, descriptions []string, wantLeft, wantRight string) {
+	t.Helper()
+	fset, expr := parseExpr(t, src)
+	binary, ok := expr.(*ast.BinaryExpr)
+	if !ok {
+		t.Fatalf("parsed %s as %T, want *ast.BinaryExpr", src, expr)
+	}
+	originalX, originalY := binary.X, binary.Y
+	before := render(t, fset, expr)
+	mutations := m.Mutate(expr)
+	if len(mutations) != 2 {
+		t.Fatalf("Mutate(%s) returned %d mutations, want 2", src, len(mutations))
+	}
+	if got := render(t, fset, expr); got != before {
+		t.Errorf("Mutate mutated the AST: got %q, want %q untouched", got, before)
+	}
+	for i, want := range []string{wantLeft, wantRight} {
+		if got := mutations[i].Description; got != descriptions[i] {
+			t.Errorf("mutations[%d].Description = %q, want %q", i, got, descriptions[i])
 		}
-
-		mutations := (&expression.RemoveMutator{}).Mutate(expr)
-		mutations[0].Apply()
-
-		ident, ok := binary.X.(*ast.Ident)
-		if !ok {
-			t.Fatalf("X = %T after Apply, want *ast.Ident", binary.X)
+		mutations[i].Apply()
+		if got := render(t, fset, expr); got != want {
+			t.Errorf("after mutations[%d].Apply(): %q, want %q", i, got, want)
 		}
-
-		if ident.Name != "false" {
-			t.Errorf("X.Name = %q, want %q", ident.Name, "false")
+		mutations[i].Revert()
+		if got := render(t, fset, expr); got != before {
+			t.Errorf("after mutations[%d].Revert(): %q, want %q", i, got, before)
 		}
+	}
+	if binary.X != originalX {
+		t.Errorf("X = %p after revert, want the original %p", binary.X, originalX)
+	}
+	if binary.Y != originalY {
+		t.Errorf("Y = %p after revert, want the original %p", binary.Y, originalY)
+	}
+}
 
-		if !ident.NamePos.IsValid() {
-			t.Error("X.NamePos is invalid, want the original operand's position")
-		}
-	})
+func testExpressionMutationsIndependent(t *testing.T) {
+	t.Parallel()
+	fset, expr := parseExpr(t, "a && b")
+	before := render(t, fset, expr)
+	mutations := (&expression.RemoveMutator{}).Mutate(expr)
+	if len(mutations) != 2 {
+		t.Fatalf("Mutate returned %d mutations, want 2", len(mutations))
+	}
+	for _, i := range []int{1, 0} {
+		mutations[i].Apply()
+		mutations[i].Revert()
+	}
+	if got := render(t, fset, expr); got != before {
+		t.Errorf("after out-of-order apply/revert: %q, want %q", got, before)
+	}
+}
+
+func testExpressionReplacementIdent(t *testing.T) {
+	t.Parallel()
+	_, expr := parseExpr(t, "a || b")
+	binary, ok := expr.(*ast.BinaryExpr)
+	if !ok {
+		t.Fatalf("parsed as %T, want *ast.BinaryExpr", expr)
+	}
+	mutations := (&expression.RemoveMutator{}).Mutate(expr)
+	mutations[0].Apply()
+	ident, ok := binary.X.(*ast.Ident)
+	if !ok {
+		t.Fatalf("X = %T after Apply, want *ast.Ident", binary.X)
+	}
+	if ident.Name != "false" {
+		t.Errorf("X.Name = %q, want %q", ident.Name, "false")
+	}
+	if !ident.NamePos.IsValid() {
+		t.Error("X.NamePos is invalid, want the original operand's position")
+	}
 }
 
 // TestRegistered covers the operator's registration under Name: that

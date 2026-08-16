@@ -78,150 +78,81 @@ func TestParseMutateFlagsRecognition(t *testing.T) {
 func TestParseMutateFlagsValues(t *testing.T) {
 	t.Parallel()
 
-	t.Run("defaults", func(t *testing.T) {
-		t.Parallel()
+	tests := map[string]func(*testing.T){
+		"defaults":                                          testMutateFlagDefaults,
+		"every flag set":                                    testMutateFlagEveryValue,
+		"estimate flag":                                     testMutateFlagEstimate,
+		"mutatemutant defaults to empty":                    testMutateFlagMutantDefault,
+		"multiple positional package patterns":              testMutateFlagMultiplePackages,
+		"a zero threshold is still a threshold":             testMutateFlagZeroMinimum,
+		"scope defaults survive an unrelated flag":          testMutateFlagParallelDefaultScope,
+		"trailing package pattern after -mutate":            testMutateFlagTrailingPackage,
+		"trailing package pattern after other mutate flags": testMutateFlagTrailingPackageAfterFlag,
+	}
 
-		cfg, _, err := parseMutateFlags([]string{"-mutate=."})
-		if err != nil {
-			t.Fatalf("parseMutateFlags() error = %v", err)
-		}
-
-		assertDefaultMutateConfig(t, cfg)
-	})
-
-	t.Run("every flag set", func(t *testing.T) {
-		t.Parallel()
-
-		// -mutatecache is combined here with -mutatemutant deliberately:
-		// that combination is accepted, not rejected (a replay still
-		// benefits from, and contributes to, the cache) — ok, err == nil
-		// below already proves acceptance; this is
-		// the negative-of-a-negative case TestParseMutateFlagsErrors' own
-		// "accepted" note calls for, guarding against someone "fixing" this
-		// by copying the -mutateestimate rejection too broadly.
-		cfg, _, err := parseMutateFlags([]string{
-			"-mutate=Foo.*",
-			"-mutatescope=impact",
-			"-mutateoperators=control/if,operator/binary",
-			"-mutateparallel=3",
-			"-mutatetimeout=90s",
-			"-mutateoutput=/tmp/reports",
-			"-mutatemin=0.75",
-			"-mutatemutant=a1b2c3d4e5f6",
-			"-mutatetce=true",
-			"-mutateworkspace=worktree",
-			"-mutatecache=/tmp/cache",
-			"./internal/...",
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			test(t)
 		})
-		if err != nil {
-			t.Fatalf("parseMutateFlags() error = %v", err)
-		}
+	}
+}
 
-		assertFullMutateConfig(t, cfg)
-	})
+func parseMutateFlagTestConfig(t *testing.T, args ...string) mutateConfig {
+	t.Helper()
+	cfg, _, err := parseMutateFlags(args)
+	if err != nil {
+		t.Fatalf("parseMutateFlags() error = %v", err)
+	}
+	return cfg
+}
 
-	t.Run("estimate flag", func(t *testing.T) {
-		t.Parallel()
+func testMutateFlagDefaults(t *testing.T) {
+	assertDefaultMutateConfig(t, parseMutateFlagTestConfig(t, "-mutate=."))
+}
 
-		// Deliberately not combined with -mutateoutput/-mutatemin in this
-		// subtest: that combination is rejected outright (see
-		// TestParseMutateFlagsErrors), so "every flag set" above
-		// intentionally leaves -mutateestimate out rather than needing two
-		// separate near-duplicate "every flag" cases.
-		cfg, _, err := parseMutateFlags([]string{"-mutate=.", "-mutateestimate=true"})
-		if err != nil {
-			t.Fatalf("parseMutateFlags() error = %v", err)
-		}
+func testMutateFlagEveryValue(t *testing.T) {
+	// Cache and mutant flags intentionally coexist: cache replay still benefits from cache.
+	cfg := parseMutateFlagTestConfig(t, "-mutate=Foo.*", "-mutatescope=impact", "-mutateoperators=control/if,operator/binary", "-mutateparallel=3", "-mutatetimeout=90s", "-mutateoutput=/tmp/reports", "-mutatemin=0.75", "-mutatemutant=a1b2c3d4e5f6", "-mutatetce=true", "-mutateworkspace=worktree", "-mutatecache=/tmp/cache", "./internal/...")
+	assertFullMutateConfig(t, cfg)
+}
 
-		if !cfg.estimate {
-			t.Error("estimate = false, want true")
-		}
-	})
-
-	t.Run("mutatemutant defaults to empty", func(t *testing.T) {
-		t.Parallel()
-
-		cfg, _, err := parseMutateFlags([]string{"-mutate=."})
-		if err != nil {
-			t.Fatalf("parseMutateFlags() error = %v", err)
-		}
-
-		if cfg.options.MutantID != "" {
-			t.Errorf("MutantID = %q, want empty", cfg.options.MutantID)
-		}
-	})
-
-	t.Run("multiple positional package patterns", func(t *testing.T) {
-		t.Parallel()
-
-		// Package selection is ordinary trailing positional arguments now,
-		// exactly as with -run/-bench/-fuzz — not a comma-separated -mutate
-		// value. Each space-separated pattern is its own argument.
-		cfg, _, err := parseMutateFlags([]string{"-mutate=.", "./a/...", "./b"})
-		if err != nil {
-			t.Fatalf("parseMutateFlags() error = %v", err)
-		}
-
-		if want := []string{"./a/...", "./b"}; !reflect.DeepEqual(cfg.options.Packages, want) {
-			t.Errorf("Packages = %v, want %v", cfg.options.Packages, want)
-		}
-	})
-
-	t.Run("a zero threshold is still a threshold", func(t *testing.T) {
-		t.Parallel()
-
-		cfg, _, err := parseMutateFlags([]string{"-mutate=.", "-mutatemin=0"})
-		if err != nil {
-			t.Fatalf("parseMutateFlags() error = %v", err)
-		}
-
-		if !cfg.hasMin || cfg.min != 0 {
-			t.Errorf("min = %v, %v; want 0, true", cfg.min, cfg.hasMin)
-		}
-	})
-
-	t.Run("scope defaults survive an unrelated flag", func(t *testing.T) {
-		t.Parallel()
-
-		cfg, _, err := parseMutateFlags([]string{"-mutateparallel=2", "-mutate=."})
-		if err != nil {
-			t.Fatalf("parseMutateFlags() error = %v", err)
-		}
-
-		if cfg.options.Scope != mutate.ScopeFull || cfg.options.Parallel != 2 {
-			t.Errorf("cfg = %+v, want full scope and 2 workers", cfg.options)
-		}
-	})
-
-	t.Run("trailing package pattern after -mutate", func(t *testing.T) {
-		t.Parallel()
-
-		// A bare, dash-less argument after -mutate is a legitimate
-		// positional package pattern, exactly like -run/-bench/-fuzz's own
-		// trailing package args — this used to be rejected as "unsupported
-		// argument" before -mutate stopped taking packages as its own value.
-		cfg, _, err := parseMutateFlags([]string{"-mutate=.", "./cmd/..."})
-		if err != nil {
-			t.Fatalf("parseMutateFlags() error = %v", err)
-		}
-
-		if want := []string{"./cmd/..."}; !reflect.DeepEqual(cfg.options.Packages, want) {
-			t.Errorf("Packages = %v, want %v", cfg.options.Packages, want)
-		}
-	})
-
-	t.Run("trailing package pattern after other mutate flags", func(t *testing.T) {
-		t.Parallel()
-
-		cfg, _, err := parseMutateFlags([]string{"-mutate=.", "-mutatemin=0.5", "extra"})
-		if err != nil {
-			t.Fatalf("parseMutateFlags() error = %v", err)
-		}
-
-		if want := []string{"extra"}; !reflect.DeepEqual(cfg.options.Packages, want) {
-			t.Errorf("Packages = %v, want %v", cfg.options.Packages, want)
-		}
-	})
+func testMutateFlagEstimate(t *testing.T) {
+	if !parseMutateFlagTestConfig(t, "-mutate=.", "-mutateestimate=true").estimate {
+		t.Error("estimate = false, want true")
+	}
+}
+func testMutateFlagMutantDefault(t *testing.T) {
+	if got := parseMutateFlagTestConfig(t, "-mutate=.").options.MutantID; got != "" {
+		t.Errorf("MutantID = %q, want empty", got)
+	}
+}
+func testMutateFlagMultiplePackages(t *testing.T) {
+	assertMutatePackages(t, parseMutateFlagTestConfig(t, "-mutate=.", "./a/...", "./b"), []string{"./a/...", "./b"})
+}
+func testMutateFlagZeroMinimum(t *testing.T) {
+	cfg := parseMutateFlagTestConfig(t, "-mutate=.", "-mutatemin=0")
+	if !cfg.hasMin || cfg.min != 0 {
+		t.Errorf("min = %v, %v; want 0, true", cfg.min, cfg.hasMin)
+	}
+}
+func testMutateFlagParallelDefaultScope(t *testing.T) {
+	cfg := parseMutateFlagTestConfig(t, "-mutateparallel=2", "-mutate=.")
+	if cfg.options.Scope != mutate.ScopeFull || cfg.options.Parallel != 2 {
+		t.Errorf("cfg = %+v, want full scope and 2 workers", cfg.options)
+	}
+}
+func testMutateFlagTrailingPackage(t *testing.T) {
+	assertMutatePackages(t, parseMutateFlagTestConfig(t, "-mutate=.", "./cmd/..."), []string{"./cmd/..."})
+}
+func testMutateFlagTrailingPackageAfterFlag(t *testing.T) {
+	assertMutatePackages(t, parseMutateFlagTestConfig(t, "-mutate=.", "-mutatemin=0.5", "extra"), []string{"extra"})
+}
+func assertMutatePackages(t *testing.T, cfg mutateConfig, want []string) {
+	t.Helper()
+	if !reflect.DeepEqual(cfg.options.Packages, want) {
+		t.Errorf("Packages = %v, want %v", cfg.options.Packages, want)
+	}
 }
 
 func assertDefaultMutateConfig(t *testing.T, cfg mutateConfig) {
