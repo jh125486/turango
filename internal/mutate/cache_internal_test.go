@@ -676,123 +676,135 @@ func TestFingerprintFile(t *testing.T) {
 func runFingerprintFileCases(t *testing.T) {
 	t.Parallel()
 
+	tests := map[string]func(*testing.T){
+		"error/no-error paths":                           testFingerprintFileErrorPaths,
+		"symlink target text matches plain-file content": testFingerprintFileSymlinkContent,
+		"h.Write error propagation":                      testFingerprintFileWriteErrors,
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			test(t)
+		})
+	}
+}
+
+func testFingerprintFileErrorPaths(t *testing.T) {
 	realFile := filepath.Join(t.TempDir(), "real.txt")
 	if err := os.WriteFile(realFile, []byte("hello, fingerprint"), 0o600); err != nil {
 		t.Fatalf("WriteFile(%s) error = %v", realFile, err)
 	}
 
-	t.Run("error/no-error paths", func(t *testing.T) {
-		t.Parallel()
+	dir := t.TempDir()
 
-		dir := t.TempDir()
+	tests := map[string]struct {
+		base, path string
+		wantErrStr string
+	}{
+		"mismatched relative base falls back to path, not an error": {
+			base: "not/a/real/base", path: realFile, wantErrStr: "",
+		},
+		"nonexistent path is a real Lstat error": {
+			base: dir, path: filepath.Join(dir, "does-not-exist"), wantErrStr: "mutate: reading",
+		},
+		"a directory path is a real ReadFile error": {
+			base: dir, path: dir, wantErrStr: "mutate: reading",
+		},
+	}
 
-		tests := map[string]struct {
-			base, path string
-			wantErrStr string
-		}{
-			"mismatched relative base falls back to path, not an error": {
-				base: "not/a/real/base", path: realFile, wantErrStr: "",
-			},
-			"nonexistent path is a real Lstat error": {
-				base: dir, path: filepath.Join(dir, "does-not-exist"), wantErrStr: "mutate: reading",
-			},
-			"a directory path is a real ReadFile error": {
-				base: dir, path: dir, wantErrStr: "mutate: reading",
-			},
-		}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
 
-		for name, tt := range tests {
-			t.Run(name, func(t *testing.T) {
-				t.Parallel()
+			err := fingerprintFile(io.Discard, tt.base, tt.path)
 
-				err := fingerprintFile(io.Discard, tt.base, tt.path)
-
-				if tt.wantErrStr == "" {
-					if err != nil {
-						t.Errorf("fingerprintFile() error = %v, want nil", err)
-					}
-
-					return
+			if tt.wantErrStr == "" {
+				if err != nil {
+					t.Errorf("fingerprintFile() error = %v, want nil", err)
 				}
 
-				if err == nil || !strings.Contains(err.Error(), tt.wantErrStr) {
-					t.Errorf("fingerprintFile() error = %v, want it to contain %q", err, tt.wantErrStr)
-				}
-			})
-		}
-	})
+				return
+			}
 
-	t.Run("a symlink's target text stands in for content, matching copyTree's own placement", func(t *testing.T) {
-		t.Parallel()
+			if err == nil || !strings.Contains(err.Error(), tt.wantErrStr) {
+				t.Errorf("fingerprintFile() error = %v, want it to contain %q", err, tt.wantErrStr)
+			}
+		})
+	}
+}
 
-		// fingerprintFile hashes both the entry's base-relative name and its
-		// content, so the symlink and the plain file below are placed in
-		// separate subdirs under the same entry name ("entry") — matching
-		// names is what isolates the comparison to content alone, which is
-		// the concrete claim fingerprintFile's doc comment makes: a symlink's
-		// target text stands in for content, matching copyTree's own
-		// placement.
-		dir := t.TempDir()
-		linkDir := filepath.Join(dir, "as-symlink")
-		fileDir := filepath.Join(dir, "as-plain-file")
+func testFingerprintFileSymlinkContent(t *testing.T) {
+	// fingerprintFile hashes both the entry's base-relative name and its
+	// content, so the symlink and the plain file below are placed in
+	// separate subdirs under the same entry name ("entry") — matching
+	// names is what isolates the comparison to content alone, which is
+	// the concrete claim fingerprintFile's doc comment makes: a symlink's
+	// target text stands in for content, matching copyTree's own
+	// placement.
+	dir := t.TempDir()
+	linkDir := filepath.Join(dir, "as-symlink")
+	fileDir := filepath.Join(dir, "as-plain-file")
 
-		if err := os.Mkdir(linkDir, 0o700); err != nil {
-			t.Fatalf("Mkdir() error = %v", err)
-		}
+	if err := os.Mkdir(linkDir, 0o700); err != nil {
+		t.Fatalf("Mkdir() error = %v", err)
+	}
 
-		if err := os.Mkdir(fileDir, 0o700); err != nil {
-			t.Fatalf("Mkdir() error = %v", err)
-		}
+	if err := os.Mkdir(fileDir, 0o700); err != nil {
+		t.Fatalf("Mkdir() error = %v", err)
+	}
 
-		target := filepath.Join(dir, "target-does-not-need-to-exist")
-		link := filepath.Join(linkDir, "entry")
+	target := filepath.Join(dir, "target-does-not-need-to-exist")
+	link := filepath.Join(linkDir, "entry")
 
-		if err := os.Symlink(target, link); err != nil {
-			t.Fatalf("Symlink() error = %v", err)
-		}
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatalf("Symlink() error = %v", err)
+	}
 
-		hLink := sha256.New()
-		if err := fingerprintFile(hLink, linkDir, link); err != nil {
-			t.Fatalf("fingerprintFile(symlink) error = %v", err)
-		}
+	hLink := sha256.New()
+	if err := fingerprintFile(hLink, linkDir, link); err != nil {
+		t.Fatalf("fingerprintFile(symlink) error = %v", err)
+	}
 
-		asFile := filepath.Join(fileDir, "entry")
-		if err := os.WriteFile(asFile, []byte(target), 0o600); err != nil {
-			t.Fatalf("WriteFile() error = %v", err)
-		}
+	asFile := filepath.Join(fileDir, "entry")
+	if err := os.WriteFile(asFile, []byte(target), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
 
-		hFile := sha256.New()
-		if err := fingerprintFile(hFile, fileDir, asFile); err != nil {
-			t.Fatalf("fingerprintFile(plain file) error = %v", err)
-		}
+	hFile := sha256.New()
+	if err := fingerprintFile(hFile, fileDir, asFile); err != nil {
+		t.Fatalf("fingerprintFile(plain file) error = %v", err)
+	}
 
-		if got, want := hLink.Sum(nil), hFile.Sum(nil); !bytes.Equal(got, want) {
-			t.Errorf("fingerprintFile(symlink) = %x, want %x (same as plain file with identical name/content)", got, want)
-		}
-	})
+	if got, want := hLink.Sum(nil), hFile.Sum(nil); !bytes.Equal(got, want) {
+		t.Errorf("fingerprintFile(symlink) = %x, want %x (same as plain file with identical name/content)", got, want)
+	}
+}
 
-	t.Run("h.Write error propagation", func(t *testing.T) {
-		t.Parallel()
+func testFingerprintFileWriteErrors(t *testing.T) {
+	realFile := filepath.Join(t.TempDir(), "real.txt")
+	if err := os.WriteFile(realFile, []byte("hello, fingerprint"), 0o600); err != nil {
+		t.Fatalf("WriteFile(%s) error = %v", realFile, err)
+	}
 
-		tests := map[string]struct{ failAfter int }{
-			"fails on the relative-name write":        {failAfter: 0},
-			"fails on the delimiter write after name": {failAfter: 1},
-			"fails on the content write":              {failAfter: 2},
-		}
+	tests := map[string]struct{ failAfter int }{
+		"fails on the relative-name write":        {failAfter: 0},
+		"fails on the delimiter write after name": {failAfter: 1},
+		"fails on the content write":              {failAfter: 2},
+	}
 
-		for name, tt := range tests {
-			t.Run(name, func(t *testing.T) {
-				t.Parallel()
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
 
-				w := &cacheFailAfterNWriter{n: tt.failAfter}
+			w := &cacheFailAfterNWriter{n: tt.failAfter}
 
-				err := fingerprintFile(w, filepath.Dir(realFile), realFile)
-				if err == nil || !strings.Contains(err.Error(), "injected write error") {
-					t.Errorf("fingerprintFile() error = %v, want the injected write error", err)
-				}
-			})
-		}
-	})
+			err := fingerprintFile(w, filepath.Dir(realFile), realFile)
+			if err == nil || !strings.Contains(err.Error(), "injected write error") {
+				t.Errorf("fingerprintFile() error = %v, want the injected write error", err)
+			}
+		})
+	}
 }
 
 // TestLoadCacheIndexErrors covers loadCacheIndex's two filesystem error
