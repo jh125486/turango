@@ -24,7 +24,7 @@ permissions:
 jobs:
   corpus:
     name: Corpus regression (${{ matrix.name }})
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runs_on }}
     strategy:
       fail-fast: false
       matrix:
@@ -32,12 +32,16 @@ jobs:
           # Keep each slow stdlib sweep on its own runner. The remaining
           # fixtures share one shard, including fixtures added later.
           - name: stdlib-crypto-aes
+            runs_on: ubuntu-latest
             test_filter: '^TestCorpus$/^stdlib-crypto-aes$/'
             skip_filter: ''
           - name: stdlib-encoding-base64
+            # Avoid repeated runner shutdowns on the ubuntu-latest pool.
+            runs_on: ubuntu-22.04
             test_filter: '^TestCorpus$/^stdlib-encoding-base64$/'
             skip_filter: ''
           - name: remaining
+            runs_on: ubuntu-latest
             test_filter: '^TestCorpus$/'
             skip_filter: '^TestCorpus$/^(stdlib-crypto-aes|stdlib-encoding-base64)$/'
     steps:
