@@ -32,12 +32,15 @@ jobs:
           # Keep each slow stdlib sweep on its own runner. The remaining
           # fixtures share one shard, including fixtures added later.
           - name: stdlib-crypto-aes
+            diagnostic: 'false'
             test_filter: '^TestCorpus$/^stdlib-crypto-aes$/'
             skip_filter: ''
           - name: stdlib-encoding-base64
+            diagnostic: 'true'
             test_filter: '^TestCorpus$/^stdlib-encoding-base64$/'
             skip_filter: ''
           - name: remaining
+            diagnostic: 'false'
             test_filter: '^TestCorpus$/'
             skip_filter: '^TestCorpus$/^(stdlib-crypto-aes|stdlib-encoding-base64)$/'
     steps:
@@ -57,6 +60,15 @@ jobs:
         # to its assigned entries; TestCorpus still runs those entries
         # sequentially within the shard.
         run: |
+          if [[ '${{ matrix.diagnostic }}' == 'true' ]]; then
+            while sleep 15; do
+              date -u '+%FT%TZ process snapshot'
+              ps -eo pid,ppid,pgid,rss,comm --sort=-rss | head -30
+            done &
+            monitor_pid=$!
+            trap 'kill "$monitor_pid" 2>/dev/null || true' EXIT
+          fi
+
           if [[ -n '${{ matrix.skip_filter }}' ]]; then
             go test -run '${{ matrix.test_filter }}' -skip '${{ matrix.skip_filter }}' -v -timeout=3h ./internal/corpus/...
           else
