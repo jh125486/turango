@@ -34,17 +34,12 @@ jobs:
           - name: stdlib-crypto-aes
             test_filter: '^TestCorpus$/^stdlib-crypto-aes$/'
             skip_filter: ''
-            gomaxprocs: ''
           - name: stdlib-encoding-base64
             test_filter: '^TestCorpus$/^stdlib-encoding-base64$/'
             skip_filter: ''
-            # This fixture receives SIGTERM on hosted runners at default parallelism.
-            # One worker keeps its test subprocess footprint bounded.
-            gomaxprocs: '1'
           - name: remaining
             test_filter: '^TestCorpus$/'
             skip_filter: '^TestCorpus$/^(stdlib-crypto-aes|stdlib-encoding-base64)$/'
-            gomaxprocs: ''
     steps:
       - name: Check out code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -62,10 +57,6 @@ jobs:
         # to its assigned entries; TestCorpus still runs those entries
         # sequentially within the shard.
         run: |
-          if [[ -n '${{ matrix.gomaxprocs }}' ]]; then
-            export GOMAXPROCS='${{ matrix.gomaxprocs }}'
-          fi
-
           if [[ -n '${{ matrix.skip_filter }}' ]]; then
             go test -run '${{ matrix.test_filter }}' -skip '${{ matrix.skip_filter }}' -v -timeout=3h ./internal/corpus/...
           else
