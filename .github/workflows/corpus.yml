@@ -23,7 +23,23 @@ permissions:
 
 jobs:
   corpus:
+    name: Corpus regression (${{ matrix.name }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Keep each slow stdlib sweep on its own runner. The remaining
+          # fixtures share one shard, including fixtures added later.
+          - name: stdlib-crypto-aes
+            test_filter: '^TestCorpus$/^stdlib-crypto-aes$/'
+            skip_filter: ''
+          - name: stdlib-encoding-base64
+            test_filter: '^TestCorpus$/^stdlib-encoding-base64$/'
+            skip_filter: ''
+          - name: remaining
+            test_filter: '^TestCorpus$/'
+            skip_filter: '^TestCorpus$/^(stdlib-crypto-aes|stdlib-encoding-base64)$/'
     steps:
       - name: Check out code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -37,10 +53,13 @@ jobs:
         # -timeout and timeout-minutes are both real, observed numbers, not
         # guesses — corpus_test.go's own corpusRunTimeout constant sets the
         # equivalent per-entry safety net for local/manual runs; keep the
-        # two in sync if either changes. TestCorpus runs its entries
-        # sequentially, not in parallel, specifically so each entry's own
-        # time stays attributable in the output (see corpus_test.go's own
-        # doc comment) — the total budget here is the sum of every entry's
-        # worst observed time plus real headroom, not a single entry's.
-        run: go test -run TestCorpus -v -timeout=3h ./internal/corpus/...
+        # two in sync if either changes. Each matrix shard filters TestCorpus
+        # to its assigned entries; TestCorpus still runs those entries
+        # sequentially within the shard.
+        run: |
+          if [[ -n '${{ matrix.skip_filter }}' ]]; then
+            go test -run '${{ matrix.test_filter }}' -skip '${{ matrix.skip_filter }}' -v -timeout=3h ./internal/corpus/...
+          else
+            go test -run '${{ matrix.test_filter }}' -v -timeout=3h ./internal/corpus/...
+          fi
         timeout-minutes: 210
