@@ -32,17 +32,12 @@ jobs:
           # Keep each slow stdlib sweep on its own runner. The remaining
           # fixtures share one shard, including fixtures added later.
           - name: stdlib-crypto-aes
-            memory_limit: ''
             test_filter: '^TestCorpus$/^stdlib-crypto-aes$/'
             skip_filter: ''
           - name: stdlib-encoding-base64
-            # A runaway mutant grows its test process past the hosted runner's
-            # memory limit. Keep it bounded so its existing 30s timeout wins.
-            memory_limit: 512MiB
             test_filter: '^TestCorpus$/^stdlib-encoding-base64$/'
             skip_filter: ''
           - name: remaining
-            memory_limit: ''
             test_filter: '^TestCorpus$/'
             skip_filter: '^TestCorpus$/^(stdlib-crypto-aes|stdlib-encoding-base64)$/'
     steps:
@@ -62,10 +57,6 @@ jobs:
         # to its assigned entries; TestCorpus still runs those entries
         # sequentially within the shard.
         run: |
-          if [[ -n '${{ matrix.memory_limit }}' ]]; then
-            export GOMEMLIMIT='${{ matrix.memory_limit }}'
-          fi
-
           if [[ -n '${{ matrix.skip_filter }}' ]]; then
             go test -run '${{ matrix.test_filter }}' -skip '${{ matrix.skip_filter }}' -v -timeout=3h ./internal/corpus/...
           else

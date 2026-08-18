@@ -184,6 +184,48 @@ func TestTruncateKeepsTail(t *testing.T) {
 	}
 }
 
+func TestBoundedOutputKeepsTailWithoutLargeWriteAllocation(t *testing.T) {
+	t.Parallel()
+
+	var output boundedOutput
+	input := []byte(strings.Repeat("x", maxOutputBytes*3) + "TAIL")
+	if n, err := output.Write(input); err != nil || n != len(input) {
+		t.Fatalf("Write() = (%d, %v), want (%d, nil)", n, err, len(input))
+	}
+
+	got := output.Bytes()
+	if len(got) != maxOutputBytes {
+		t.Errorf("retained output = %d bytes, want %d", len(got), maxOutputBytes)
+	}
+	if !strings.HasSuffix(string(got), "TAIL") {
+		t.Errorf("retained output lost tail: %q", got[len(got)-min(len(got), 32):])
+	}
+}
+
+func TestTestEventStateClassifiesSplitEventAfterLargeOutput(t *testing.T) {
+	t.Parallel()
+
+	var events testEventState
+	for _, chunk := range [][]byte{
+		[]byte(strings.Repeat("noise\n", maxOutputBytes)),
+		[]byte(`{"Action":"run","Package":"p","Te`),
+		[]byte(`st":"TestFailure"}` + "\n"),
+		[]byte(`{"Action":"fail","Package":"p","Test":"TestFailure"}` + "\n"),
+	} {
+		if _, err := events.Write(chunk); err != nil {
+			t.Fatalf("Write() error = %v", err)
+		}
+	}
+	events.finish()
+
+	if got, _ := classifyEventState(events, nil); got != Killed {
+		t.Errorf("classifyEventState() = %v, want %v", got, Killed)
+	}
+	if got := len(events.output.Bytes()); got > maxOutputBytes {
+		t.Errorf("retained decoded output = %d bytes, want at most %d", got, maxOutputBytes)
+	}
+}
+
 // TestRunSkipsNoOpMutation covers the skip path: a mutation whose printed
 // source is identical to the original is not a mutant, so run must report
 // neither a result nor an error — and must not touch the filesystem or shell
