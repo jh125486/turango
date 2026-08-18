@@ -171,6 +171,107 @@ const timeoutGrace = 15 * time.Second
 // where the failure is.
 const maxOutputBytes = 16 << 10
 
+// maxEventLineBytes bounds incomplete test2json records while a process is
+// running. Go emits compact JSON records, so a record above this limit cannot
+// carry a useful test verdict; retaining it would let malformed tool output
+// defeat the output cap.
+const maxEventLineBytes = maxOutputBytes
+
+// boundedOutput keeps only an output tail. It caps memory while a subprocess
+// is still running, rather than after cmd.Run returns.
+type boundedOutput struct{ tail []byte }
+
+func (b *boundedOutput) Write(p []byte) (int, error) {
+	n := len(p)
+	if len(p) >= maxOutputBytes {
+		b.tail = append(b.tail[:0], p[len(p)-maxOutputBytes:]...)
+		return n, nil
+	}
+
+	drop := len(b.tail) + len(p) - maxOutputBytes
+	if drop > 0 {
+		b.tail = b.tail[drop:]
+	}
+	b.tail = append(b.tail, p...)
+
+	return n, nil
+}
+
+func (b *boundedOutput) Bytes() []byte { return append([]byte(nil), b.tail...) }
+
+// testEventState holds classification signals extracted while stdout streams.
+// Parsing incrementally avoids relying on retained-output boundaries lining up
+// with JSON records.
+type testEventState struct {
+	sawTest, testFailed, pkgFailed, buildFail bool
+	output                                    boundedOutput
+	partial                                   []byte
+}
+
+func (s *testEventState) Write(p []byte) (int, error) {
+	n := len(p)
+	for len(p) > 0 {
+		end := bytes.IndexByte(p, '\n')
+		if end < 0 {
+			s.appendPartial(p)
+			break
+		}
+
+		s.appendPartial(p[:end])
+		s.consumeLine()
+		p = p[end+1:]
+	}
+
+	return n, nil
+}
+
+func (s *testEventState) appendPartial(p []byte) {
+	if len(s.partial)+len(p) > maxEventLineBytes {
+		// This cannot be a useful test2json event once its prefix has been
+		// discarded. Keep output bounded and wait for its newline.
+		s.partial = nil
+		return
+	}
+	s.partial = append(s.partial, p...)
+}
+
+func (s *testEventState) consumeLine() {
+	line := string(s.partial)
+	s.partial = s.partial[:0]
+	if strings.TrimSpace(line) == "" {
+		return
+	}
+
+	ev, ok := decodeTestEvent(line)
+	if !ok {
+		_, _ = s.output.Write(append([]byte(line), '\n'))
+		return
+	}
+
+	if ev.Output != "" {
+		_, _ = s.output.Write([]byte(ev.Output))
+	}
+	if ev.Test != "" {
+		s.sawTest = true
+	}
+	switch ev.Action {
+	case "build-fail":
+		s.buildFail = true
+	case "fail":
+		if ev.Test != "" {
+			s.testFailed = true
+		} else {
+			s.pkgFailed = true
+		}
+	}
+}
+
+func (s *testEventState) finish() {
+	if len(s.partial) > 0 {
+		s.consumeLine()
+	}
+}
+
 // allPackages is the "everything" package pattern go test itself understands.
 const allPackages = "./..."
 
@@ -327,14 +428,14 @@ func (r *runner) run(ctx context.Context, m mutant) (result MutantResult, ok, eq
 		// not. Counting it as Survived would be plainly wrong, and NotViable is
 		// reserved for code that does not compile.
 		result.Status = Killed
-		result.Output = truncate(string(stdout) + string(stderr) + "\nturango: mutant exceeded the per-mutant timeout")
+		result.Output = truncate(string(stdout.output.Bytes()) + string(stderr) + "\nturango: mutant exceeded the per-mutant timeout")
 
 		r.cacheWrite(cacheRecord{Key: m.cacheKey(r.toolchain), Status: result.Status, Output: result.Output})
 
 		return result, true, false, nil
 	}
 
-	result.Status, result.Output = classify(stdout, stderr)
+	result.Status, result.Output = classifyEventState(stdout, stderr)
 
 	r.cacheWrite(cacheRecord{Key: m.cacheKey(r.toolchain), Status: result.Status, Output: result.Output})
 
@@ -480,7 +581,7 @@ func packagePattern(moduleDir, pkgDir string) (string, error) {
 // timedOut reports that the mutant was killed by the runner's own deadline, as
 // opposed to the parent context being cancelled — the caller must distinguish
 // "this mutant hung" from "the user pressed Ctrl+C".
-func (r *runner) goTest(ctx context.Context, dir string, args []string) (stdout, stderr []byte, timedOut bool, err error) {
+func (r *runner) goTest(ctx context.Context, dir string, args []string) (stdout testEventState, stderr []byte, timedOut bool, err error) {
 	execCalls.Add(1)
 
 	runCtx, cancel := context.WithTimeout(ctx, r.testTimeout+timeoutGrace)
@@ -514,8 +615,8 @@ func (r *runner) goTest(ctx context.Context, dir string, args []string) (stdout,
 	cmd := exec.CommandContext(runCtx, r.goBin, argv...)
 	cmd.Dir = dir
 
-	var outBuf, errBuf bytes.Buffer
-	cmd.Stdout = &outBuf
+	var errBuf boundedOutput
+	cmd.Stdout = &stdout
 	cmd.Stderr = &errBuf
 
 	runErr := cmd.Run()
@@ -524,14 +625,15 @@ func (r *runner) goTest(ctx context.Context, dir string, args []string) (stdout,
 	// only a failure to start the toolchain at all is an engine error.
 	var exitErr *exec.ExitError
 	if runErr != nil && !errors.As(runErr, &exitErr) {
-		return nil, nil, false, fmt.Errorf("mutate: running %s test: %w", r.goBin, runErr)
+		return testEventState{}, nil, false, fmt.Errorf("mutate: running %s test: %w", r.goBin, runErr)
 	}
 
 	if ctx.Err() != nil {
-		return nil, nil, false, ctx.Err()
+		return testEventState{}, nil, false, ctx.Err()
 	}
 
-	return outBuf.Bytes(), errBuf.Bytes(), runCtx.Err() != nil, nil
+	stdout.finish()
+	return stdout, errBuf.Bytes(), runCtx.Err() != nil, nil
 }
 
 // tceBuildID is a fixed literal passed to every TCE compile — the
@@ -681,7 +783,17 @@ var compileError = regexp.MustCompile(`(?m)^.*\.go:\d+(:\d+)?: `)
 //     caught it.
 func classify(stdout, stderr []byte) (status Status, output string) {
 	sawTest, testFailed, pkgFailed, buildFail, text := parseTestEvents(stdout)
-	out := text + string(stderr)
+	return classifySignals(sawTest, testFailed, pkgFailed, buildFail, []byte(text), stderr)
+}
+
+// classifyEventState classifies a stream whose test2json events were decoded
+// as they arrived, before bounded retention could discard any of them.
+func classifyEventState(events testEventState, stderr []byte) (status Status, output string) {
+	return classifySignals(events.sawTest, events.testFailed, events.pkgFailed, events.buildFail, events.output.Bytes(), stderr)
+}
+
+func classifySignals(sawTest, testFailed, pkgFailed, buildFail bool, text, stderr []byte) (status Status, output string) {
+	out := string(text) + string(stderr)
 
 	switch {
 	case buildFail:
