@@ -311,15 +311,13 @@ func TestCollectorSorts(t *testing.T) {
 	}
 
 	for _, m := range mutants {
-		wg.Add(1)
 
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 
 			sink.mutant(m)
 			sink.suppression(SuppressionResult{File: m.File, Line: m.Line})
 			sink.equivalent(EquivalentResult{File: m.File, Line: m.Line, Operator: m.Operator})
-		}()
+		})
 	}
 
 	wg.Wait()
