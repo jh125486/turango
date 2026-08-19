@@ -227,7 +227,7 @@ func listTests(ctx context.Context, goBin, dir, pattern string) ([]string, error
 func parseTestList(out string) []string {
 	var names []string
 
-	for _, line := range strings.Split(out, "\n") {
+	for line := range strings.SplitSeq(out, "\n") {
 		if line = strings.TrimSpace(line); testFuncName.MatchString(line) {
 			names = append(names, line)
 		}

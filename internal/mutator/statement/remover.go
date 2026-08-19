@@ -25,6 +25,7 @@ import (
 	"go/ast"
 	"go/printer"
 	"go/token"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -58,13 +59,7 @@ func (*Remover) Name() string { return RemoverName }
 // The scan is O(len(list)), but blocks and case clauses are a small minority of
 // the nodes in a file, and the loop allocates nothing on either path.
 func (*Remover) Applies(node ast.Node) bool {
-	for _, stmt := range statements(node) {
-		if removable(stmt) {
-			return true
-		}
-	}
-
-	return false
+	return slices.ContainsFunc(statements(node), removable)
 }
 
 // Mutate returns one mutation per removable statement in node's statement list.

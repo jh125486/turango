@@ -11,6 +11,7 @@ import (
 	"go/token"
 	"io"
 	"io/fs"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1310,9 +1311,7 @@ func mergeVariants(pkgs []*packages.Package) *packages.Package {
 		merged.GoFiles = append(merged.GoFiles, p.GoFiles...)
 		merged.CompiledGoFiles = append(merged.CompiledGoFiles, p.CompiledGoFiles...)
 
-		for path, imp := range p.Imports {
-			merged.Imports[path] = imp
-		}
+		maps.Copy(merged.Imports, p.Imports)
 	}
 
 	return merged

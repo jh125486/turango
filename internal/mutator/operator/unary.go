@@ -2,6 +2,7 @@ package operator
 
 import (
 	"go/ast"
+	"slices"
 
 	"github.com/jh125486/turango/internal/mutator"
 )
@@ -54,13 +55,7 @@ func (unary) Applies(node ast.Node) bool {
 	case *ast.IfStmt:
 		return isUnaryExpr(n.Cond)
 	case *ast.AssignStmt:
-		for _, rhs := range n.Rhs {
-			if isUnaryExpr(rhs) {
-				return true
-			}
-		}
-
-		return false
+		return slices.ContainsFunc(n.Rhs, isUnaryExpr)
 	default:
 		return false
 	}
