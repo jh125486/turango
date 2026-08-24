@@ -46,7 +46,7 @@ tool before proposing toolchain integration.
 
 An earlier `go-turango` prototype explored mutation testing against historical
 Go packages. Its retained source is available under
-[`example/legacy/`](example/legacy/); this proposal does not rely on its
+[`corpus/example/legacy/`](corpus/example/legacy/); this proposal does not rely on its
 measurements.
 
 The prototype includes an in-memory mutation engine, coverage-directed test

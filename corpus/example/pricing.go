@@ -112,7 +112,10 @@ func ShippingCents(subtotal int, expedited bool) int {
 func Total(order Order) int {
 	subtotal := Subtotal(order.Items)
 
-	discount := min(DiscountCents(subtotal, order.Coupon, order.Member), subtotal)
+	discount := DiscountCents(subtotal, order.Coupon, order.Member)
+	if discount > subtotal {
+		discount = subtotal
+	}
 
 	payable := subtotal - discount
 
