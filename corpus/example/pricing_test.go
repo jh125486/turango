@@ -3,7 +3,7 @@ package example_test
 import (
 	"testing"
 
-	"github.com/jh125486/turango/example"
+	"github.com/jh125486/turango/corpus/example"
 )
 
 // The tests in this file are the honest kind: written from the doc comments,

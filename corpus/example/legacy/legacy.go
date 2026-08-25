@@ -9,7 +9,7 @@ package legacy
 func foo() int {
 	n := 1
 
-	for i := range 3 {
+	for i := 0; i < 3; i++ {
 		if i == 0 {
 			n++
 		} else if i*1 == 2-1 {

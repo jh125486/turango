@@ -35,13 +35,17 @@ vulncheck:
 	@echo "Checking dependencies for known vulnerabilities..."
 	@go tool -modfile=tools.mod govulncheck ./...
 
-## fix: Apply standard Go modernization rewrites
+## fix: Apply standard Go modernization rewrites (corpus/ is fixture code
+## whose mutant counts are pinned in golden.json files -- modernizing it out
+## from under those pins would silently break the corpus regression suite,
+## so it's excluded here)
 fix:
-	@go fix ./...
+	@go fix $$(go list ./... | grep -v '/corpus\($$\|/\)')
 
-## check-fix: Fail if standard Go modernization rewrites are needed
+## check-fix: Fail if standard Go modernization rewrites are needed (same
+## corpus/ exclusion as fix, above)
 check-fix:
-	@go fix -diff ./...
+	@go fix -diff $$(go list ./... | grep -v '/corpus\($$\|/\)')
 
 ## update-lint: Update golangci-lint to latest version
 update-lint:

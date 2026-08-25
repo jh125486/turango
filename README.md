@@ -181,7 +181,7 @@ All of turango's own flags require the `-flag=value` form (a bare
 | Flag | Default | Meaning |
 | --- | --- | --- |
 | `-mutate=<regexp>` | — | Required to enter mutation mode. A regular expression matched against function/method names in the target packages — behaves like `-run`/`-bench`/`-fuzz`, not a package selector. `-mutate=.` matches every function (mirroring `-bench=.`). Package selection is the ordinary trailing argument(s) after `test`, exactly as with those three flags, e.g. `turango test -mutate=. ./...`. |
-| `-mutatescope=full\|package\|impact` | `full` | How much of the test suite reruns per mutant. `full` reruns `go test ./...` for the whole module (catches mutants killed by a neighboring package's tests); `package` reruns only the mutated file's own package (much cheaper, recommended when mutating a package that lives inside a slow module — see `example/README.md`); `impact` builds a per-test coverage map once and reruns only the tests that actually cover the mutated line. |
+| `-mutatescope=full\|package\|impact` | `full` | How much of the test suite reruns per mutant. `full` reruns `go test ./...` for the whole module (catches mutants killed by a neighboring package's tests); `package` reruns only the mutated file's own package (much cheaper, recommended when mutating a package that lives inside a slow module — see `corpus/example/README.md`); `impact` builds a per-test coverage map once and reruns only the tests that actually cover the mutated line. |
 | `-mutateoperators=<comma-list>` | all registered operators | Restrict which mutation operators run (see the operator list below for names). |
 | `-mutateparallel=<n>` | `GOMAXPROCS` | Worker-pool size. Parallelizes at the file level, since one file's AST is mutated in place across its own mutants. |
 | `-mutatetimeout=<duration>` | baseline-derived | Per-mutant budget. If unset, turango times the real suite three times, averages, and scales by CPU count, so a mutant that produces an infinite loop (e.g. `i++` flipped to `i--`) doesn't stall the run to `go test`'s own ~10-minute default. A timeout counts as a kill. |
@@ -197,7 +197,7 @@ All of turango's own flags require the `-flag=value` form (a bare
 
 A `//nomutant` (or `//nomutant: reason`) comment above a statement excludes
 it from mutation. On a compound statement (`if`/`for`/`switch`) the
-suppression cascades into its body. See `example/README.md` for a worked
+suppression cascades into its body. See `corpus/example/README.md` for a worked
 example, including how it affects the reported score.
 
 ### Exit codes
@@ -446,14 +446,14 @@ flowchart TD
 
 ## Try it
 
-- [`example/`](example/) — ordinary, deliberately-imperfect order-pricing
-  code with an ordinary test suite. `example/README.md` has a runnable
-  command and explains what surviving mutants and `//nomutant` suppressions
-  do to the score.
-- [`example/legacy/`](example/legacy/) — the original `go-turango`
-  prototype's demo package, ported unchanged: one coarse assertion,
-  74 mutants, 29 survivors — a clean illustration of what a single
-  overall-result check misses.
+- [`corpus/example/`](corpus/example/) — ordinary, deliberately-imperfect
+  order-pricing code with an ordinary test suite. `corpus/example/README.md`
+  has a runnable command and explains what surviving mutants and
+  `//nomutant` suppressions do to the score.
+- [`corpus/example/legacy/`](corpus/example/legacy/) — the original
+  `go-turango` prototype's demo package, ported unchanged: one coarse
+  assertion, 74 mutants, 29 survivors — a clean illustration of what a
+  single overall-result check misses.
 
 ## Alias mode (experimental, opt-in)
 

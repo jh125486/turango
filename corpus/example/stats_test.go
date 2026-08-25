@@ -3,7 +3,7 @@ package example_test
 import (
 	"testing"
 
-	"github.com/jh125486/turango/example"
+	"github.com/jh125486/turango/corpus/example"
 )
 
 func TestSum(t *testing.T) {

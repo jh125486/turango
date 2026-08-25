@@ -86,7 +86,10 @@ jobs:
           fi
 
       - name: Check Go fixes
-        run: go fix -diff ./...
+        # corpus/ is fixture code whose mutant counts are pinned in
+        # golden.json files -- modernizing it would silently break those
+        # pins, so it's excluded (see Makefile's check-fix target).
+        run: make check-fix
 
       - name: Test
         # -short skips internal/corpus's own TestCorpus (its only consumer

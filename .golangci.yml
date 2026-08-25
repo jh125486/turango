@@ -73,7 +73,7 @@ linters:
         # gocyclo: table-driven tests with many t.Run/switch-case assertions
         # rack up "complexity" that isn't a signal about the test's quality,
         # unlike the same metric on production control flow.
-      - path: corpus/stdlib-.*
+      - path: corpus/(stdlib-.*|example.*)
         linters:
           - gocritic
           - gocyclo
@@ -81,7 +81,11 @@ linters:
           - govet
           - revive
           - staticcheck
-      - path: example/legacy/legacy\.go
+        # Every corpus/ fixture's mutant counts are pinned in its
+        # golden.json, and --fix-capable linters would silently rewrite the
+        # fixture source out from under those pins the same way `go fix`
+        # once did (see the Makefile's fix/check-fix targets).
+      - path: corpus/example/legacy/legacy\.go
         linters:
           - gocritic
         text: "ifElseChain"
